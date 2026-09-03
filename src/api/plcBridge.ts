@@ -35,6 +35,21 @@ export type ModelSummary = {
   base_url: string
   model: string
   configured: boolean
+  api_key_configured: boolean
+}
+
+export type DiscoveredModel = {
+  id: string
+  name: string
+  owned_by: string | null
+}
+
+export type ModelDiscoveryResult = {
+  provider: ProviderKind
+  endpoint: string
+  status: number
+  models: DiscoveredModel[]
+  checked_at: string
 }
 
 export type ModelForm = {
@@ -147,6 +162,7 @@ export type CodesysStatus = {
 
 export type Snapshot = {
   app_version: string
+  config_directory: string
   model: ModelSummary
   mcp_servers: McpSummary[]
   project: ProjectContext
@@ -236,7 +252,8 @@ export const EMPTY_PROJECT: ProjectContext = {
 
 export const EMPTY_SNAPSHOT: Snapshot = {
   app_version: '0.1.0',
-  model: { provider: 'responses', base_url: 'https://api.openai.com/v1', model: 'gpt-5', configured: false },
+  config_directory: '',
+  model: { provider: 'responses', base_url: 'https://api.openai.com/v1', model: 'gpt-5', configured: false, api_key_configured: false },
   mcp_servers: [],
   project: EMPTY_PROJECT,
   codesys: { detected: false, executable: null, supported_version: 'CODESYS 3.5.22', note: '等待桌面运行时检测' },
@@ -279,6 +296,16 @@ export const saveModel = (form: ModelForm) => invoke<ModelSummary>('configure_mo
     provider: form.provider,
     base_url: form.baseUrl,
     model: form.model,
+    api_key: form.apiKey.trim() || null,
+    max_tokens: 4096,
+  },
+})
+
+export const discoverModels = (form: ModelForm) => invoke<ModelDiscoveryResult>('discover_models', {
+  config: {
+    provider: form.provider,
+    base_url: form.baseUrl,
+    model: form.model.trim(),
     api_key: form.apiKey.trim() || null,
     max_tokens: 4096,
   },

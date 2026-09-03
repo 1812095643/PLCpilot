@@ -17,6 +17,7 @@ import {
   abortAgent,
   compactContext,
   compileProject,
+  discoverModels,
   EMPTY_SNAPSHOT,
   getSkillContent,
   getSnapshot,
@@ -30,6 +31,7 @@ import {
   type AgentEvent,
   type AgentResult,
   type AgentRunOptions,
+  type ModelDiscoveryResult,
   type McpForm,
   type ModelForm,
   type PendingChange,
@@ -55,6 +57,9 @@ const isSidebarCollapsed = shallowRef(false)
 const isBusy = shallowRef(false)
 const isRefreshing = shallowRef(false)
 const notice = shallowRef('')
+const isDiscoveringModels = shallowRef(false)
+const modelDiscovery = shallowRef<ModelDiscoveryResult | null>(null)
+const modelDiscoveryError = shallowRef('')
 const liveOverlay = shallowRef<UiLiveOverlay | null>(null)
 const diagnostics = shallowRef<Diagnostic[]>([])
 const diagnosticNote = shallowRef('')
@@ -92,6 +97,7 @@ const fallbackCommands = [
   { command: '/skills', label: 'Skills', detail: '查看内置 PLC Skills', supports_args: true },
   { command: '/mcp', label: 'MCP', detail: '查看 MCP 服务和工具', supports_args: true },
   { command: '/tools', label: '工具目录', detail: '列出可调用工具', supports_args: false },
+  { command: '/model', label: '获取模型', detail: '从当前接口读取 /models 或 /model 列表', supports_args: false },
   { command: '/compact', label: '压缩上下文', detail: '保留关键结论并释放上下文', supports_args: true },
   { command: '/compile', label: '编译诊断', detail: '调用 CODESYS 编译/诊断闭环', supports_args: false },
   { command: '/new', label: '新会话', detail: '清空当前对话，不改工程', supports_args: false },
@@ -101,7 +107,8 @@ const fallbackCommands = [
 const commands = computed(() => snapshot.value.commands.length > 0 ? snapshot.value.commands : fallbackCommands)
 const modelOptions = computed(() => {
   const configured = snapshot.value.model.model.trim()
-  return Array.from(new Set([configured, selectedModel.value, 'gpt-5'].filter(Boolean)))
+  const discovered = modelDiscovery.value?.models.map((model) => model.id) || []
+  return Array.from(new Set([...discovered, configured, selectedModel.value, 'gpt-5'].filter(Boolean)))
 })
 const currentProject = computed(() => snapshot.value.project)
 const currentCwd = computed(() => currentProject.value.working_directory || currentProject.value.project_directory || currentProject.value.path || '')
@@ -189,6 +196,8 @@ async function refresh(): Promise<void> {
       model: next.model.model,
       apiKey: '',
     }
+    modelDiscovery.value = null
+    modelDiscoveryError.value = ''
     const server = next.mcp_servers[0]
     if (server) {
       mcpForm.value = {
@@ -451,6 +460,27 @@ async function onSaveModel(): Promise<void> {
   }
 }
 
+function selectDiscoveredModel(modelId: string): void {
+  modelForm.value = { ...modelForm.value, model: modelId }
+  selectedModel.value = modelId
+}
+
+async function onDiscoverModels(): Promise<void> {
+  modelDiscoveryError.value = ''
+  isDiscoveringModels.value = true
+  try {
+    const result = await discoverModels({ ...modelForm.value })
+    modelDiscovery.value = result
+    showNotice(result.models.length > 0 ? `已获取 ${result.models.length} 个可用模型。` : '接口已响应，但没有返回可用模型。')
+  } catch (error) {
+    modelDiscovery.value = null
+    modelDiscoveryError.value = error instanceof Error ? error.message : String(error)
+    showNotice('模型列表获取未完成，请查看设置面板中的原因。')
+  } finally {
+    isDiscoveringModels.value = false
+  }
+}
+
 async function onSaveMcp(): Promise<void> {
   try {
     snapshot.value = { ...snapshot.value, mcp_servers: await saveMcp(mcpForm.value) }
@@ -677,7 +707,52 @@ onUnmounted(() => {
   <div v-if="showSettings" class="plc-overlay" @click.self="showSettings = false">
     <section class="plc-settings-modal" role="dialog" aria-modal="true" aria-label="PLC Pilot 设置">
       <div class="plc-modal-heading"><div><p class="plc-eyebrow">工作台设置</p><h2>连接与外观</h2></div><button class="plc-close-button" type="button" @click="showSettings = false"><IconTablerX /></button></div>
-      <div class="plc-settings-group"><label>模型接口<select v-model="modelForm.provider"><option value="responses">Responses</option><option value="messages">Messages</option><option value="chatcompletions">Chat Completions</option><option value="ollama">Ollama</option></select></label><label>接口地址<input v-model="modelForm.baseUrl" type="url" /></label><label>模型<input v-model="modelForm.model" type="text" /></label><label>API Key <small>只保存在本次运行内存</small><input v-model="modelForm.apiKey" type="password" autocomplete="off" /></label><button class="plc-button plc-button-primary" type="button" @click="onSaveModel">保存模型</button></div>
+      <div class="plc-settings-storage">
+        <span>配置目录</span>
+        <code>{{ snapshot.config_directory || '桌面运行时启动后显示' }}</code>
+        <small>config.json · auth.json · skills · sessions</small>
+      </div>
+      <div class="plc-settings-group">
+        <label>模型接口
+          <select v-model="modelForm.provider">
+            <option value="responses">Responses</option>
+            <option value="messages">Messages</option>
+            <option value="chatcompletions">Chat Completions</option>
+            <option value="ollama">Ollama</option>
+          </select>
+        </label>
+        <label>接口地址<input v-model="modelForm.baseUrl" type="url" /></label>
+        <div class="plc-model-row">
+          <label>模型<input v-model="modelForm.model" type="text" list="plc-discovered-models" /></label>
+          <button class="plc-button plc-button-quiet plc-model-discover-button" type="button" :disabled="isDiscoveringModels" @click="onDiscoverModels">
+            <IconTablerSearch />
+            {{ isDiscoveringModels ? '获取中' : '获取模型' }}
+          </button>
+        </div>
+        <datalist id="plc-discovered-models">
+          <option v-for="model in modelDiscovery?.models || []" :key="model.id" :value="model.id">{{ model.name }}</option>
+        </datalist>
+        <div v-if="modelDiscoveryError" class="plc-model-discovery-error" role="alert">{{ modelDiscoveryError }}</div>
+        <div v-else-if="modelDiscovery" class="plc-model-discovery" aria-live="polite">
+          <div class="plc-model-discovery-meta">
+            <span>HTTP {{ modelDiscovery.status }} · {{ modelDiscovery.models.length }} 个模型</span>
+            <code>{{ modelDiscovery.endpoint }}</code>
+          </div>
+          <div v-if="modelDiscovery.models.length > 0" class="plc-model-discovery-list">
+            <button v-for="model in modelDiscovery.models" :key="model.id" class="plc-model-option" type="button" @click="selectDiscoveredModel(model.id)">
+              <span>{{ model.name }}</span>
+              <code>{{ model.id }}</code>
+            </button>
+          </div>
+          <p v-else class="plc-model-discovery-empty">接口已响应，但没有返回可用模型。</p>
+        </div>
+        <label>API Key
+          <small v-if="snapshot.model.api_key_configured">已保存至 auth.json；留空则继续使用现有 Key</small>
+          <small v-else>保存至当前配置目录的 auth.json</small>
+          <input v-model="modelForm.apiKey" type="password" autocomplete="off" />
+        </label>
+        <button class="plc-button plc-button-primary" type="button" @click="onSaveModel">保存模型</button>
+      </div>
       <div class="plc-settings-group"><div class="plc-settings-group-title">MCP / Bridge</div><label>服务名称<input v-model="mcpForm.name" type="text" /></label><label>stdio 命令<input v-model="mcpForm.command" type="text" placeholder="python -m codesys_mcp" /></label><label>HTTP URL<input v-model="mcpForm.url" type="url" placeholder="https://..." /></label><button class="plc-button plc-button-quiet" type="button" @click="onSaveMcp">保存 MCP</button></div>
       <div class="plc-settings-group plc-settings-theme"><span>主题</span><button class="plc-theme-choice" :class="{ 'is-active': theme === 'dark' }" type="button" @click="theme = 'dark'">深色</button><button class="plc-theme-choice" :class="{ 'is-active': theme === 'light' }" type="button" @click="theme = 'light'">浅色</button></div>
     </section>
@@ -802,9 +877,25 @@ onUnmounted(() => {
 .plc-command-row kbd { @apply text-xs text-slate-300; }
 .plc-settings-group { @apply mt-5 grid gap-3 border-t border-slate-100 pt-4; }
 .plc-settings-group-title { @apply text-xs font-semibold text-zinc-800; }
+.plc-settings-storage { @apply grid gap-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2; }
+.plc-settings-storage > span { @apply text-[10px] font-semibold uppercase tracking-wider text-slate-400; }
+.plc-settings-storage code { @apply break-all font-mono text-[11px] text-zinc-700; }
+.plc-settings-storage small { @apply text-[10px] text-slate-400; }
 .plc-settings-group label { @apply grid gap-1 text-xs font-medium text-slate-600; }
 .plc-settings-group label small { @apply font-normal text-slate-400; }
 .plc-settings-group input, .plc-settings-group select { @apply rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-zinc-800 outline-none focus:border-amber-400 focus:bg-white focus:ring-2 focus:ring-amber-100; }
+.plc-model-row { @apply grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end; }
+.plc-model-discover-button { @apply min-h-8 whitespace-nowrap; }
+.plc-model-discovery { @apply grid gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3; }
+.plc-model-discovery-meta { @apply flex min-w-0 flex-col gap-1 text-[11px] text-slate-500; }
+.plc-model-discovery-meta code { @apply break-all font-mono text-[10px] text-slate-400; }
+.plc-model-discovery-list { @apply grid max-h-44 gap-1 overflow-y-auto; }
+.plc-model-option { @apply flex min-w-0 items-center justify-between gap-3 rounded-md border border-slate-200 bg-white px-2.5 py-2 text-left text-xs text-zinc-700 transition hover:border-sky-300 hover:bg-sky-50; }
+.plc-model-option span, .plc-model-option code { @apply min-w-0 truncate; }
+.plc-model-option code { @apply font-mono text-[10px] text-slate-400; }
+.plc-model-discovery-empty, .plc-model-discovery-error { @apply m-0 text-xs leading-5; }
+.plc-model-discovery-empty { @apply text-slate-500; }
+.plc-model-discovery-error { @apply rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-rose-700; }
 .plc-settings-theme { @apply flex items-center gap-2; }
 .plc-settings-theme > span { @apply mr-auto text-xs font-medium text-slate-600; }
 .plc-theme-choice { @apply rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600; }
@@ -822,7 +913,17 @@ onUnmounted(() => {
 :global(:root.dark) .plc-content, :global(:root.dark) .plc-detail-layout { @apply bg-zinc-950; }
 :global(:root.dark) .plc-detail-section, :global(:root.dark) .plc-approval-card, :global(:root.dark) .plc-command-palette, :global(:root.dark) .plc-settings-modal, :global(:root.dark) .plc-skill-modal { @apply bg-zinc-900 text-zinc-100; }
 :global(:root.dark) .plc-section-heading h2, :global(:root.dark) .plc-modal-heading h2, :global(:root.dark) .plc-fact-grid strong, :global(:root.dark) .plc-skill-card strong, :global(:root.dark) .plc-command-row strong, :global(:root.dark) .plc-settings-group-title { @apply text-zinc-100; }
+:global(:root.dark) .plc-settings-storage { border-color: var(--plc-dark-border); background-color: var(--plc-dark-surface-raised); }
+:global(:root.dark) .plc-settings-storage > span, :global(:root.dark) .plc-settings-storage small { color: var(--plc-dark-subtle); }
+:global(:root.dark) .plc-settings-storage code { color: var(--plc-dark-text); }
 :global(:root.dark) .plc-project-picker input, :global(:root.dark) .plc-settings-group input, :global(:root.dark) .plc-settings-group select { @apply border-zinc-700 bg-zinc-800 text-zinc-100; }
+:global(:root.dark) .plc-model-discovery { border-color: var(--plc-dark-border); background-color: var(--plc-dark-surface-raised); }
+:global(:root.dark) .plc-model-discovery-meta { color: var(--plc-dark-muted); }
+:global(:root.dark) .plc-model-discovery-meta code, :global(:root.dark) .plc-model-option code { color: var(--plc-dark-subtle); }
+:global(:root.dark) .plc-model-option { border-color: var(--plc-dark-border); background-color: var(--plc-dark-surface); color: var(--plc-dark-text); }
+:global(:root.dark) .plc-model-option:hover { border-color: rgba(0, 122, 204, 0.65); background-color: #2a2d2e; }
+:global(:root.dark) .plc-model-discovery-empty { color: var(--plc-dark-muted); }
+:global(:root.dark) .plc-model-discovery-error { border-color: rgba(244, 135, 113, 0.45); background-color: var(--plc-dark-error-bg); color: var(--plc-dark-error); }
 :global(:root.dark) .plc-fact-grid { @apply bg-zinc-700; }
 :global(:root.dark) .plc-fact-grid > div, :global(:root.dark) .plc-file-list, :global(:root.dark) .plc-tool-list { @apply bg-zinc-900; }
 :global(:root.dark) .plc-file-list, :global(:root.dark) .plc-tool-list, :global(:root.dark) .plc-file-list li, :global(:root.dark) .plc-tool-list li, :global(:root.dark) .plc-command-row, :global(:root.dark) .plc-settings-group { @apply border-zinc-800; }

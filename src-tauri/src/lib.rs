@@ -9,7 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use similar::TextDiff;
@@ -38,7 +38,7 @@ const CODESYS_SKILL: &str = include_str!("../../skills/codesys-agent/SKILL.md");
 const PLC_SAFETY_SKILL: &str = include_str!("../../skills/plc-safety/SKILL.md");
 const IEC_ST_SKILL: &str = include_str!("../../skills/iec61131-st/SKILL.md");
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Responses,
@@ -58,7 +58,7 @@ pub struct ModelConfig {
     pub provider: ProviderKind,
     pub base_url: String,
     pub model: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
@@ -189,6 +189,7 @@ impl Default for ProjectContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSnapshot {
     pub app_version: String,
+    pub config_directory: String,
     pub model: ModelSummary,
     pub mcp_servers: Vec<McpSummary>,
     pub project: ProjectContext,
@@ -207,6 +208,32 @@ pub struct ModelSummary {
     pub base_url: String,
     pub model: String,
     pub configured: bool,
+    pub api_key_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedSecrets {
+    /// 当前模型接口的 Key 单独保存，避免进入普通配置正文。
+    #[serde(default, alias = "api_key", alias = "OPENAI_API_KEY")]
+    model_api_key: Option<String>,
+    #[serde(default)]
+    mcp_auth_tokens: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredModel {
+    pub id: String,
+    pub name: String,
+    pub owned_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDiscoveryResult {
+    pub provider: ProviderKind,
+    pub endpoint: String,
+    pub status: u16,
+    pub models: Vec<DiscoveredModel>,
+    pub checked_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,6 +529,8 @@ impl Default for RuntimeState {
 }
 
 fn app_data_root() -> PathBuf {
+    // Windows 下 dirs::data_local_dir() 指向当前用户的 C 盘本地应用数据目录，
+    // 与 CODESYS Bridge 共用该根目录，避免两套路径导致工程快照断开。
     dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("PLC Pilot")
@@ -511,49 +540,246 @@ fn config_file_path() -> PathBuf {
     app_data_root().join("config.json")
 }
 
+fn auth_file_path() -> PathBuf {
+    app_data_root().join("auth.json")
+}
+
+fn ensure_runtime_layout() -> Result<(), AppError> {
+    let root = app_data_root();
+    fs::create_dir_all(&root).map_err(|error| {
+        AppError::Configuration(format!("创建 PLC Pilot 配置目录未完成：{error}"))
+    })?;
+    for directory in ["skills", "sessions", "codesys-bridge"] {
+        fs::create_dir_all(root.join(directory)).map_err(|error| {
+            AppError::Configuration(format!("创建 PLC Pilot {directory} 目录未完成：{error}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn load_persisted_secrets() -> Result<PersistedSecrets, AppError> {
+    let path = auth_file_path();
+    match fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str::<PersistedSecrets>(&content).map_err(|error| {
+            AppError::Configuration(format!("解析 PLC Pilot 凭据文件未完成：{error}"))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(PersistedSecrets::default())
+        }
+        Err(error) => Err(AppError::Configuration(format!(
+            "读取 PLC Pilot 凭据文件未完成：{error}"
+        ))),
+    }
+}
+
 fn load_runtime_state() -> RuntimeState {
     let mut state = RuntimeState::default();
+    if let Err(error) = ensure_runtime_layout() {
+        eprintln!("PLC Pilot 运行目录未准备好：{error}");
+    }
     let path = config_file_path();
-    let Ok(content) = fs::read_to_string(&path) else {
-        return state;
-    };
-    match serde_json::from_str::<PersistedRuntimeConfig>(&content) {
-        Ok(config) => {
-            if let Some(model) = config.model {
-                state.model = model;
+    let mut needs_config_migration = false;
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            needs_config_migration = content.contains("\"api_key\"");
+            match serde_json::from_str::<PersistedRuntimeConfig>(&content) {
+                Ok(config) => {
+                    if let Some(model) = config.model {
+                        state.model = model;
+                    }
+                    state.mcp_servers = config.mcp_servers;
+                }
+                Err(error) => eprintln!("PLC Pilot 配置读取未完成：{error}"),
             }
-            state.mcp_servers = config.mcp_servers;
         }
-        Err(error) => {
-            eprintln!("PLC Pilot 配置读取未完成：{error}");
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            eprintln!("PLC Pilot 配置文件读取未完成：{error}");
+        }
+        Err(_) => {}
+    }
+    match load_persisted_secrets() {
+        Ok(secrets) => {
+            if secrets
+                .model_api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty())
+            {
+                state.model.api_key = secrets.model_api_key;
+            }
+            for server in &mut state.mcp_servers {
+                if let Some(token) = secrets.mcp_auth_tokens.get(&server.id) {
+                    server
+                        .env
+                        .insert("MCP_AUTH_TOKEN".to_string(), token.clone());
+                }
+            }
+        }
+        Err(error) => eprintln!("PLC Pilot 凭据读取未完成：{error}"),
+    }
+    if needs_config_migration {
+        if let Err(error) = persist_runtime_state(&state) {
+            eprintln!("PLC Pilot 旧配置迁移未完成：{error}");
         }
     }
     state
 }
 
 fn persist_runtime_state(state: &RuntimeState) -> Result<(), AppError> {
-    let root = app_data_root();
-    fs::create_dir_all(&root).map_err(|error| {
-        AppError::Configuration(format!("创建 PLC Pilot 配置目录未完成：{error}"))
-    })?;
-    // API 密钥只保留在当前进程内存，不写入 config.json；重启后需要重新输入。
-    let config = PersistedRuntimeConfig {
+    ensure_runtime_layout()?;
+    // 非敏感连接配置与凭据分离保存；配置文件中永远不写入 API Key 或 MCP Token。
+    let config = runtime_config_without_secrets(state);
+    let secrets = persisted_secrets(state)?;
+    write_private_json(&auth_file_path(), &secrets, "凭据")?;
+    write_json_atomic(&config_file_path(), &config, "配置")?;
+    Ok(())
+}
+
+fn runtime_config_without_secrets(state: &RuntimeState) -> PersistedRuntimeConfig {
+    let mut mcp_servers = state.mcp_servers.clone();
+    for server in &mut mcp_servers {
+        server.env.retain(|key, _| !is_secret_env_key(key));
+    }
+    PersistedRuntimeConfig {
         model: Some(ModelConfig {
             api_key: None,
             ..state.model.clone()
         }),
-        mcp_servers: state.mcp_servers.clone(),
-    };
-    let bytes = serde_json::to_vec_pretty(&config)
-        .map_err(|error| AppError::Configuration(format!("编码 PLC Pilot 配置未完成：{error}")))?;
-    let temporary = root.join(format!("config.json.{}.tmp", Uuid::new_v4()));
-    fs::write(&temporary, bytes)
-        .map_err(|error| AppError::Configuration(format!("写入 PLC Pilot 配置未完成：{error}")))?;
-    if let Err(error) = fs::rename(&temporary, config_file_path()) {
+        mcp_servers,
+    }
+}
+
+fn persisted_secrets(state: &RuntimeState) -> Result<PersistedSecrets, AppError> {
+    let mut secrets = load_persisted_secrets()?;
+    if let Some(key) = state
+        .model
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        secrets.model_api_key = Some(key.to_string());
+    }
+    for server in &state.mcp_servers {
+        if let Some(token) = server
+            .env
+            .get("MCP_AUTH_TOKEN")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            secrets
+                .mcp_auth_tokens
+                .insert(server.id.clone(), token.to_string());
+        }
+    }
+    Ok(secrets)
+}
+
+fn is_secret_env_key(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    key.contains("TOKEN")
+        || key.contains("API_KEY")
+        || key.contains("SECRET")
+        || key.contains("PASSWORD")
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<(), AppError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Configuration(format!("PLC Pilot {label}文件没有父目录")))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        AppError::Configuration(format!("创建 PLC Pilot {label}目录未完成：{error}"))
+    })?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        AppError::Configuration(format!("编码 PLC Pilot {label}未完成：{error}"))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config.json");
+    let temporary = parent.join(format!("{file_name}.{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, bytes).map_err(|error| {
+        AppError::Configuration(format!("写入 PLC Pilot {label}未完成：{error}"))
+    })?;
+    if let Err(error) = fs::rename(&temporary, path) {
         let _ = fs::remove_file(&temporary);
         return Err(AppError::Configuration(format!(
-            "替换 PLC Pilot 配置未完成：{error}"
+            "替换 PLC Pilot {label}未完成：{error}"
         )));
+    }
+    Ok(())
+}
+
+fn write_private_json<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<(), AppError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Configuration(format!("PLC Pilot {label}文件没有父目录")))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        AppError::Configuration(format!("创建 PLC Pilot {label}目录未完成：{error}"))
+    })?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        AppError::Configuration(format!("编码 PLC Pilot {label}未完成：{error}"))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("auth.json");
+    let temporary = parent.join(format!("{file_name}.{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, bytes).map_err(|error| {
+        AppError::Configuration(format!("写入 PLC Pilot {label}未完成：{error}"))
+    })?;
+    if let Err(error) = restrict_secret_file(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(AppError::Configuration(format!(
+            "替换 PLC Pilot {label}未完成：{error}"
+        )));
+    }
+    Ok(())
+}
+
+fn restrict_secret_file(path: &Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            AppError::Configuration(format!("设置 PLC Pilot 凭据文件权限未完成：{error}"))
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        let identity = std::process::Command::new("whoami")
+            .output()
+            .ok()
+            .and_then(|output| {
+                let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                (!value.is_empty()).then_some(value)
+            })
+            .or_else(|| {
+                std::env::var("USERNAME")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .ok_or_else(|| {
+                AppError::Configuration("无法识别当前 Windows 用户，未写入凭据文件".to_string())
+            })?;
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(format!("{identity}:(F)"))
+            .arg("*S-1-5-18:(F)")
+            .arg("*S-1-5-32-544:(F)")
+            .output()
+            .map_err(|error| AppError::Configuration(format!("设置凭据文件权限未完成：{error}")))?;
+        if !output.status.success() {
+            return Err(AppError::Configuration(
+                "设置凭据文件权限未完成，已取消保存".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -873,6 +1099,16 @@ async fn dispatch_local_rpc(
             let config = nested_arg::<ModelConfig>(&args, "config")?;
             serde_json::to_value(configure_model_inner(config, &state).await?)
                 .map_err(|error| AppError::Internal(format!("编码模型配置未完成：{error}")))?
+        }
+        "discover_models" | "model/list" => {
+            let config = if args.get("config").is_some() {
+                nested_arg::<ModelConfig>(&args, "config")?
+            } else {
+                state.inner.lock().await.model.clone()
+            };
+            let config = model_config_with_saved_key(config, &state).await;
+            serde_json::to_value(discover_models_inner(config).await?)
+                .map_err(|error| AppError::Internal(format!("编码模型列表未完成：{error}")))?
         }
         "configure_mcp" => {
             let request = nested_arg::<ConfigureMcpRequest>(&args, "request")?;
@@ -1298,6 +1534,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             configure_model,
+            discover_models,
             configure_mcp,
             select_project,
             detect_codesys,
@@ -1338,6 +1575,8 @@ async fn configure_model_inner(
     config: ModelConfig,
     state: &AppState,
 ) -> Result<ModelSummary, AppError> {
+    let current = state.inner.lock().await.model.clone();
+    let config = apply_saved_model_key(config, &current);
     if config.model.trim().is_empty() {
         return Err(AppError::Configuration("模型名称不能为空".to_string()));
     }
@@ -1352,6 +1591,15 @@ async fn configure_model_inner(
 }
 
 #[tauri::command]
+async fn discover_models(
+    config: ModelConfig,
+    state: State<'_, AppState>,
+) -> Result<ModelDiscoveryResult, AppError> {
+    let config = model_config_with_saved_key(config, state.inner()).await;
+    discover_models_inner(config).await
+}
+
+#[tauri::command]
 async fn configure_mcp(
     request: ConfigureMcpRequest,
     state: State<'_, AppState>,
@@ -1363,6 +1611,8 @@ async fn configure_mcp_inner(
     mut request: ConfigureMcpRequest,
     state: &AppState,
 ) -> Result<Vec<McpSummary>, AppError> {
+    let current_servers = state.inner.lock().await.mcp_servers.clone();
+    let stored_secrets = load_persisted_secrets()?;
     for server in &mut request.servers {
         if server.id.trim().is_empty() {
             return Err(AppError::Configuration("MCP 服务需要 id".to_string()));
@@ -1373,6 +1623,26 @@ async fn configure_mcp_inner(
         } else {
             server.name.trim().to_string()
         };
+        // 设置面板不会回显 Token；空输入表示继续使用同一服务已经保存的凭据，
+        // 避免用户修改普通连接字段时意外让 MCP 失去鉴权。
+        let has_auth_token = server
+            .env
+            .get("MCP_AUTH_TOKEN")
+            .map(String::as_str)
+            .map(str::trim)
+            .is_some_and(|token| !token.is_empty());
+        if !has_auth_token {
+            let inherited = current_servers
+                .iter()
+                .find(|item| item.id == server.id)
+                .and_then(|item| item.env.get("MCP_AUTH_TOKEN"))
+                .or_else(|| stored_secrets.mcp_auth_tokens.get(&server.id));
+            if let Some(token) = inherited.filter(|token| !token.trim().is_empty()) {
+                server
+                    .env
+                    .insert("MCP_AUTH_TOKEN".to_string(), token.clone());
+            }
+        }
         if server.transport.trim().is_empty() {
             server.transport = if server.url.as_deref().unwrap_or_default().trim().is_empty() {
                 "stdio".to_string()
@@ -2231,26 +2501,34 @@ async fn run_agent_inner(
             };
             return Ok(agent_result_from_state(state, text, Vec::new(), Vec::new()).await);
         }
-        "/model" => {
-            let guard = state.inner.lock().await;
+        "/model" | "/models" => {
+            let config = state.inner.lock().await.model.clone();
+            let discovery = discover_models_inner(config.clone()).await?;
+            let models = if discovery.models.is_empty() {
+                "接口已响应，但没有返回可用模型。".to_string()
+            } else {
+                discovery
+                    .models
+                    .iter()
+                    .map(|model| {
+                        if model.name == model.id {
+                            format!("- {}", model.id)
+                        } else {
+                            format!("- {} · {}", model.id, model.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
             let text = format!(
-                "接口：{:?}\n模型：{}\n地址：{}\n密钥：{}",
-                guard.model.provider,
-                guard.model.model,
-                guard.model.base_url,
-                if guard
-                    .model
-                    .api_key
-                    .as_deref()
-                    .unwrap_or_default()
-                    .is_empty()
-                {
-                    "未设置"
-                } else {
-                    "已设置（不显示）"
-                }
+                "接口：{:?}\n当前模型：{}\n模型路由：{}（HTTP {}）\n可用模型（{}）：\n{}",
+                config.provider,
+                config.model,
+                discovery.endpoint,
+                discovery.status,
+                discovery.models.len(),
+                models
             );
-            drop(guard);
             return Ok(agent_result_from_state(state, text, Vec::new(), Vec::new()).await);
         }
         "/scan" => {
@@ -4221,6 +4499,287 @@ enum ApiFlavor {
     Ollama,
 }
 
+#[derive(Debug)]
+struct ModelEndpointFailure {
+    endpoint: String,
+    status: Option<u16>,
+    detail: String,
+}
+
+async fn discover_models_inner(config: ModelConfig) -> Result<ModelDiscoveryResult, AppError> {
+    let base_url = config.base_url.trim();
+    if base_url.is_empty() {
+        return Err(AppError::Configuration(
+            "获取模型前请填写接口地址".to_string(),
+        ));
+    }
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err(AppError::Configuration(
+            "模型接口地址必须以 http:// 或 https:// 开头".to_string(),
+        ));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| AppError::Network(format!("创建模型列表请求未完成：{error}")))?;
+    let headers = model_request_headers(&config)?;
+    let mut failures = Vec::new();
+
+    for endpoint in model_endpoint_candidates(&config) {
+        match fetch_model_endpoint(&client, &headers, &endpoint).await {
+            Ok((status, models)) => {
+                return Ok(ModelDiscoveryResult {
+                    provider: config.provider.clone(),
+                    endpoint,
+                    status,
+                    models,
+                    checked_at: now_iso(),
+                });
+            }
+            Err(failure) => {
+                let try_next = matches!(failure.status, Some(404 | 405));
+                failures.push(failure);
+                if !try_next {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(AppError::Network(format_model_discovery_error(&failures)))
+}
+
+fn model_request_headers(config: &ModelConfig) -> Result<HeaderMap, AppError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    if let Some(key) = config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        if matches!(&config.provider, ProviderKind::Messages) {
+            headers.insert(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_str(key).map_err(|error| {
+                    AppError::Configuration(format!("API Key 格式不正确：{error}"))
+                })?,
+            );
+        } else {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {key}")).map_err(|error| {
+                    AppError::Configuration(format!("API Key 格式不正确：{error}"))
+                })?,
+            );
+        }
+    }
+    if matches!(&config.provider, ProviderKind::Messages) {
+        headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+    }
+    Ok(headers)
+}
+
+async fn fetch_model_endpoint(
+    client: &reqwest::Client,
+    headers: &HeaderMap,
+    endpoint: &str,
+) -> Result<(u16, Vec<DiscoveredModel>), ModelEndpointFailure> {
+    let response = client
+        .get(endpoint)
+        .headers(headers.clone())
+        .send()
+        .await
+        .map_err(|error| ModelEndpointFailure {
+            endpoint: endpoint.to_string(),
+            status: None,
+            detail: format!("连接未完成：{error}"),
+        })?;
+    let response_status = response.status();
+    let status = response_status.as_u16();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| ModelEndpointFailure {
+            endpoint: endpoint.to_string(),
+            status: Some(status),
+            detail: format!("读取响应未完成：{error}"),
+        })?;
+    if !response_status.is_success() {
+        return Err(ModelEndpointFailure {
+            endpoint: endpoint.to_string(),
+            status: Some(status),
+            detail: model_http_error_detail(status, &body),
+        });
+    }
+    let value =
+        serde_json::from_str::<Value>(body.trim()).map_err(|error| ModelEndpointFailure {
+            endpoint: endpoint.to_string(),
+            status: Some(status),
+            detail: format!("响应不是 JSON：{error}"),
+        })?;
+    Ok((status, parse_discovered_models(&value)))
+}
+
+fn model_http_error_detail(status: u16, body: &str) -> String {
+    match status {
+        401 | 403 => "鉴权未通过，请检查 API Key".to_string(),
+        404 | 405 => "没有找到模型列表路由".to_string(),
+        429 => "服务端限流，请稍后再试".to_string(),
+        500..=599 => "模型服务暂时不可用".to_string(),
+        _ => {
+            let detail = truncate(body.trim(), 360);
+            if detail.is_empty() {
+                "接口未提供错误详情".to_string()
+            } else {
+                detail
+            }
+        }
+    }
+}
+
+fn format_model_discovery_error(failures: &[ModelEndpointFailure]) -> String {
+    let attempts = failures
+        .iter()
+        .map(|failure| {
+            let status = failure
+                .status
+                .map(|value| format!("HTTP {value}"))
+                .unwrap_or_else(|| "连接错误".to_string());
+            format!("{}：{}（{}）", failure.endpoint, status, failure.detail)
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    format!("模型列表获取未完成：{attempts}。请检查接口地址、/models 或 /model 路由和鉴权配置。")
+}
+
+fn model_endpoint_candidates(config: &ModelConfig) -> Vec<String> {
+    let base_url = config.base_url.trim();
+    let mut paths = Vec::new();
+    if matches!(&config.provider, ProviderKind::Ollama) {
+        paths.push("api/tags");
+    }
+    paths.extend(["models", "model"]);
+
+    let mut endpoints = Vec::new();
+    for path in paths {
+        let endpoint = model_discovery_endpoint(base_url, path);
+        if !endpoints.iter().any(|item| item == &endpoint) {
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints
+}
+
+fn model_discovery_endpoint(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if path == "api/tags" && base.ends_with("/api") {
+        return format!("{base}/tags");
+    }
+    let suffix = format!("/{path}");
+    if base.ends_with(&suffix) {
+        base.to_string()
+    } else {
+        format!("{base}/{path}")
+    }
+}
+
+fn parse_discovered_models(value: &Value) -> Vec<DiscoveredModel> {
+    let mut values = Vec::new();
+    collect_model_values(value, &mut values, 0);
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter_map(discovered_model_from_value)
+        .filter(|model| seen.insert(model.id.clone()))
+        .collect()
+}
+
+fn collect_model_values<'a>(value: &'a Value, result: &mut Vec<&'a Value>, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    if model_identifier(value).is_some() {
+        result.push(value);
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_model_values(item, result, depth + 1);
+            }
+        }
+        Value::Object(object) => {
+            for key in ["data", "models", "items", "result"] {
+                if let Some(child) = object.get(key) {
+                    collect_model_values(child, result, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn model_identifier(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        Value::Object(object) => {
+            for key in ["id", "model", "slug"] {
+                if let Some(text) = object.get(key).and_then(Value::as_str) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+            if !["data", "models", "items", "result"]
+                .iter()
+                .any(|key| object.contains_key(*key))
+            {
+                if let Some(text) = object.get("name").and_then(Value::as_str) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn discovered_model_from_value(value: &Value) -> Option<DiscoveredModel> {
+    let id = model_identifier(value)?;
+    let object = value.as_object();
+    let name = object
+        .and_then(|object| {
+            ["display_name", "displayName", "name", "model", "id"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(&id)
+        .to_string();
+    let owned_by = object.and_then(|object| {
+        ["owned_by", "ownedBy", "provider"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    });
+    Some(DiscoveredModel { id, name, owned_by })
+}
+
 async fn send_json(
     client: &reqwest::Client,
     config: &ModelConfig,
@@ -4473,6 +5032,7 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
     let (mcp_servers, tools) = inspect_mcp_servers(&servers).await;
     Ok(AppSnapshot {
         app_version: APP_VERSION.to_string(),
+        config_directory: app_data_root().to_string_lossy().into_owned(),
         model,
         mcp_servers,
         project,
@@ -4487,17 +5047,40 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
 }
 
 fn model_summary(config: &ModelConfig) -> ModelSummary {
+    let api_key_configured = config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|key| !key.is_empty());
     ModelSummary {
         provider: config.provider.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
-        configured: config
-            .api_key
-            .as_deref()
-            .map(|key| !key.trim().is_empty())
-            .unwrap_or(false)
-            || matches!(config.provider, ProviderKind::Ollama),
+        configured: api_key_configured || matches!(config.provider, ProviderKind::Ollama),
+        api_key_configured,
     }
+}
+
+fn same_model_scope(left: &ModelConfig, right: &ModelConfig) -> bool {
+    left.provider == right.provider
+        && left.base_url.trim().trim_end_matches('/') == right.base_url.trim().trim_end_matches('/')
+}
+
+fn apply_saved_model_key(mut config: ModelConfig, current: &ModelConfig) -> ModelConfig {
+    let has_draft_key = config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|key| !key.is_empty());
+    if !has_draft_key && same_model_scope(&config, current) {
+        config.api_key = current.api_key.clone();
+    }
+    config
+}
+
+async fn model_config_with_saved_key(config: ModelConfig, state: &AppState) -> ModelConfig {
+    let current = state.inner.lock().await.model.clone();
+    apply_saved_model_key(config, &current)
 }
 
 fn now_iso() -> String {
@@ -4613,7 +5196,13 @@ fn available_commands() -> Vec<CommandSummary> {
             "tools",
             false,
         ),
-        ("/model", "模型", "查看当前模型接口配置", "tools", false),
+        (
+            "/model",
+            "获取模型",
+            "从当前接口读取 /models 或 /model 模型列表",
+            "tools",
+            false,
+        ),
         (
             "/approve",
             "批准修改",
@@ -5948,6 +6537,121 @@ mod tests {
             parse_http_json("event: message\ndata: {\"ok\":true}\n\n").unwrap()["ok"],
             true
         );
+    }
+
+    #[test]
+    fn model_endpoint_candidates_cover_openai_and_ollama_routes() {
+        let openai = ModelConfig {
+            base_url: "https://example.test/v1".to_string(),
+            ..ModelConfig::default()
+        };
+        assert_eq!(
+            model_endpoint_candidates(&openai),
+            vec![
+                "https://example.test/v1/models".to_string(),
+                "https://example.test/v1/model".to_string()
+            ]
+        );
+
+        let ollama = ModelConfig {
+            provider: ProviderKind::Ollama,
+            base_url: "http://127.0.0.1:11434/api".to_string(),
+            ..ModelConfig::default()
+        };
+        assert_eq!(
+            model_endpoint_candidates(&ollama),
+            vec![
+                "http://127.0.0.1:11434/api/tags".to_string(),
+                "http://127.0.0.1:11434/api/models".to_string(),
+                "http://127.0.0.1:11434/api/model".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn model_parser_accepts_common_payloads_and_deduplicates() {
+        let payload = json!({
+            "data": [
+                {"id": "gpt-5", "display_name": "GPT-5", "owned_by": "openai"},
+                {"id": "gpt-5", "display_name": "重复项"}
+            ],
+            "models": [
+                {"name": "llama3:8b", "model": "llama3:8b"}
+            ]
+        });
+        assert_eq!(
+            parse_discovered_models(&payload),
+            vec![
+                DiscoveredModel {
+                    id: "gpt-5".to_string(),
+                    name: "GPT-5".to_string(),
+                    owned_by: Some("openai".to_string())
+                },
+                DiscoveredModel {
+                    id: "llama3:8b".to_string(),
+                    name: "llama3:8b".to_string(),
+                    owned_by: None
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_config_removes_model_and_mcp_credentials() {
+        let mut env = HashMap::new();
+        env.insert(
+            "MCP_AUTH_TOKEN".to_string(),
+            "synthetic-mcp-token".to_string(),
+        );
+        env.insert("PLC_MODE".to_string(), "safe".to_string());
+        let state = RuntimeState {
+            model: ModelConfig {
+                api_key: Some("synthetic-model-key".to_string()),
+                ..ModelConfig::default()
+            },
+            mcp_servers: vec![McpServerConfig {
+                id: "demo".to_string(),
+                name: "Demo".to_string(),
+                command: "demo".to_string(),
+                args: Vec::new(),
+                env,
+                enabled: true,
+                transport: "stdio".to_string(),
+                url: None,
+            }],
+            ..RuntimeState::default()
+        };
+        let config = runtime_config_without_secrets(&state);
+        let serialized = serde_json::to_string(&config).expect("编码非敏感配置");
+        assert!(!serialized.contains("synthetic-model-key"));
+        assert!(!serialized.contains("synthetic-mcp-token"));
+        assert!(!serialized.contains("\"api_key\""));
+        assert!(!serialized.contains("MCP_AUTH_TOKEN"));
+        assert!(serialized.contains("PLC_MODE"));
+    }
+
+    #[test]
+    fn blank_model_key_preserves_same_endpoint_credential() {
+        let current = ModelConfig {
+            api_key: Some("synthetic-model-key".to_string()),
+            ..ModelConfig::default()
+        };
+        let draft = ModelConfig {
+            model: "another-model".to_string(),
+            api_key: None,
+            ..current.clone()
+        };
+        let merged = apply_saved_model_key(draft, &current);
+        assert_eq!(merged.api_key, current.api_key);
+
+        let different_endpoint = ModelConfig {
+            base_url: "https://different.example/v1".to_string(),
+            api_key: None,
+            ..merged
+        };
+        assert!(apply_saved_model_key(different_endpoint, &current)
+            .api_key
+            .is_none());
     }
 
     #[test]
