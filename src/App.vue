@@ -599,7 +599,6 @@ onUnmounted(() => {
           <template #actions>
             <button class="plc-header-action" type="button" title="命令面板" aria-label="命令面板" @click="showCommandPalette = true">⌘K</button>
             <button class="plc-header-action" type="button" title="切换主题" aria-label="切换主题" @click="theme = theme === 'dark' ? 'light' : 'dark'">{{ theme === 'dark' ? '○' : '●' }}</button>
-            <button class="plc-header-action" type="button" title="设置" aria-label="设置" @click="showSettings = true"><IconTablerSettings /></button>
           </template>
         </ContentHeader>
 
