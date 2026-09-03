@@ -153,6 +153,15 @@ pub struct ProjectContext {
     pub active_text_truncated: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceProject {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub exists: bool,
+    pub last_opened_at: String,
+}
+
 fn default_scan_status() -> String {
     "not_scanned".to_string()
 }
@@ -196,6 +205,7 @@ pub struct AppSnapshot {
     pub model: ModelSummary,
     pub mcp_servers: Vec<McpSummary>,
     pub project: ProjectContext,
+    pub projects: Vec<WorkspaceProject>,
     pub codesys: CodesysStatus,
     pub skills: Vec<SkillSummary>,
     pub commands: Vec<CommandSummary>,
@@ -288,6 +298,8 @@ pub struct SessionRecord {
     pub path: String,
     pub modified_at: Option<String>,
     pub message_count: usize,
+    #[serde(default)]
+    pub cwd: Option<String>,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
 }
@@ -481,6 +493,7 @@ pub struct RuntimeState {
     pub model: ModelConfig,
     pub mcp_servers: Vec<McpServerConfig>,
     pub project: ProjectContext,
+    pub projects: Vec<WorkspaceProject>,
     pub pending: HashMap<String, PendingChange>,
     pub patches: HashMap<String, AppliedFilePatch>,
     pub session: AgentSessionSummary,
@@ -492,6 +505,10 @@ struct PersistedRuntimeConfig {
     model: Option<ModelConfig>,
     #[serde(default)]
     mcp_servers: Vec<McpServerConfig>,
+    #[serde(default)]
+    projects: Vec<WorkspaceProject>,
+    #[serde(default)]
+    active_project_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -529,6 +546,7 @@ impl Default for RuntimeState {
             model: ModelConfig::default(),
             mcp_servers: Vec::new(),
             project: ProjectContext::default(),
+            projects: Vec::new(),
             pending: HashMap::new(),
             patches: HashMap::new(),
             session: AgentSessionSummary::default(),
@@ -582,6 +600,7 @@ fn load_persisted_secrets() -> Result<PersistedSecrets, AppError> {
 
 fn load_runtime_state() -> RuntimeState {
     let mut state = RuntimeState::default();
+    let mut active_project_path = None;
     if let Err(error) = ensure_runtime_layout() {
         eprintln!("PLC Pilot 运行目录未准备好：{error}");
     }
@@ -596,6 +615,8 @@ fn load_runtime_state() -> RuntimeState {
                         state.model = model;
                     }
                     state.mcp_servers = config.mcp_servers;
+                    state.projects = config.projects;
+                    active_project_path = config.active_project_path;
                 }
                 Err(error) => eprintln!("PLC Pilot 配置读取未完成：{error}"),
             }
@@ -605,6 +626,36 @@ fn load_runtime_state() -> RuntimeState {
         }
         Err(_) => {}
     }
+    if let Some(path) = active_project_path.filter(|value: &String| !value.trim().is_empty()) {
+        let candidate = PathBuf::from(&path);
+        if let Ok(metadata) = fs::metadata(&candidate) {
+            let project_directory = if metadata.is_dir() {
+                Some(path.clone())
+            } else {
+                candidate
+                    .parent()
+                    .map(|value| value.to_string_lossy().into_owned())
+            };
+            state.project = scan_project_context(ProjectContext {
+                path: Some(path.clone()),
+                project_directory,
+                name: candidate
+                    .file_stem()
+                    .or_else(|| candidate.file_name())
+                    .and_then(|value| value.to_str())
+                    .map(str::to_string),
+                version: Some("SP22（目标版本）".to_string()),
+                exists: metadata.is_file() || metadata.is_dir(),
+                extension: candidate
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_lowercase),
+                ..ProjectContext::default()
+            });
+        }
+    }
+    let project = state.project.clone();
+    upsert_project(&mut state.projects, &project, false);
     match load_persisted_secrets() {
         Ok(secrets) => {
             if secrets
@@ -653,6 +704,8 @@ fn runtime_config_without_secrets(state: &RuntimeState) -> PersistedRuntimeConfi
             ..state.model.clone()
         }),
         mcp_servers,
+        projects: state.projects.clone(),
+        active_project_path: state.project.path.clone(),
     }
 }
 
@@ -1015,6 +1068,7 @@ async fn dispatch_local_rpc(
                 path: String::new(),
                 modified_at: None,
                 message_count: 0,
+                cwd: None,
                 messages: Vec::new(),
             }))
             .map_err(|error| AppError::Internal(format!("编码线程读取结果未完成：{error}")))?
@@ -1217,6 +1271,32 @@ async fn dispatch_local_rpc(
                 .map_err(|error| {
                     AppError::Internal(format!("编码工程文件搜索结果未完成：{error}"))
                 })?
+        }
+        "list_projects" | "project/list" => {
+            serde_json::to_value(state.inner.lock().await.projects.clone())
+                .map_err(|error| AppError::Internal(format!("编码工程列表未完成：{error}")))?
+        }
+        "remove_project" | "project/delete" => {
+            let id = required_string_arg(&args, "id")?;
+            serde_json::to_value(remove_project_inner(id, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码工程列表未完成：{error}")))?
+        }
+        "start_new_session" => serde_json::to_value(start_new_session_inner(&state).await?)
+            .map_err(|error| AppError::Internal(format!("编码新会话结果未完成：{error}")))?,
+        "rename_session" | "thread/name/set" => {
+            let name = required_string_arg(&args, "name")?;
+            let path = args
+                .get("path")
+                .or_else(|| args.get("session_file"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            serde_json::to_value(rename_session_inner(name, path, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码会话名称未完成：{error}")))?
+        }
+        "delete_session" | "thread/archive" => {
+            let path = required_string_arg(&args, "path")?;
+            serde_json::to_value(delete_session_inner(path, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码会话列表未完成：{error}")))?
         }
         "read_local_attachment_file" => {
             let path = required_string_arg(&args, "path")?;
@@ -1573,6 +1653,12 @@ pub fn run() {
             get_skill_content,
             list_sessions,
             resume_session,
+            list_projects,
+            pick_project_folder,
+            remove_project,
+            start_new_session,
+            rename_session,
+            delete_session,
             scan_project,
             sync_current_project,
             compact_context,
@@ -1725,14 +1811,83 @@ async fn select_project(
     select_project_inner(path, &state).await
 }
 
+fn project_identity(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn project_record_from_context(project: &ProjectContext) -> Option<WorkspaceProject> {
+    let path = project.path.as_deref()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(WorkspaceProject {
+        id: project_identity(Path::new(path)),
+        name: project.name.clone().unwrap_or_else(|| {
+            Path::new(path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(path)
+                .to_string()
+        }),
+        path: path.to_string(),
+        exists: project.exists,
+        last_opened_at: now_iso(),
+    })
+}
+
+fn upsert_project(
+    projects: &mut Vec<WorkspaceProject>,
+    project: &ProjectContext,
+    touch_last_opened: bool,
+) {
+    let Some(record) = project_record_from_context(project) else {
+        return;
+    };
+    if let Some(existing) = projects.iter_mut().find(|item| item.id == record.id) {
+        existing.name = record.name;
+        existing.path = record.path;
+        existing.exists = record.exists;
+        if touch_last_opened {
+            existing.last_opened_at = record.last_opened_at;
+        }
+    } else {
+        projects.push(record);
+    }
+    projects.sort_by(|left, right| right.last_opened_at.cmp(&left.last_opened_at));
+    projects.truncate(30);
+}
+
+async fn persist_selected_project(
+    state: &AppState,
+    project: ProjectContext,
+) -> Result<(), AppError> {
+    let mut guard = state.inner.lock().await;
+    guard.project = project;
+    let project = guard.project.clone();
+    upsert_project(&mut guard.projects, &project, true);
+    let snapshot = guard.clone();
+    drop(guard);
+    persist_runtime_state(&snapshot)
+}
+
 async fn select_project_inner(path: String, state: &AppState) -> Result<ProjectContext, AppError> {
+    if state.agent_runs.try_lock().is_err() {
+        return Err(AppError::Internal(
+            "当前任务仍在运行，完成或停止后再切换工程".to_string(),
+        ));
+    }
     let normalized = path.trim().trim_matches('"');
     if normalized.is_empty() {
         return Err(AppError::Project(
             "请提供 CODESYS 工程文件或目录路径".to_string(),
         ));
     }
-    let path_buf = PathBuf::from(normalized);
+    let path_buf = fs::canonicalize(PathBuf::from(normalized))
+        .map_err(|error| AppError::Project(format!("无法读取路径：{error}")))?;
     let metadata = std::fs::metadata(&path_buf)
         .map_err(|error| AppError::Project(format!("无法读取路径：{error}")))?;
     let name = path_buf
@@ -1745,7 +1900,7 @@ async fn select_project_inner(path: String, state: &AppState) -> Result<ProjectC
         .and_then(|value| value.to_str())
         .map(str::to_lowercase);
     let project_directory = if metadata.is_dir() {
-        Some(normalized.to_string())
+        Some(path_buf.to_string_lossy().into_owned())
     } else {
         path_buf
             .parent()
@@ -1753,7 +1908,7 @@ async fn select_project_inner(path: String, state: &AppState) -> Result<ProjectC
             .map(str::to_string)
     };
     let project = ProjectContext {
-        path: Some(normalized.to_string()),
+        path: Some(path_buf.to_string_lossy().into_owned()),
         project_directory,
         name: Some(name),
         version: Some("SP22（目标版本）".to_string()),
@@ -1762,8 +1917,220 @@ async fn select_project_inner(path: String, state: &AppState) -> Result<ProjectC
         ..ProjectContext::default()
     };
     let scanned = scan_project_context(project);
-    state.inner.lock().await.project = scanned.clone();
+    persist_selected_project(state, scanned.clone()).await?;
     Ok(scanned)
+}
+
+#[tauri::command]
+async fn list_projects(state: State<'_, AppState>) -> Result<Vec<WorkspaceProject>, AppError> {
+    let projects = state.inner.lock().await.projects.clone();
+    Ok(projects)
+}
+
+#[tauri::command]
+async fn pick_project_folder() -> Result<Option<String>, AppError> {
+    let selected = rfd::AsyncFileDialog::new()
+        .set_title("选择 CODESYS 工程目录")
+        .pick_folder()
+        .await;
+    Ok(selected.map(|handle| handle.path().to_string_lossy().into_owned()))
+}
+
+async fn remove_project_inner(
+    id: String,
+    state: &AppState,
+) -> Result<Vec<WorkspaceProject>, AppError> {
+    if state.agent_runs.try_lock().is_err() {
+        return Err(AppError::Internal(
+            "当前任务仍在运行，完成或停止后再移除工程入口".to_string(),
+        ));
+    }
+    let requested = id.trim();
+    if requested.is_empty() {
+        return Err(AppError::Configuration(
+            "请选择要移除的工程入口".to_string(),
+        ));
+    }
+    let mut guard = state.inner.lock().await;
+    guard
+        .projects
+        .retain(|project| project.id != requested && project.path != requested);
+    if guard
+        .project
+        .path
+        .as_deref()
+        .is_some_and(|path| project_identity(Path::new(path)) == requested || path == requested)
+    {
+        guard.project = ProjectContext::default();
+        guard.session = AgentSessionSummary::default();
+    }
+    let projects = guard.projects.clone();
+    let snapshot = guard.clone();
+    drop(guard);
+    persist_runtime_state(&snapshot)?;
+    Ok(projects)
+}
+
+#[tauri::command]
+async fn remove_project(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<WorkspaceProject>, AppError> {
+    remove_project_inner(id, &state).await
+}
+
+async fn start_new_session_inner(state: &AppState) -> Result<AgentSessionSummary, AppError> {
+    if state.agent_runs.try_lock().is_err() {
+        return Err(AppError::Internal(
+            "当前任务仍在运行，完成或停止后再新建会话".to_string(),
+        ));
+    }
+    let mut guard = state.inner.lock().await;
+    guard.session = AgentSessionSummary::default();
+    Ok(guard.session.clone())
+}
+
+#[tauri::command]
+async fn start_new_session(state: State<'_, AppState>) -> Result<AgentSessionSummary, AppError> {
+    start_new_session_inner(&state).await
+}
+
+async fn rename_session_inner(
+    name: String,
+    path: Option<String>,
+    state: &AppState,
+) -> Result<AgentSessionSummary, AppError> {
+    let normalized = name.trim();
+    if normalized.is_empty() {
+        return Err(AppError::Configuration("会话名称不能为空".to_string()));
+    }
+    if normalized.chars().count() > 120 {
+        return Err(AppError::Configuration(
+            "会话名称不能超过 120 个字符".to_string(),
+        ));
+    }
+    let requested_path = path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let target = if let Some(requested_path) = requested_path {
+        list_session_records()
+            .into_iter()
+            .find(|item| session_paths_equal(&item.path, requested_path))
+            .ok_or_else(|| {
+                AppError::Configuration("会话文件不在 PLC Pilot 会话目录中".to_string())
+            })?
+    } else {
+        let guard = state.inner.lock().await;
+        SessionRecord {
+            session_id: guard.session.session_id.clone().unwrap_or_default(),
+            name: guard.session.name.clone(),
+            path: guard.session.session_file.clone().unwrap_or_default(),
+            modified_at: None,
+            message_count: guard.session.message_count,
+            cwd: None,
+            messages: Vec::new(),
+        }
+    };
+    if !target.path.trim().is_empty() {
+        append_session_info(&target.path, normalized)?;
+    }
+    let mut guard = state.inner.lock().await;
+    let is_current_session = if target.path.is_empty() {
+        guard.session.session_file.is_none()
+    } else {
+        guard
+            .session
+            .session_file
+            .as_deref()
+            .is_some_and(|current| session_paths_equal(current, &target.path))
+    };
+    if is_current_session {
+        guard.session.name = Some(normalized.to_string());
+        return Ok(guard.session.clone());
+    }
+    Ok(AgentSessionSummary {
+        session_id: Some(target.session_id),
+        session_file: Some(target.path),
+        name: Some(normalized.to_string()),
+        message_count: target.message_count,
+        ..AgentSessionSummary::default()
+    })
+}
+
+#[tauri::command]
+async fn rename_session(
+    name: String,
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<AgentSessionSummary, AppError> {
+    rename_session_inner(name, path, &state).await
+}
+
+async fn delete_session_inner(
+    path: String,
+    state: &AppState,
+) -> Result<Vec<SessionRecord>, AppError> {
+    if state.agent_runs.try_lock().is_err() {
+        return Err(AppError::Internal(
+            "当前任务仍在运行，完成或停止后再清理会话".to_string(),
+        ));
+    }
+    let requested = path.trim();
+    let record = list_session_records()
+        .into_iter()
+        .find(|item| session_paths_equal(&item.path, requested))
+        .ok_or_else(|| AppError::Configuration("会话文件不在 PLC Pilot 会话目录中".to_string()))?;
+    let root = fs::canonicalize(agent_session_dir())
+        .map_err(|error| AppError::Configuration(format!("会话目录不可用：{error}")))?;
+    let target = fs::canonicalize(&record.path)
+        .map_err(|error| AppError::Configuration(format!("会话文件不可用：{error}")))?;
+    if !target.starts_with(&root)
+        || !target
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
+    {
+        return Err(AppError::Configuration(
+            "只能清理 PLC Pilot 自己创建的会话文件".to_string(),
+        ));
+    }
+    fs::remove_file(&target)
+        .map_err(|error| AppError::Configuration(format!("清理会话未完成：{error}")))?;
+    let mut guard = state.inner.lock().await;
+    if guard
+        .session
+        .session_file
+        .as_deref()
+        .is_some_and(|current| session_paths_equal(current, &record.path))
+    {
+        guard.session = AgentSessionSummary::default();
+    }
+    Ok(list_session_records())
+}
+
+#[tauri::command]
+async fn delete_session(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SessionRecord>, AppError> {
+    delete_session_inner(path, &state).await
+}
+
+fn append_session_info(path: &str, name: &str) -> Result<(), AppError> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|error| AppError::Configuration(format!("更新会话名称未完成：{error}")))?;
+    let line = serde_json::to_string(&json!({
+        "type": "session_info",
+        "name": name,
+        "timestamp": now_iso(),
+    }))
+    .map_err(|error| AppError::Internal(format!("编码会话名称未完成：{error}")))?;
+    writeln!(file, "{line}")
+        .map_err(|error| AppError::Configuration(format!("写入会话名称未完成：{error}")))
 }
 
 #[tauri::command]
@@ -1824,7 +2191,10 @@ async fn sync_current_project(state: State<'_, AppState>) -> Result<ProjectConte
 async fn sync_current_project_inner(state: &AppState) -> Result<ProjectContext, AppError> {
     let current = state.inner.lock().await.project.clone();
     let synced = sync_project_from_codesys(current);
-    state.inner.lock().await.project = synced.clone();
+    let mut guard = state.inner.lock().await;
+    guard.project = synced.clone();
+    let project = guard.project.clone();
+    upsert_project(&mut guard.projects, &project, false);
     Ok(synced)
 }
 
@@ -2552,6 +2922,19 @@ async fn run_agent_inner(
                             item.modified_at.as_deref().unwrap_or("时间未知")
                         )
                     })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            return Ok(agent_result_from_state(state, text, Vec::new(), Vec::new()).await);
+        }
+        "/projects" => {
+            let projects = state.inner.lock().await.projects.clone();
+            let text = if projects.is_empty() {
+                "还没有保存的项目。请添加工程目录或拖入 .project 文件。".to_string()
+            } else {
+                projects
+                    .into_iter()
+                    .map(|project| format!("- {} · {}", project.name, project.path))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -5136,6 +5519,7 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
     let guard = state.inner.lock().await;
     let model = model_summary(&guard.model);
     let project = guard.project.clone();
+    let projects = guard.projects.clone();
     let pending_changes = guard
         .pending
         .values()
@@ -5155,6 +5539,7 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
         model,
         mcp_servers,
         project,
+        projects,
         codesys: detect_codesys_installation(),
         skills: discover_skills(&project_for_skills),
         commands: available_commands(),
@@ -5563,6 +5948,7 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
         .unwrap_or_default()
         .to_string();
     let mut name = None;
+    let mut cwd = None;
     let mut messages = Vec::new();
     for line in content.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -5573,6 +5959,7 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
                 if let Some(id) = entry.get("id").and_then(Value::as_str) {
                     session_id = id.to_string();
                 }
+                cwd = entry.get("cwd").and_then(Value::as_str).map(str::to_string);
             }
             Some("session_info") => {
                 name = entry
@@ -5642,6 +6029,7 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
         name,
         path: path.to_string_lossy().to_string(),
         message_count,
+        cwd,
         messages,
         modified_at,
     })
@@ -6790,6 +7178,32 @@ mod tests {
     }
 
     #[test]
+    fn workspace_project_is_serialized_without_secrets() {
+        let state = RuntimeState {
+            project: ProjectContext {
+                path: Some("C:/PLC/Machine.project".to_string()),
+                name: Some("Machine".to_string()),
+                exists: true,
+                ..ProjectContext::default()
+            },
+            projects: vec![WorkspaceProject {
+                id: "c:/plc/machine.project".to_string(),
+                name: "Machine".to_string(),
+                path: "C:/PLC/Machine.project".to_string(),
+                exists: true,
+                last_opened_at: "10".to_string(),
+            }],
+            ..RuntimeState::default()
+        };
+        let config = runtime_config_without_secrets(&state);
+        assert_eq!(config.projects.len(), 1);
+        assert_eq!(
+            config.active_project_path.as_deref(),
+            Some("C:/PLC/Machine.project")
+        );
+    }
+
+    #[test]
     fn blank_model_key_preserves_same_endpoint_credential() {
         let current = ModelConfig {
             api_key: Some("synthetic-model-key".to_string()),
@@ -6901,6 +7315,7 @@ mod tests {
         let record = parse_session_record(&path).expect("解析会话文件");
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.name.as_deref(), Some("泵站诊断"));
+        assert_eq!(record.cwd.as_deref(), Some("C:/plc"));
         assert_eq!(record.message_count, 2);
         assert_eq!(record.messages[0].content, "检查 MAIN");
         assert_eq!(record.messages[1].content, "已读取工程。");

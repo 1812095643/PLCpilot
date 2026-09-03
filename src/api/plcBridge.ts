@@ -31,6 +31,14 @@ export type ProjectContext = {
   active_text_truncated: boolean
 }
 
+export type WorkspaceProject = {
+  id: string
+  name: string
+  path: string
+  exists: boolean
+  last_opened_at: string
+}
+
 export type ModelSummary = {
   provider: ProviderKind
   base_url: string
@@ -116,6 +124,7 @@ export type SessionRecord = {
   path: string
   modified_at: string | null
   message_count: number
+  cwd?: string | null
   messages: Array<{
     role: string
     content: string
@@ -171,6 +180,7 @@ export type Snapshot = {
   model: ModelSummary
   mcp_servers: McpSummary[]
   project: ProjectContext
+  projects: WorkspaceProject[]
   codesys: CodesysStatus
   skills: SkillSummary[]
   commands: CommandSummary[]
@@ -281,6 +291,7 @@ export const EMPTY_SNAPSHOT: Snapshot = {
   model: { provider: 'responses', base_url: 'https://api.openai.com/v1', model: 'gpt-5', configured: false, api_key_configured: false },
   mcp_servers: [],
   project: EMPTY_PROJECT,
+  projects: [],
   codesys: { detected: false, executable: null, supported_version: 'CODESYS 3.5.22', note: '等待桌面运行时检测' },
   skills: [],
   commands: [],
@@ -306,10 +317,16 @@ export const EMPTY_SNAPSHOT: Snapshot = {
 
 export const getSnapshot = () => invoke<Snapshot>('get_snapshot')
 export const selectProject = (path: string) => invoke<ProjectContext>('select_project', { path })
+export const pickProjectFolder = () => invoke<string | null>('pick_project_folder')
+export const listProjects = () => invoke<WorkspaceProject[]>('list_projects')
+export const removeProject = (id: string) => invoke<WorkspaceProject[]>('remove_project', { id })
 export const scanProject = () => invoke<ProjectContext>('scan_project')
 export const syncCurrentProject = () => invoke<ProjectContext>('sync_current_project')
 export const listSessions = () => invoke<SessionRecord[]>('list_sessions')
 export const resumeSession = (path: string) => invoke<SessionRecord>('resume_session', { path })
+export const startNewSession = () => invoke<SessionSummary>('start_new_session')
+export const renameSession = (name: string, path?: string) => invoke<SessionSummary>('rename_session', { name, path })
+export const deleteSession = (path: string) => invoke<SessionRecord[]>('delete_session', { path })
 export const getSkillContent = (id: string) => invoke<string>('get_skill_content', { id })
 export const compileProject = () => invoke<{ content: unknown[]; is_error: boolean }>('compile_project')
 export const approveChange = (id: string) => invoke<unknown>('approve_change', { id })

@@ -1,5 +1,5 @@
 <template>
-  <div class="desktop-layout" :class="{ 'is-mobile': isMobile }" :style="layoutStyle">
+  <div class="desktop-layout" :class="{ 'is-mobile': isMobile }" :style="layoutStyle" @dragover="$emit('dragover', $event)" @dragleave="$emit('dragleave', $event)" @drop="$emit('drop', $event)">
     <Teleport v-if="isMobile" to="body">
       <Transition name="drawer">
         <div v-if="!isSidebarCollapsed" class="mobile-drawer-backdrop" @click="$emit('close-sidebar')">
@@ -44,6 +44,9 @@ const props = withDefaults(
 
 defineEmits<{
   'close-sidebar': []
+  dragover: [event: DragEvent]
+  dragleave: [event: DragEvent]
+  drop: [event: DragEvent]
 }>()
 
 const { isMobile } = useMobile()

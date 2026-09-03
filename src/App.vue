@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, shallowRef, watch, type ComponentPublicInstance } from 'vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import DesktopLayout from './components/layout/DesktopLayout.vue'
 import SidebarThreadControls from './components/sidebar/SidebarThreadControls.vue'
 import ContentHeader from './components/content/ContentHeader.vue'
@@ -11,6 +12,9 @@ import IconTablerBolt from './components/icons/IconTablerBolt.vue'
 import IconTablerSettings from './components/icons/IconTablerSettings.vue'
 import IconTablerSearch from './components/icons/IconTablerSearch.vue'
 import IconTablerTerminal from './components/icons/IconTablerTerminal.vue'
+import IconTablerFolder from './components/icons/IconTablerFolder.vue'
+import IconTablerFilePencil from './components/icons/IconTablerFilePencil.vue'
+import IconTablerTrash from './components/icons/IconTablerTrash.vue'
 import IconTablerX from './components/icons/IconTablerX.vue'
 import {
   approveChange,
@@ -21,12 +25,17 @@ import {
   EMPTY_SNAPSHOT,
   getSkillContent,
   getSnapshot,
+  deleteSession,
+  pickProjectFolder,
+  removeProject,
+  renameSession,
   rejectChange,
   resumeSession,
   runAgent,
   saveMcp,
   saveModel,
   selectProject,
+  startNewSession,
   syncCurrentProject,
   type AgentEvent,
   type AgentResult,
@@ -38,6 +47,7 @@ import {
   type PendingChange,
   type SessionRecord,
   type Snapshot,
+  type WorkspaceProject,
 } from './api/plcBridge'
 import type {
   CollaborationModeKind,
@@ -57,6 +67,7 @@ const activeView = shallowRef<View>('chat')
 const activeThreadId = shallowRef('local-plc-thread')
 const isSidebarCollapsed = shallowRef(false)
 const isBusy = shallowRef(false)
+const isWindowDropActive = shallowRef(false)
 const isRefreshing = shallowRef(false)
 const notice = shallowRef('')
 const isDiscoveringModels = shallowRef(false)
@@ -96,6 +107,7 @@ const fallbackCommands: CommandSummary[] = [
   { command: '/help', label: '帮助', detail: '查看命令和安全边界', category: 'session', supports_args: false },
   { command: '/status', label: '运行状态', detail: '工程、模型和会话状态', category: 'session', supports_args: false },
   { command: '/sessions', label: '会话历史', detail: '列出本机保存的工作会话', category: 'session', supports_args: false },
+  { command: '/projects', label: '项目列表', detail: '查看最近打开的工程目录', category: 'project', supports_args: false },
   { command: '/rename', label: '重命名会话', detail: '给当前会话设置一个易识别的名称', category: 'session', supports_args: true },
   { command: '/clear', label: '清空会话', detail: '移除当前对话记录，不改工程文件', category: 'session', supports_args: false },
   { command: '/scan', label: '扫描工程', detail: '读取工程树和源对象', category: 'project', supports_args: false },
@@ -119,6 +131,7 @@ const modelOptions = computed(() => {
   return Array.from(new Set([...discovered, configured, selectedModel.value, 'gpt-5'].filter(Boolean)))
 })
 const currentProject = computed(() => snapshot.value.project)
+const recentProjects = computed(() => snapshot.value.projects.filter((project) => !isSamePath(project.path, currentProject.value.path)))
 const currentCwd = computed(() => currentProject.value.working_directory || currentProject.value.project_directory || currentProject.value.path || '')
 const currentTitle = computed(() => snapshot.value.session.name || currentProject.value.name || 'PLC Pilot')
 const skills = computed(() => snapshot.value.skills.map((skill) => ({
@@ -436,16 +449,75 @@ async function onCompile(): Promise<void> {
   }
 }
 
-async function onSelectProject(): Promise<void> {
-  const path = projectPathDraft.value.trim()
-  if (!path) {
+function pathKey(value: string | null | undefined): string {
+  return (value || '').trim().replaceAll('\\', '/').replace(/\/+$/u, '').toLowerCase()
+}
+
+function isSamePath(left: string | null | undefined, right: string | null | undefined): boolean {
+  const leftKey = pathKey(left)
+  const rightKey = pathKey(right)
+  return leftKey.length > 0 && leftKey === rightKey
+}
+
+function resetConversationForWorkspace(): void {
+  activeThreadId.value = `local-${Date.now()}`
+  messages.value = []
+  diagnostics.value = []
+  diagnosticNote.value = ''
+  liveOverlay.value = null
+}
+
+async function activateProject(path: string): Promise<void> {
+  const normalized = path.trim()
+  if (!normalized) {
     showNotice('请输入 CODESYS 工程文件或目录路径。')
     return
   }
+  const previousPath = currentProject.value.path
   try {
-    snapshot.value = { ...snapshot.value, project: await selectProject(path) }
+    const project = await selectProject(normalized)
+    snapshot.value = { ...snapshot.value, project }
+    projectPathDraft.value = project.path || normalized
+    if (!isSamePath(previousPath, project.path)) {
+      await startNewSession()
+      resetConversationForWorkspace()
+    }
     activeView.value = 'overview'
-    showNotice('工程上下文已更新。')
+    await refresh()
+    showNotice(`已打开工程：${project.name || project.path || normalized}`)
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function onSelectProject(): Promise<void> {
+  await activateProject(projectPathDraft.value)
+}
+
+async function onPickProjectFolder(): Promise<void> {
+  try {
+    const path = await pickProjectFolder()
+    if (path) await activateProject(path)
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '文件夹选择窗口尚未准备好。')
+  }
+}
+
+async function onOpenProject(project: WorkspaceProject): Promise<void> {
+  await activateProject(project.path)
+}
+
+async function onRemoveProject(project: WorkspaceProject): Promise<void> {
+  if (!window.confirm(`从工作区移除“${project.name}”吗？不会删除磁盘上的文件。`)) return
+  try {
+    const projects = await removeProject(project.id)
+    snapshot.value = { ...snapshot.value, projects }
+    if (isSamePath(currentProject.value.path, project.path)) {
+      resetConversationForWorkspace()
+      snapshot.value = { ...snapshot.value, project: { ...snapshot.value.project, path: null, exists: false, name: null, project_directory: null, source_root: null, source_files: [], file_count: 0, pou_count: 0, scan_status: 'not_scanned', scan_message: null } }
+      activeView.value = 'chat'
+    }
+    showNotice(`已从工作区移除：${project.name}`)
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
   }
@@ -453,6 +525,11 @@ async function onSelectProject(): Promise<void> {
 
 async function onResumeSession(record: SessionRecord): Promise<void> {
   try {
+    if (record.cwd && !isSamePath(currentCwd.value, record.cwd)) {
+      const project = await selectProject(record.cwd)
+      snapshot.value = { ...snapshot.value, project }
+      projectPathDraft.value = project.path || record.cwd
+    }
     const resumed = await resumeSession(record.path)
     activeThreadId.value = resumed.session_id
     messages.value = resumed.messages.map((item, index) => ({
@@ -468,7 +545,37 @@ async function onResumeSession(record: SessionRecord): Promise<void> {
       session: { ...snapshot.value.session, session_id: resumed.session_id, session_file: resumed.path, name: resumed.name, message_count: resumed.message_count },
     }
     activeView.value = 'chat'
+    await refresh()
     showNotice(`已恢复会话：${resumed.name || resumed.session_id.slice(0, 12)}`)
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function onRenameSession(record: SessionRecord): Promise<void> {
+  const currentName = record.name || ''
+  const name = window.prompt('输入新的会话名称', currentName)
+  if (name === null || !name.trim()) return
+  try {
+    await renameSession(name, record.path)
+    await refresh()
+    showNotice('会话名称已更新。')
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function onDeleteSession(record: SessionRecord): Promise<void> {
+  if (!window.confirm(`清理会话“${record.name || record.session_id.slice(0, 12)}”吗？这只会删除本地会话记录。`)) return
+  try {
+    const sessions = await deleteSession(record.path)
+    snapshot.value = { ...snapshot.value, sessions }
+    if (record.session_id === snapshot.value.session.session_id) {
+      await startNewSession()
+      resetConversationForWorkspace()
+      snapshot.value = { ...snapshot.value, session: { ...snapshot.value.session, session_id: null, session_file: null, name: null, message_count: 0 } }
+    }
+    showNotice('本地会话记录已清理。')
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
   }
@@ -555,13 +662,108 @@ function chooseCommand(command: string, supportsArgs: boolean): void {
   if (!supportsArgs) void onSubmit({ text: command, skills: [], attachments: [], mode: 'steer' })
 }
 
-function startNewThread(): void {
-  activeThreadId.value = `local-${Date.now()}`
-  messages.value = []
-  diagnostics.value = []
-  diagnosticNote.value = ''
-  snapshot.value = { ...snapshot.value, session: { ...snapshot.value.session, session_id: null, session_file: null, name: null, message_count: 0 } }
-  activeView.value = 'chat'
+async function startNewThread(): Promise<void> {
+  if (isBusy.value) {
+    showNotice('当前任务仍在运行，请先停止或等待它完成。')
+    return
+  }
+  try {
+    const session = await startNewSession()
+    resetConversationForWorkspace()
+    snapshot.value = { ...snapshot.value, session }
+    activeView.value = 'chat'
+    showNotice('已新建会话，工程文件没有改动。')
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+function droppedProjectPath(paths: string[]): string | null {
+  const normalized = paths.map((path) => path.trim()).filter(Boolean)
+  return normalized.find((path) => /\.(project|projectarchive)$/iu.test(path))
+    || normalized.find((path) => !/[.][^\\/]+$/u.test(path))
+    || (normalized.length === 1 ? normalized[0] : null)
+}
+
+function dropIsOverComposer(position?: { x: number; y: number }): boolean {
+  if (!position || typeof document === 'undefined') return false
+  const scale = window.devicePixelRatio || 1
+  const points = [
+    [position.x, position.y],
+    [position.x / scale, position.y / scale],
+  ]
+  return points.some(([x, y]) => document.elementFromPoint(x, y)?.closest('.plc-thread-composer') !== null)
+}
+
+async function openDroppedProject(paths: string[], position?: { x: number; y: number }): Promise<void> {
+  isWindowDropActive.value = false
+  if (dropIsOverComposer(position)) return
+  const path = droppedProjectPath(paths)
+  if (!path) {
+    showNotice('请拖入 CODESYS 工程目录或 .project 文件。')
+    return
+  }
+  await activateProject(path)
+}
+
+function onWindowDragOver(event: DragEvent): void {
+  if (event.target instanceof Element && event.target.closest('.plc-thread-composer')) {
+    isWindowDropActive.value = false
+    return
+  }
+  const types = Array.from(event.dataTransfer?.types ?? [])
+  if (!types.includes('Files') && !types.includes('text/uri-list')) return
+  event.preventDefault()
+  isWindowDropActive.value = true
+}
+
+function onWindowDragLeave(event: DragEvent): void {
+  if (event.relatedTarget instanceof Node && event.currentTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return
+  isWindowDropActive.value = false
+}
+
+function uriToLocalPath(value: string): string | null {
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'file:') return null
+    const pathname = decodeURIComponent(url.pathname)
+    if (url.hostname && url.hostname !== 'localhost') return `\\\\${url.hostname}${pathname.replaceAll('/', '\\')}`
+    return pathname.replace(/^\/(?=[A-Z]:[\\/])/iu, '')
+  } catch {
+    return null
+  }
+}
+
+async function onWindowDrop(event: DragEvent): Promise<void> {
+  if (event.target instanceof Element && event.target.closest('.plc-thread-composer')) {
+    isWindowDropActive.value = false
+    return
+  }
+  const uriPaths = (event.dataTransfer?.getData('text/uri-list') ?? '')
+    .split(/\r?\n/u)
+    .map((value) => uriToLocalPath(value.trim()))
+    .filter((value): value is string => value !== null)
+  if (uriPaths.length === 0) return
+  event.preventDefault()
+  await openDroppedProject(uriPaths)
+}
+
+async function setupNativeWindowDrop(): Promise<void> {
+  try {
+    stopWindowDrop = await getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === 'enter' || event.payload.type === 'over') {
+        isWindowDropActive.value = !dropIsOverComposer(event.payload.position)
+        return
+      }
+      if (event.payload.type === 'leave') {
+        isWindowDropActive.value = false
+        return
+      }
+      void openDroppedProject(event.payload.paths, event.payload.position)
+    })
+  } catch {
+    // 浏览器预览没有 Tauri 原生拖拽事件，保留 DOM URI 回退。
+  }
 }
 
 function onKeyDown(event: KeyboardEvent): void {
@@ -577,6 +779,7 @@ function onKeyDown(event: KeyboardEvent): void {
 }
 
 let stopListening: UnlistenFn | undefined
+let stopWindowDrop: UnlistenFn | undefined
 let syncTimer: number | undefined
 
 watch(theme, applyTheme, { immediate: true })
@@ -584,6 +787,7 @@ watch(theme, applyTheme, { immediate: true })
 onMounted(async () => {
   await refresh()
   window.addEventListener('keydown', onKeyDown)
+  await setupNativeWindowDrop()
   try {
     stopListening = await listen<AgentEvent>('agent-event', (event) => {
       const item = event.payload
@@ -608,12 +812,19 @@ onMounted(async () => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeyDown)
   stopListening?.()
+  stopWindowDrop?.()
   if (syncTimer) window.clearInterval(syncTimer)
 })
 </script>
 
 <template>
-  <DesktopLayout :is-sidebar-collapsed="isSidebarCollapsed" @close-sidebar="isSidebarCollapsed = true">
+  <DesktopLayout
+    :is-sidebar-collapsed="isSidebarCollapsed"
+    @close-sidebar="isSidebarCollapsed = true"
+    @dragover="onWindowDragOver"
+    @dragleave="onWindowDragLeave"
+    @drop="onWindowDrop"
+  >
     <template #sidebar>
       <aside class="plc-sidebar">
         <SidebarThreadControls
@@ -633,25 +844,43 @@ onUnmounted(() => {
         </button>
 
         <div class="plc-sidebar-rule" />
-        <p class="plc-sidebar-label">工作区</p>
+        <div class="plc-project-heading">
+          <span class="plc-sidebar-label plc-sidebar-label-inline">项目</span>
+          <button class="plc-sidebar-add-button" type="button" aria-label="添加项目" title="添加项目文件夹" @click="onPickProjectFolder">
+            <IconTablerFolder />
+          </button>
+        </div>
         <button class="plc-project-row" type="button" @click="activeView = 'overview'">
           <span class="plc-project-status" :data-state="currentProject.exists ? 'ok' : 'idle'" />
           <span class="plc-project-copy"><strong>{{ currentProject.name || '尚未选择工程' }}</strong><small>{{ currentProject.path || '选择一个 .project 或工程目录' }}</small></span>
         </button>
+        <div v-if="recentProjects.length > 0" class="plc-project-list">
+          <div v-for="project in recentProjects" :key="project.id" class="plc-project-list-row">
+            <button class="plc-project-list-main" type="button" :title="project.path" @click="onOpenProject(project)">
+              <span class="plc-project-status" :data-state="project.exists ? 'ok' : 'idle'" />
+              <span class="plc-project-copy"><strong>{{ project.name }}</strong><small>{{ project.path }}</small></span>
+            </button>
+            <button class="plc-project-remove" type="button" :aria-label="`从工作区移除 ${project.name}`" :title="`从工作区移除 ${project.name}`" @click="onRemoveProject(project)">
+              <IconTablerTrash />
+            </button>
+          </div>
+        </div>
 
         <p class="plc-sidebar-label plc-sidebar-label-spaced">会话</p>
         <div class="plc-session-list">
-          <button
+          <div
             v-for="record in snapshot.sessions"
             :key="record.path"
             class="plc-session-row"
             :class="{ 'is-active': record.session_id === snapshot.session.session_id }"
-            type="button"
-            @click="onResumeSession(record)"
           >
-            <span class="plc-session-dot" />
-            <span class="plc-session-copy"><strong>{{ record.name || record.session_id.slice(0, 12) }}</strong><small>{{ record.message_count }} 条消息</small></span>
-          </button>
+            <button class="plc-session-main" type="button" @click="onResumeSession(record)">
+              <span class="plc-session-dot" />
+              <span class="plc-session-copy"><strong>{{ record.name || record.session_id.slice(0, 12) }}</strong><small>{{ record.message_count }} 条消息 · {{ record.cwd || '本地会话' }}</small></span>
+            </button>
+            <button class="plc-session-action" type="button" :aria-label="`重命名会话 ${record.name || record.session_id.slice(0, 12)}`" title="重命名会话" @click="onRenameSession(record)"><IconTablerFilePencil /></button>
+            <button class="plc-session-action plc-session-delete" type="button" :aria-label="`清理会话 ${record.name || record.session_id.slice(0, 12)}`" title="清理本地会话" @click="onDeleteSession(record)"><IconTablerTrash /></button>
+          </div>
           <p v-if="snapshot.sessions.length === 0" class="plc-empty-side">发送第一条任务后，会话会自动保留。</p>
         </div>
 
@@ -724,7 +953,7 @@ onUnmounted(() => {
         <div v-else-if="activeView === 'overview'" class="plc-detail-layout">
           <section class="plc-detail-section plc-project-overview">
             <div class="plc-section-heading"><div><p class="plc-eyebrow">工程上下文</p><h2>{{ currentProject.name || '选择 CODESYS 工程' }}</h2></div><button class="plc-button plc-button-primary" type="button" @click="onCompile"><IconTablerTerminal /> 编译诊断</button></div>
-            <div class="plc-project-picker"><input v-model="projectPathDraft" type="text" placeholder="C:\\Projects\\Machine\\Machine.project" @keydown.enter="onSelectProject" /><button class="plc-button plc-button-quiet" type="button" @click="onSelectProject">读取工程</button></div>
+            <div class="plc-project-picker"><input v-model="projectPathDraft" type="text" placeholder="C:\\Projects\\Machine\\Machine.project" @keydown.enter="onSelectProject" /><button class="plc-button plc-button-quiet" type="button" @click="onSelectProject">读取工程</button><button class="plc-button plc-button-quiet plc-project-folder-button" type="button" aria-label="选择工程文件夹" title="选择工程文件夹" @click="onPickProjectFolder"><IconTablerFolder /></button></div>
             <div class="plc-fact-grid"><div><span>版本</span><strong>{{ currentProject.version || snapshot.codesys.supported_version }}</strong></div><div><span>源文件</span><strong>{{ currentProject.file_count }}</strong></div><div><span>POU / 源对象</span><strong>{{ currentProject.pou_count }}</strong></div><div><span>扫描</span><strong :data-state="currentProject.scan_status">{{ currentProject.scan_status === 'scanned' ? '已完成' : currentProject.scan_status === 'warning' ? '需注意' : '等待' }}</strong></div></div>
             <p v-if="currentProject.scan_message" class="plc-inline-note">{{ currentProject.scan_message }}</p>
           </section>
@@ -740,6 +969,12 @@ onUnmounted(() => {
       </section>
     </template>
   </DesktopLayout>
+
+  <div v-if="isWindowDropActive" class="plc-window-drop-overlay" role="status" aria-live="polite">
+    <IconTablerFolder />
+    <strong>松开以打开工程</strong>
+    <span>支持工程目录或 .project 文件</span>
+  </div>
 
   <Transition name="plc-fade"><div v-if="notice" class="plc-toast" role="status">{{ notice }}</div></Transition>
 
@@ -823,13 +1058,31 @@ onUnmounted(() => {
 .plc-brand-copy small, .plc-project-copy small, .plc-session-copy small, .plc-sidebar-link small { @apply truncate text-[11px] text-slate-500; }
 .plc-sidebar-rule { @apply my-3 h-px bg-slate-200; }
 .plc-sidebar-label { @apply px-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400; }
+.plc-project-heading { @apply flex items-center justify-between; }
+.plc-sidebar-label-inline { @apply px-2; }
+.plc-sidebar-add-button { @apply flex h-6 w-6 items-center justify-center rounded-md border-0 bg-transparent text-slate-500 transition hover:bg-white hover:text-slate-900; }
+.plc-sidebar-add-button :deep(svg) { @apply h-4 w-4; }
 .plc-sidebar-label-spaced { @apply mt-5; }
 .plc-project-row { @apply mt-2 px-2 py-2; }
+.plc-project-list { @apply mt-1 grid gap-0.5 border-l border-slate-200 pl-1.5; }
+.plc-project-list { max-height: 22vh; overflow-y: auto; }
+.plc-project-list-row { @apply flex min-w-0 items-center gap-1 rounded-md transition hover:bg-white/80; }
+.plc-project-list-row.is-active { @apply bg-white shadow-sm; }
+.plc-project-list-main { @apply flex min-w-0 flex-1 items-center gap-2 rounded-md border-0 bg-transparent px-1.5 py-1.5 text-left; }
+.plc-project-list-main .plc-project-copy strong { @apply text-[11px] font-medium; }
+.plc-project-list-main .plc-project-copy small { @apply text-[10px]; }
+.plc-project-remove, .plc-session-action { @apply flex h-6 w-6 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-400 transition hover:bg-slate-200 hover:text-slate-700; }
+.plc-project-remove :deep(svg), .plc-session-action :deep(svg) { @apply h-3.5 w-3.5; }
 .plc-project-status, .plc-header-status, .plc-session-dot { @apply h-2 w-2 shrink-0 rounded-full bg-slate-300; }
 .plc-project-status[data-state='ok'], .plc-header-status[data-state='ok'] { @apply bg-emerald-500; }
 .plc-header-status[data-state='busy'] { @apply animate-pulse bg-amber-500; }
 .plc-session-dot { @apply h-1.5 w-1.5 bg-slate-300; }
-.plc-session-row { @apply mt-0.5 px-2 py-2; }
+.plc-session-row { @apply mt-0.5 flex min-w-0 items-center gap-0.5 rounded-lg px-1.5 py-1; }
+.plc-session-list { min-height: 0; max-height: 38vh; overflow-y: auto; }
+.plc-session-main { @apply flex min-w-0 flex-1 items-center gap-2 rounded-md border-0 bg-transparent px-0.5 py-1 text-left; }
+.plc-session-action { @apply opacity-0; }
+.plc-session-row:hover .plc-session-action, .plc-session-row.is-active .plc-session-action { @apply opacity-100; }
+.plc-session-delete:hover, .plc-project-remove:hover { @apply bg-rose-100 text-rose-700; }
 .plc-session-row.is-active { @apply bg-white shadow-sm; }
 .plc-session-row.is-active .plc-session-dot { @apply bg-amber-500; }
 .plc-empty-side { @apply px-2 py-3 text-xs leading-5 text-slate-400; }
@@ -853,6 +1106,8 @@ onUnmounted(() => {
 .plc-section-meta { @apply text-xs text-slate-400; }
 .plc-project-picker { @apply mt-5 flex gap-2; }
 .plc-project-picker input { @apply min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-800 outline-none transition focus:border-amber-400 focus:bg-white focus:ring-2 focus:ring-amber-100; }
+.plc-project-folder-button { @apply w-9 shrink-0 px-0; }
+.plc-project-folder-button :deep(svg) { @apply h-4 w-4; }
 .plc-fact-grid { @apply mt-5 grid grid-cols-2 gap-px overflow-hidden rounded-lg bg-slate-200 sm:grid-cols-4; }
 .plc-fact-grid > div { @apply flex flex-col gap-1 bg-white px-3 py-3; }
 .plc-fact-grid span { @apply text-[10px] uppercase tracking-wider text-slate-400; }
@@ -948,6 +1203,10 @@ onUnmounted(() => {
 .plc-theme-choice.is-active { @apply border-zinc-900 bg-zinc-900 text-white; }
 .plc-skill-content { @apply mt-5 max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-950 p-4 font-mono text-xs leading-5 text-zinc-200; }
 .plc-toast { @apply fixed bottom-5 left-1/2 z-[600] -translate-x-1/2 rounded-full bg-zinc-900 px-4 py-2 text-xs text-white shadow-xl; }
+.plc-window-drop-overlay { @apply pointer-events-none fixed inset-3 z-[700] flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-sky-500 bg-sky-500/10 text-sky-700 backdrop-blur-sm; }
+.plc-window-drop-overlay :deep(svg) { @apply h-8 w-8; }
+.plc-window-drop-overlay strong { @apply text-base font-semibold; }
+.plc-window-drop-overlay span { @apply text-xs; }
 .plc-fade-enter-active, .plc-fade-leave-active { @apply transition duration-200; }
 .plc-fade-enter-from, .plc-fade-leave-to { @apply translate-y-2 opacity-0; }
 
@@ -956,6 +1215,10 @@ onUnmounted(() => {
 :global(:root.dark) .plc-sidebar-label, :global(:root.dark) .plc-brand-copy small, :global(:root.dark) .plc-project-copy small, :global(:root.dark) .plc-session-copy small, :global(:root.dark) .plc-sidebar-link small { @apply text-zinc-500; }
 :global(:root.dark) .plc-brand-mark { @apply bg-zinc-100 text-zinc-900; }
 :global(:root.dark) .plc-brand-row:hover, :global(:root.dark) .plc-project-row:hover, :global(:root.dark) .plc-session-row:hover, :global(:root.dark) .plc-sidebar-link:hover, :global(:root.dark) .plc-sidebar-link.is-active, :global(:root.dark) .plc-session-row.is-active { @apply bg-zinc-800; }
+:global(:root.dark) .plc-project-list { @apply border-zinc-700; }
+:global(:root.dark) .plc-project-list-row:hover, :global(:root.dark) .plc-project-list-row.is-active { @apply bg-zinc-800; }
+:global(:root.dark) .plc-sidebar-add-button:hover, :global(:root.dark) .plc-project-remove:hover, :global(:root.dark) .plc-session-action:hover { @apply bg-zinc-700 text-zinc-100; }
+:global(:root.dark) .plc-session-delete:hover, :global(:root.dark) .plc-project-remove:hover { @apply bg-rose-950 text-rose-200; }
 :global(:root.dark) .plc-content, :global(:root.dark) .plc-detail-layout { @apply bg-zinc-950; }
 :global(:root.dark) .plc-detail-section, :global(:root.dark) .plc-approval-card, :global(:root.dark) .plc-command-palette, :global(:root.dark) .plc-settings-modal, :global(:root.dark) .plc-skill-modal { @apply bg-zinc-900 text-zinc-100; }
 :global(:root.dark) .plc-section-heading h2, :global(:root.dark) .plc-modal-heading h2, :global(:root.dark) .plc-fact-grid strong, :global(:root.dark) .plc-skill-card strong, :global(:root.dark) .plc-command-row strong, :global(:root.dark) .plc-settings-group-title { @apply text-zinc-100; }
@@ -983,6 +1246,7 @@ onUnmounted(() => {
 :global(:root.dark) .plc-skill-card { border-color: var(--plc-dark-border); background-color: var(--plc-dark-surface-raised); }
 :global(:root.dark) .plc-button-quiet, :global(:root.dark) .plc-theme-choice { @apply border-zinc-700 bg-zinc-800 text-zinc-200; }
 :global(:root.dark) .plc-toast { @apply bg-zinc-100 text-zinc-900; }
+:global(:root.dark) .plc-window-drop-overlay { @apply border-sky-400 bg-sky-400/10 text-sky-300; }
 
 @media (max-width: 767px) {
   .plc-sidebar { @apply px-3; }
