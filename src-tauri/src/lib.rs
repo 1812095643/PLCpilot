@@ -34,6 +34,9 @@ const RPC_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const RPC_PROTOCOL_VERSION: u32 = 1;
 const RPC_REQUEST_TIMEOUT_SECONDS: u64 = 300;
 
+mod attachments;
+use attachments::{prepare_attachments, read_local_file, AttachmentInput, CodexImageInput};
+
 const CODESYS_SKILL: &str = include_str!("../../skills/codesys-agent/SKILL.md");
 const PLC_SAFETY_SKILL: &str = include_str!("../../skills/plc-safety/SKILL.md");
 const IEC_ST_SKILL: &str = include_str!("../../skills/iec61131-st/SKILL.md");
@@ -293,6 +296,8 @@ pub struct SessionRecord {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<CodexImageInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -314,6 +319,9 @@ pub struct AgentRequest {
     /// 本轮重点 Skill 的 id 或路径。
     #[serde(default)]
     pub skills: Vec<String>,
+    /// 本轮待发送的图片、文本和其他文件附件。
+    #[serde(default)]
+    pub attachments: Vec<AttachmentInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1028,10 +1036,7 @@ async fn dispatch_local_rpc(
                 .or_else(|| args.get("input"))
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    AppError::Configuration("turn/start 需要 message 或 prompt".to_string())
-                })?
+                .unwrap_or_default()
                 .to_string();
             let history = args
                 .get("history")
@@ -1053,6 +1058,20 @@ async fn dispatch_local_rpc(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let attachments = args
+                .get("attachments")
+                .cloned()
+                .map(|value| serde_json::from_value::<Vec<AttachmentInput>>(value))
+                .transpose()
+                .map_err(|error| {
+                    AppError::Configuration(format!("turn/start attachments 无法解析：{error}"))
+                })?
+                .unwrap_or_default();
+            if message.is_empty() && attachments.is_empty() {
+                return Err(AppError::Configuration(
+                    "turn/start 需要 message、prompt 或可读取的附件".to_string(),
+                ));
+            }
             let request = AgentRequest {
                 message,
                 history,
@@ -1070,6 +1089,7 @@ async fn dispatch_local_rpc(
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 skills,
+                attachments,
                 ..AgentRequest::default()
             };
             serde_json::to_value(run_agent_inner(app.clone(), request, &state).await?)
@@ -1197,6 +1217,11 @@ async fn dispatch_local_rpc(
                 .map_err(|error| {
                     AppError::Internal(format!("编码工程文件搜索结果未完成：{error}"))
                 })?
+        }
+        "read_local_attachment_file" => {
+            let path = required_string_arg(&args, "path")?;
+            serde_json::to_value(read_local_file(Path::new(&path)).map_err(AppError::Project)?)
+                .map_err(|error| AppError::Internal(format!("编码本地附件未完成：{error}")))?
         }
         "update_thread_file_changes" => {
             let request = nested_arg_or_self::<FileChangesRequest>(&args, "request")?;
@@ -1552,10 +1577,22 @@ pub fn run() {
             sync_current_project,
             compact_context,
             search_project_files,
+            read_local_attachment_file,
             update_thread_file_changes
         ])
         .run(tauri::generate_context!())
         .expect("PLC Pilot 启动失败");
+}
+
+#[tauri::command]
+fn read_local_attachment_file(path: String) -> Result<AttachmentInput, AppError> {
+    let candidate = PathBuf::from(path.trim());
+    if candidate.as_os_str().is_empty() {
+        return Err(AppError::Configuration(
+            "剪贴板没有提供文件路径".to_string(),
+        ));
+    }
+    read_local_file(&candidate).map_err(AppError::Project)
 }
 
 #[tauri::command]
@@ -2180,12 +2217,17 @@ async fn compile_project_inner(state: &AppState) -> Result<ToolCallResult, AppEr
 #[tauri::command]
 async fn run_agent_legacy(
     app: AppHandle,
-    request: AgentRequest,
+    mut request: AgentRequest,
     state: &AppState,
 ) -> Result<AgentRunResult, AppError> {
-    if request.message.trim().is_empty() {
+    prepare_attachments(&mut request.attachments);
+    if request.message.trim().is_empty()
+        && request.attachments.iter().all(|item| {
+            item.error.is_some() || (item.kind != "image" && item.text_content.is_none())
+        })
+    {
         return Err(AppError::Configuration(
-            "请输入要交给 Agent 的任务".to_string(),
+            "请输入任务或添加一个可读取的图片/文本附件".to_string(),
         ));
     }
     let (base_model, project, servers) = {
@@ -2207,9 +2249,18 @@ async fn run_agent_legacy(
     }
     let system = build_agent_system_prompt(&project, &request);
     let mut messages = request.history;
+    let attachment_text = attachments::attachment_context(&request.attachments);
+    let prompt_text = if attachment_text.is_empty() {
+        request.message.clone()
+    } else if request.message.trim().is_empty() {
+        attachment_text
+    } else {
+        format!("{}\n\n{}", request.message.trim(), attachment_text)
+    };
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: request.message,
+        content: prompt_text,
+        images: attachments::attachment_images(&request.attachments),
     });
     push_event(
         &app,
@@ -2346,12 +2397,17 @@ async fn abort_agent(state: State<'_, AppState>) -> Result<Value, AppError> {
 
 async fn run_agent_inner(
     app: AppHandle,
-    request: AgentRequest,
+    mut request: AgentRequest,
     state: &AppState,
 ) -> Result<AgentRunResult, AppError> {
-    if request.message.trim().is_empty() {
+    prepare_attachments(&mut request.attachments);
+    if request.message.trim().is_empty()
+        && request.attachments.iter().all(|item| {
+            item.error.is_some() || (item.kind != "image" && item.text_content.is_none())
+        })
+    {
         return Err(AppError::Configuration(
-            "请输入要交给 Agent 的任务".to_string(),
+            "请输入任务或添加一个可读取的图片/文本附件".to_string(),
         ));
     }
 
@@ -3004,6 +3060,8 @@ async fn run_pi_host(
         "request_id": request_id,
         "action": action,
         "message": request.message,
+        // 图片沿用 Codex 的 image_url 数据 URI；文本/工作簿正文由宿主拼接到本轮提示。
+        "attachments": request.attachments,
         "instructions": request
             .message
             .strip_prefix("/compact")
@@ -3506,6 +3564,7 @@ fn tool_feedback(tool: &str, content: &str) -> ChatMessage {
     ChatMessage {
         role: "user".to_string(),
         content: format!("[PLC Pilot 工具结果: {tool}]\n{content}"),
+        images: Vec::new(),
     }
 }
 
@@ -4265,7 +4324,7 @@ async fn call_responses(
     let body = json!({
         "model": config.model,
         "instructions": system,
-        "input": normalized_messages(messages),
+        "input": normalized_messages_for_api(messages, ApiFlavor::OpenAiResponses),
         "tools": response_tools(tools),
         "max_output_tokens": config.max_tokens,
     });
@@ -4274,7 +4333,7 @@ async fn call_responses(
         config,
         &endpoint(&config.base_url, "responses"),
         body,
-        ApiFlavor::OpenAi,
+        ApiFlavor::OpenAiResponses,
     )
     .await?;
     let mut response = ModelResponse::default();
@@ -4328,7 +4387,7 @@ async fn call_messages(
     let body = json!({
         "model": config.model,
         "system": system,
-        "messages": normalized_messages(messages),
+        "messages": normalized_messages_for_api(messages, ApiFlavor::Anthropic),
         "tools": anthropic_tools(tools),
         "max_tokens": config.max_tokens,
     });
@@ -4375,7 +4434,7 @@ async fn call_chat_completions(
     tools: &[McpTool],
 ) -> Result<ModelResponse, AppError> {
     let mut input = vec![json!({"role": "system", "content": system})];
-    input.extend(normalized_messages(messages));
+    input.extend(normalized_messages_for_api(messages, ApiFlavor::OpenAiChat));
     let body = json!({
         "model": config.model,
         "messages": input,
@@ -4387,7 +4446,7 @@ async fn call_chat_completions(
         config,
         &endpoint(&config.base_url, "chat/completions"),
         body,
-        ApiFlavor::OpenAi,
+        ApiFlavor::OpenAiChat,
     )
     .await?;
     let message = value
@@ -4434,7 +4493,7 @@ async fn call_ollama(
     tools: &[McpTool],
 ) -> Result<ModelResponse, AppError> {
     let mut input = vec![json!({"role": "system", "content": system})];
-    input.extend(normalized_messages(messages));
+    input.extend(normalized_messages_for_api(messages, ApiFlavor::Ollama));
     let body = json!({
         "model": config.model,
         "messages": input,
@@ -4478,7 +4537,7 @@ async fn call_ollama(
     Ok(response)
 }
 
-fn normalized_messages(messages: &[ChatMessage]) -> Vec<Value> {
+fn normalized_messages_for_api(messages: &[ChatMessage], flavor: ApiFlavor) -> Vec<Value> {
     messages
         .iter()
         .map(|message| {
@@ -4487,14 +4546,74 @@ fn normalized_messages(messages: &[ChatMessage]) -> Vec<Value> {
             } else {
                 "user"
             };
-            json!({"role": role, "content": message.content})
+            if message.images.is_empty() {
+                return json!({"role": role, "content": message.content});
+            }
+            match flavor {
+                ApiFlavor::OpenAiResponses => {
+                    let mut content = vec![json!({"type": "input_text", "text": message.content})];
+                    content.extend(message.images.iter().map(|image| {
+                        json!({
+                            "type": "input_image",
+                            "image_url": image.image_url,
+                        })
+                    }));
+                    json!({"role": role, "content": content})
+                }
+                ApiFlavor::OpenAiChat => {
+                    let mut content = vec![json!({"type": "text", "text": message.content})];
+                    content.extend(message.images.iter().map(|image| {
+                        json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image.image_url,
+                            },
+                        })
+                    }));
+                    json!({"role": role, "content": content})
+                }
+                ApiFlavor::Anthropic => {
+                    let mut content = vec![json!({"type": "text", "text": message.content})];
+                    content.extend(message.images.iter().map(|image| {
+                        let (mime_type, data) = parse_image_data_url(&image.image_url);
+                        json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime_type,
+                                "data": data,
+                            },
+                        })
+                    }));
+                    json!({"role": role, "content": content})
+                }
+                ApiFlavor::Ollama => json!({
+                    "role": role,
+                    "content": message.content,
+                    "images": message.images.iter().map(|image| parse_image_data_url(&image.image_url).1).collect::<Vec<_>>(),
+                }),
+            }
         })
         .collect()
 }
 
+fn parse_image_data_url(value: &str) -> (String, String) {
+    let Some((header, data)) = value.split_once(',') else {
+        return ("application/octet-stream".to_string(), value.to_string());
+    };
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(';'))
+        .map(|(value, _)| value)
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    (mime, data.to_string())
+}
+
 #[derive(Clone, Copy)]
 enum ApiFlavor {
-    OpenAi,
+    OpenAiResponses,
+    OpenAiChat,
     Anthropic,
     Ollama,
 }
@@ -4790,7 +4909,7 @@ async fn send_json(
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     match flavor {
-        ApiFlavor::OpenAi => {
+        ApiFlavor::OpenAiResponses | ApiFlavor::OpenAiChat => {
             if let Some(key) = config
                 .api_key
                 .as_deref()
@@ -5474,7 +5593,8 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
                     continue;
                 }
                 let text = extract_session_message_text(message);
-                if text.trim().is_empty() {
+                let images = extract_session_message_images(message);
+                if text.trim().is_empty() && images.is_empty() {
                     continue;
                 }
                 if messages.len() >= MAX_SESSION_PREVIEW_MESSAGES {
@@ -5483,6 +5603,7 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
                 messages.push(ChatMessage {
                     role: role.to_string(),
                     content: truncate(&text, MAX_SESSION_PREVIEW_CHARS),
+                    images,
                 });
             }
             // 兼容早期实验版本曾写入的 session_name 字段。
@@ -5556,6 +5677,44 @@ fn extract_session_message_text(message: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn extract_session_message_images(message: &Value) -> Vec<CodexImageInput> {
+    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| {
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if block_type != "image" && block_type != "input_image" {
+                return None;
+            }
+            if let Some(url) = block.get("image_url").and_then(Value::as_str) {
+                return Some(CodexImageInput {
+                    image_url: url.to_string(),
+                });
+            }
+            let data = block.get("data").and_then(Value::as_str)?.to_string();
+            let mime = block
+                .get("mimeType")
+                .or_else(|| block.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            Some(CodexImageInput {
+                image_url: if data.starts_with("data:") {
+                    data
+                } else {
+                    format!("data:{mime};base64,{data}")
+                },
+            })
+        })
+        .take(12)
+        .collect()
 }
 
 fn session_paths_equal(left: &str, right: &str) -> bool {

@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import type { UiAttachment } from '../types/codex'
 
 export type ProviderKind = 'responses' | 'messages' | 'chatcompletions' | 'ollama'
 
@@ -115,7 +116,11 @@ export type SessionRecord = {
   path: string
   modified_at: string | null
   message_count: number
-  messages: Array<{ role: string; content: string }>
+  messages: Array<{
+    role: string
+    content: string
+    images?: Array<{ image_url: string }>
+  }>
 }
 
 export type PendingChange = {
@@ -218,6 +223,26 @@ export type AgentRunOptions = {
   collaborationMode?: 'default' | 'plan'
   /** 本轮重点 Skill 的 id 或路径。 */
   skills?: Array<{ name: string; path: string }>
+  /** 本轮真实发送给模型的图片和文本附件。 */
+  attachments?: UiAttachment[]
+}
+
+export type AgentHistoryMessage = {
+  role: string
+  content: string
+  images?: Array<{ image_url: string }>
+}
+
+export type LocalAttachmentInput = {
+  id: string
+  name: string
+  mime_type: string
+  size: number
+  kind: 'image' | 'text' | 'file' | string
+  data_base64?: string
+  image_url?: string
+  text_content?: string
+  error?: string
 }
 
 const EMPTY_TOKEN_SUMMARY: TokenSummary = { input: 0, output: 0, cache_read: 0, cache_write: 0, total: 0 }
@@ -290,6 +315,8 @@ export const compileProject = () => invoke<{ content: unknown[]; is_error: boole
 export const approveChange = (id: string) => invoke<unknown>('approve_change', { id })
 export const rejectChange = (id: string) => invoke<void>('reject_change', { id })
 export const listMcpTools = () => invoke<ToolSummary[]>('list_mcp_tools')
+/** 读取资源管理器复制到剪贴板的本地文件；失败时由输入框恢复为普通文本粘贴。 */
+export const readLocalAttachmentFile = (path: string) => invoke<LocalAttachmentInput>('read_local_attachment_file', { path })
 
 export const saveModel = (form: ModelForm) => invoke<ModelSummary>('configure_model', {
   config: {
@@ -328,7 +355,7 @@ export const saveMcp = (form: McpForm) => invoke<McpSummary[]>('configure_mcp', 
 
 export const runAgent = (
   message: string,
-  history: Array<{ role: string; content: string }>,
+  history: AgentHistoryMessage[],
   context: AgentContextBinding,
   options: AgentRunOptions = {},
 ) => invoke<AgentResult>('run_agent', {
@@ -340,6 +367,19 @@ export const runAgent = (
     reasoning_effort: options.reasoningEffort || undefined,
     collaboration_mode: options.collaborationMode || undefined,
     skills: options.skills?.map((skill) => skill.path).filter(Boolean) || [],
+    attachments: options.attachments?.map((attachment) => ({
+      id: attachment.id,
+      name: attachment.name,
+      mime_type: attachment.mimeType,
+      size: attachment.size,
+      kind: attachment.kind,
+      data_base64: attachment.dataBase64,
+      image_url: attachment.kind === 'image' && attachment.dataBase64
+        ? `data:${attachment.mimeType};base64,${attachment.dataBase64}`
+        : undefined,
+      text_content: attachment.textContent,
+      error: attachment.error,
+    })) || [],
   },
 })
 

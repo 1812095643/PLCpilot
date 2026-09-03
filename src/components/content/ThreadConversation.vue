@@ -250,6 +250,22 @@
                 </a>
               </div>
 
+              <div v-if="message.attachments && message.attachments.length > 0" class="message-file-attachments" aria-label="消息附件">
+                <article v-for="attachment in message.attachments" :key="`${message.id}:${attachment.id}`" class="message-file-attachment" :data-status="attachment.status">
+                  <img
+                    v-if="attachment.kind === 'image' && attachmentPreviewUrl(attachment)"
+                    class="message-file-attachment-preview"
+                    :src="attachmentPreviewUrl(attachment)"
+                    :alt="attachment.name"
+                  />
+                  <IconTablerFilePencil v-else class="message-file-attachment-icon" aria-hidden="true" />
+                  <div class="message-file-attachment-copy">
+                    <strong :title="attachment.name">{{ attachment.name }}</strong>
+                    <span>{{ formatAttachmentSize(attachment.size) }} · {{ attachment.status === 'ready' ? '已发送' : attachment.error || '未就绪' }}</span>
+                  </div>
+                </article>
+              </div>
+
               <article v-if="message.text.length > 0" class="message-card" :data-role="message.role">
                 <div v-if="message.messageType === 'worked'" class="worked-separator-wrap" aria-live="polite">
                   <button type="button" class="worked-separator" @click="toggleWorkedExpand(message)">
@@ -851,7 +867,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { UiFileChange, UiLiveOverlay, UiMessage, UiPlanStep } from '../../types/codex'
+import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiPlanStep } from '../../types/codex'
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
@@ -860,6 +876,7 @@ import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
+import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
 import IconTablerTerminal from '../icons/IconTablerTerminal.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 
@@ -1110,6 +1127,20 @@ function commandGroupSummaryLabel(message: UiMessage): string {
 
 function commandGroupSummaryStatus(message: UiMessage): string {
   return commandStatusLabel(message)
+}
+
+function formatAttachmentSize(size: number): string {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
+function attachmentPreviewUrl(attachment: UiAttachment): string {
+  if (attachment.previewUrl) return attachment.previewUrl
+  if (attachment.dataBase64 && attachment.mimeType.startsWith('image/')) {
+    return `data:${attachment.mimeType};base64,${attachment.dataBase64}`
+  }
+  return ''
 }
 
 /**
@@ -3918,6 +3949,40 @@ onBeforeUnmount(() => {
 .message-skill-attachments {
   @apply mb-2 flex flex-wrap justify-end gap-1.5;
 }
+
+.message-file-attachments {
+  @apply mb-2 flex max-w-full flex-wrap justify-end gap-1.5;
+}
+
+.message-file-attachment {
+  @apply flex min-w-0 max-w-[260px] items-center gap-2 rounded-md border border-slate-200 bg-white/70 px-2 py-1.5 text-left;
+}
+
+.message-file-attachment[data-status='error'] {
+  @apply border-rose-200 bg-rose-50/60;
+}
+
+.message-file-attachment-preview,
+.message-file-attachment-icon {
+  @apply h-8 w-8 shrink-0 rounded object-cover text-slate-500;
+}
+
+.message-file-attachment-copy {
+  @apply flex min-w-0 flex-col gap-0.5;
+}
+
+.message-file-attachment-copy strong,
+.message-file-attachment-copy span {
+  @apply overflow-hidden text-ellipsis whitespace-nowrap;
+}
+
+.message-file-attachment-copy strong { @apply text-[11px] font-medium text-slate-700; }
+.message-file-attachment-copy span { @apply text-[10px] text-slate-500; }
+
+:global(.dark) .message-file-attachment { @apply border-slate-700 bg-slate-900/70; }
+:global(.dark) .message-file-attachment[data-status='error'] { @apply border-rose-900/70 bg-rose-950/30; }
+:global(.dark) .message-file-attachment-copy strong { @apply text-slate-200; }
+:global(.dark) .message-file-attachment-copy span { @apply text-slate-400; }
 
 .message-skill-chip {
   @apply inline-flex max-w-full items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs text-emerald-800 no-underline transition hover:border-emerald-300 hover:bg-emerald-100 hover:text-emerald-900;

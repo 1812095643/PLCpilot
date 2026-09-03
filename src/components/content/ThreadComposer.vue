@@ -6,7 +6,9 @@ import type {
   ReasoningEffort,
   UiThreadTokenUsage,
 } from '../../types/codex'
-import type { CommandSummary } from '../../api/plcBridge'
+import type { ComposerAttachment, ComposerAttachmentDraft } from '../../composables/useComposerAttachments'
+import { useComposerAttachments } from '../../composables/useComposerAttachments'
+import { readLocalAttachmentFile, type CommandSummary } from '../../api/plcBridge'
 import { searchComposerFiles, type ComposerFileSuggestion } from '../../api/codexGateway'
 import {
   completeSlashCommand,
@@ -18,9 +20,11 @@ import {
 import ComposerCommandPopup from './ComposerCommandPopup.vue'
 import ComposerDropdown from './ComposerDropdown.vue'
 import ComposerSearchDropdown from './ComposerSearchDropdown.vue'
+import ComposerAttachmentStrip from './ComposerAttachmentStrip.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
+import IconTablerPaperclip from '../icons/IconTablerPaperclip.vue'
 import IconTablerPlayerStopFilled from '../icons/IconTablerPlayerStopFilled.vue'
 
 type SkillItem = {
@@ -35,11 +39,13 @@ type SkillItem = {
 export type ComposerDraftPayload = {
   text: string
   skills: Array<{ name: string; path: string }>
+  attachments?: ComposerAttachmentDraft[]
 }
 
 export type SubmitPayload = {
   text: string
   skills: Array<{ name: string; path: string }>
+  attachments: ComposerAttachment[]
   mode: 'steer' | 'queue'
 }
 
@@ -108,6 +114,18 @@ let mentionSearchToken = 0
 
 const inputRef = shallowRef<HTMLTextAreaElement | null>(null)
 const composerRootRef = shallowRef<HTMLElement | null>(null)
+const fileInputRef = shallowRef<HTMLInputElement | null>(null)
+const isDragActive = shallowRef(false)
+const {
+  attachments,
+  isReading: isAttachmentReading,
+  hasReadyAttachment,
+  addFiles,
+  addPreparedAttachment,
+  removeAttachment,
+  serializeAttachments,
+  restoreAttachments,
+} = useComposerAttachments()
 
 const modelOptions = computed(() => {
   const values = Array.from(new Set(props.models.map((item) => item.trim()).filter(Boolean)))
@@ -146,8 +164,8 @@ const isPlanMode = computed(() => props.selectedCollaborationMode === 'plan')
 const placeholder = computed(() => isInteractionDisabled.value
   ? '先选择一个本地 CODESYS 工程'
   : '描述要检查、修改或诊断的 PLC 任务…')
-const hasUnsavedDraft = computed(() => draft.value.trim().length > 0 || selectedSkills.value.length > 0)
-const canSubmit = computed(() => !isInteractionDisabled.value && draft.value.trim().length > 0)
+const hasUnsavedDraft = computed(() => draft.value.trim().length > 0 || selectedSkills.value.length > 0 || attachments.value.length > 0)
+const canSubmit = computed(() => !isInteractionDisabled.value && !isAttachmentReading.value && (draft.value.trim().length > 0 || hasReadyAttachment.value))
 
 const contextView = computed(() => {
   const usage = props.threadTokenUsage
@@ -179,7 +197,7 @@ function getDraftStorageKey(threadId: string): string {
 }
 
 function emptyPayload(): ComposerDraftPayload {
-  return { text: '', skills: [] }
+  return { text: '', skills: [], attachments: [] }
 }
 
 function readDraft(threadId: string): ComposerDraftPayload | null {
@@ -194,6 +212,9 @@ function readDraft(threadId: string): ComposerDraftPayload | null {
         ? value.skills.filter((skill): skill is { name: string; path: string } => Boolean(skill)
           && typeof skill.name === 'string' && typeof skill.path === 'string')
         : [],
+      attachments: Array.isArray(value.attachments)
+        ? value.attachments as ComposerAttachmentDraft[]
+        : [],
     }
   } catch {
     return null
@@ -205,10 +226,24 @@ function persistDraft(threadId: string): void {
   const payload: ComposerDraftPayload = {
     text: draft.value,
     skills: selectedSkills.value.map((skill) => ({ name: skill.name, path: skill.path })),
+    attachments: serializeAttachments(),
   }
   try {
-    if (payload.text.trim() || payload.skills.length > 0) {
-      window.localStorage.setItem(getDraftStorageKey(threadId), JSON.stringify(payload))
+    if (payload.text.trim() || payload.skills.length > 0 || payload.attachments.length > 0) {
+      try {
+        window.localStorage.setItem(getDraftStorageKey(threadId), JSON.stringify(payload))
+      } catch {
+        // 图片可能超过浏览器 localStorage 容量；至少保留名称、类型和状态，避免输入草稿整体消失。
+        const metadataOnly = {
+          ...payload,
+          attachments: payload.attachments.map(({ dataBase64: _dataBase64, textContent: _textContent, ...item }) => ({
+            ...item,
+            status: 'error' as const,
+            error: '附件内容超过本地草稿容量，重新打开后请再次添加。',
+          })),
+        }
+        window.localStorage.setItem(getDraftStorageKey(threadId), JSON.stringify(metadataOnly))
+      }
     } else {
       window.localStorage.removeItem(getDraftStorageKey(threadId))
     }
@@ -221,6 +256,7 @@ function replaceDraft(payload: ComposerDraftPayload): void {
   draft.value = payload.text
   selectedSkills.value = payload.skills.map((item) => props.skills.find((skill) => skill.path === item.path)
     ?? { name: item.name, path: item.path, description: '' })
+  restoreAttachments(payload.attachments)
   closeFileMention()
   resetSlashCommandPopup()
   void nextTick(syncComposerPopups)
@@ -250,6 +286,7 @@ function submitCurrent(mode: 'steer' | 'queue' = props.isTurnInProgress ? active
   emit('submit', {
     text: draft.value.trim(),
     skills: selectedSkills.value.map((skill) => ({ name: skill.name, path: skill.path })),
+    attachments: serializeAttachments().filter((attachment) => attachment.status === 'ready'),
     mode,
   })
   clearDraft()
@@ -292,6 +329,164 @@ function onKeydown(event: KeyboardEvent): void {
 
 function onInput(): void {
   syncComposerPopups()
+}
+
+function openFilePicker(): void {
+  if (isInteractionDisabled.value) return
+  fileInputRef.value?.click()
+}
+
+function onFileInputChange(event: Event): void {
+  const input = event.target
+  if (!(input instanceof HTMLInputElement)) return
+  addFiles(Array.from(input.files ?? []), 'file')
+  input.value = ''
+}
+
+function clipboardFiles(event: ClipboardEvent): File[] {
+  const files = Array.from(event.clipboardData?.files ?? [])
+  if (files.length > 0) return files
+  return Array.from(event.clipboardData?.items ?? [])
+    .filter((item) => item.kind === 'file')
+    .map((item, index) => {
+      const file = item.getAsFile()
+      if (!file) return null
+      if (typeof File !== 'undefined' && file instanceof File) return file
+      return new File([file], `clipboard-${Date.now()}-${index}`, { type: file.type || 'application/octet-stream' })
+    })
+    .filter((file): file is File => file !== null)
+}
+
+function clipboardSpreadsheetFile(event: ClipboardEvent): File | null {
+  const html = event.clipboardData?.getData('text/html') ?? ''
+  if (!html || !/<table[\s>]/iu.test(html)) return null
+  if (typeof DOMParser === 'undefined' || typeof File === 'undefined') return null
+  const parsed = new DOMParser().parseFromString(html, 'text/html')
+  const rows = Array.from(parsed.querySelectorAll('tr'))
+    .map((row) => Array.from(row.querySelectorAll('th,td')).map((cell) => (cell.textContent ?? '').replace(/\s+/gu, ' ').trim()))
+    .filter((row) => row.length > 0)
+  if (rows.length === 0) return null
+  const csv = rows.map((row) => row.map((cell) => {
+    const escaped = cell.replace(/"/gu, '""')
+    return /[",\n]/u.test(escaped) ? `"${escaped}"` : escaped
+  }).join(',')).join('\n')
+  return new File([csv], `clipboard-table-${Date.now()}.csv`, { type: 'text/csv' })
+}
+
+function clipboardFilePaths(event: ClipboardEvent): string[] {
+  const uriList = event.clipboardData?.getData('text/uri-list') ?? ''
+  const candidates = uriList.split(/\r?\n/u).map((value) => value.trim()).filter((value) => value && !value.startsWith('#'))
+  const plainText = event.clipboardData?.getData('text/plain') ?? ''
+  if (candidates.length === 0 && plainText.split(/\r?\n/u).every((value) => /^file:\/\//iu.test(value.trim()))) {
+    candidates.push(...plainText.split(/\r?\n/u).map((value) => value.trim()).filter(Boolean))
+  }
+  return candidates
+    .filter((value) => /^file:\/\//iu.test(value))
+    .map((value) => {
+      try {
+        return decodeURIComponent(new URL(value).pathname.replace(/^\/(?=[A-Z]:[\\/])/iu, ''))
+      } catch {
+        return value.replace(/^file:\/\//iu, '')
+      }
+    })
+}
+
+async function onPaste(event: ClipboardEvent): Promise<void> {
+  const files = clipboardFiles(event)
+  const spreadsheet = files.length === 0 ? clipboardSpreadsheetFile(event) : null
+  const paths = files.length === 0 && !spreadsheet ? clipboardFilePaths(event) : []
+  if (files.length === 0 && !spreadsheet && paths.length === 0) return
+  event.preventDefault()
+  if (spreadsheet || files.length > 0) {
+    addFiles(spreadsheet ? [spreadsheet] : files, 'clipboard')
+    return
+  }
+  const prepared = await Promise.all(paths.map(async (path) => {
+    try {
+      return await readLocalAttachmentFile(path)
+    } catch {
+      return null
+    }
+  }))
+  prepared.filter((item): item is NonNullable<typeof item> => item !== null).forEach((item) => addPreparedAttachment(item, 'clipboard'))
+}
+
+function hasDraggedFiles(event: DragEvent): boolean {
+  const types = Array.from(event.dataTransfer?.types ?? [])
+  return types.includes('Files') || types.includes('text/uri-list')
+}
+
+function onDragOver(event: DragEvent): void {
+  if (!hasDraggedFiles(event)) return
+  event.preventDefault()
+  isDragActive.value = true
+}
+
+function onDragLeave(event: DragEvent): void {
+  if (!hasDraggedFiles(event)) return
+  const root = composerRootRef.value
+  if (root && event.relatedTarget instanceof Node && root.contains(event.relatedTarget)) return
+  isDragActive.value = false
+}
+
+type FileSystemEntryLike = {
+  isFile: boolean
+  isDirectory: boolean
+  file?: (callback: (file: File) => void) => void
+  createReader?: () => { readEntries: (callback: (entries: FileSystemEntryLike[]) => void) => void }
+}
+
+function readDirectoryEntries(reader: { readEntries: (callback: (entries: FileSystemEntryLike[]) => void) => void }): Promise<FileSystemEntryLike[]> {
+  return new Promise((resolve) => reader.readEntries(resolve))
+}
+
+async function filesFromDrop(event: DragEvent): Promise<File[]> {
+  const directFiles = Array.from(event.dataTransfer?.files ?? [])
+  const items = Array.from(event.dataTransfer?.items ?? [])
+  const entries = items
+    .map((item) => (item as DataTransferItem & { webkitGetAsEntry?: () => FileSystemEntryLike | null }).webkitGetAsEntry?.() ?? null)
+    .filter((entry): entry is FileSystemEntryLike => entry !== null)
+  if (entries.length === 0) return directFiles
+  const result: File[] = [...directFiles]
+  async function visit(entry: FileSystemEntryLike): Promise<void> {
+    if (entry.isFile && entry.file) {
+      await new Promise<void>((resolve) => entry.file?.((file) => { result.push(file); resolve() }))
+      return
+    }
+    if (!entry.isDirectory || !entry.createReader) return
+    const reader = entry.createReader()
+    while (true) {
+      const batch = await readDirectoryEntries(reader)
+      if (batch.length === 0) break
+      for (const child of batch) await visit(child)
+    }
+  }
+  for (const entry of entries) await visit(entry)
+  return result
+}
+
+async function onDrop(event: DragEvent): Promise<void> {
+  if (!hasDraggedFiles(event)) return
+  event.preventDefault()
+  isDragActive.value = false
+  const files = await filesFromDrop(event)
+  if (files.length > 0) {
+    addFiles(files, 'drop')
+    return
+  }
+  const paths = Array.from(event.dataTransfer?.getData('text/uri-list')?.split(/\r?\n/u) ?? [])
+    .map((value) => value.trim())
+    .filter((value) => /^file:\/\//iu.test(value))
+  const prepared = await Promise.all(paths.map(async (path) => {
+    try {
+      const url = new URL(path)
+      const normalizedPath = decodeURIComponent(url.pathname.replace(/^\/(?=[A-Z]:[\\/])/iu, ''))
+      return await readLocalAttachmentFile(normalizedPath)
+    } catch {
+      return null
+    }
+  }))
+  prepared.filter((item): item is NonNullable<typeof item> => item !== null).forEach((item) => addPreparedAttachment(item, 'drop'))
 }
 
 function onCursorChange(): void {
@@ -559,7 +754,7 @@ watch(() => props.activeThreadId, (threadId) => {
   lastActiveThreadId = threadId.trim()
 }, { immediate: true })
 
-watch([draft, selectedSkillPaths], () => {
+watch([draft, selectedSkillPaths, attachments], () => {
   if (lastActiveThreadId) persistDraft(lastActiveThreadId)
 })
 
@@ -574,6 +769,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', onDocumentPointerDown)
   if (mentionSearchTimer) clearTimeout(mentionSearchTimer)
+  isDragActive.value = false
 })
 
 defineExpose<ThreadComposerExposed>({
@@ -584,7 +780,7 @@ defineExpose<ThreadComposerExposed>({
 </script>
 
 <template>
-  <form ref="composerRootRef" class="plc-thread-composer" @submit.prevent="submitCurrent()">
+  <form ref="composerRootRef" class="plc-thread-composer" :class="{ 'is-drag-active': isDragActive }" @submit.prevent="submitCurrent()" @dragover="onDragOver" @dragleave="onDragLeave" @drop="onDrop">
     <div class="plc-composer-shell" :class="{ 'is-busy': isTurnInProgress }">
       <div v-if="selectedSkills.length > 0" class="plc-composer-chips" aria-label="已启用 Skills">
         <span v-for="skill in selectedSkills" :key="skill.path" class="plc-composer-chip">
@@ -618,6 +814,7 @@ defineExpose<ThreadComposerExposed>({
           <p v-if="fileMentionSuggestions.length === 0" class="plc-file-mention-empty">正在查找工程文件…</p>
         </div>
 
+        <ComposerAttachmentStrip :attachments="attachments" @remove="removeAttachment" />
         <textarea
           ref="inputRef"
           v-model="draft"
@@ -630,6 +827,7 @@ defineExpose<ThreadComposerExposed>({
           aria-autocomplete="list"
           rows="3"
           @input="onInput"
+          @paste="onPaste"
           @keydown="onKeydown"
           @keyup="onCursorChange"
           @select="onCursorChange"
@@ -643,6 +841,10 @@ defineExpose<ThreadComposerExposed>({
 
       <div class="plc-composer-toolbar">
         <div class="plc-composer-options">
+          <button type="button" class="plc-composer-attach" aria-label="添加附件" title="添加图片或文件" :disabled="isInteractionDisabled" @click="openFilePicker">
+            <IconTablerPaperclip aria-hidden="true" />
+          </button>
+          <input ref="fileInputRef" class="plc-composer-file-input" type="file" multiple accept="image/*,.c,.cc,.cpp,.css,.csv,.h,.hpp,.html,.iecst,.ini,.java,.js,.json,.log,.md,.mjs,.py,.rs,.sql,.st,.svg,.toml,.ts,.tsx,.txt,.vue,.xml,.yaml,.yml" @change="onFileInputChange" />
           <ComposerDropdown
             class="plc-composer-dropdown"
             :model-value="selectedModel"
@@ -772,6 +974,13 @@ defineExpose<ThreadComposerExposed>({
 .plc-composer-chip button { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 15px; line-height: 1; padding: 0 1px; }
 
 .plc-composer-editor { position: relative; padding: 12px 14px 8px; }
+
+.plc-thread-composer.is-drag-active .plc-composer-shell { border-color: var(--plc-dark-accent, #007acc); box-shadow: 0 0 0 3px rgba(0, 122, 204, 0.14); }
+.plc-composer-file-input { display: none; }
+.plc-composer-attach { display: inline-flex; width: 27px; height: 27px; align-items: center; justify-content: center; border: 0; border-radius: 7px; background: transparent; color: var(--composer-muted); cursor: pointer; }
+.plc-composer-attach:hover:not(:disabled) { background: var(--composer-soft); color: var(--composer-text); }
+.plc-composer-attach:disabled { cursor: not-allowed; opacity: 0.42; }
+.plc-composer-attach svg { width: 15px; height: 15px; }
 
 .plc-composer-input {
   display: block;

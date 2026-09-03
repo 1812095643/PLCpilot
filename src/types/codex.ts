@@ -42,11 +42,28 @@ export type UiPlanData = {
   isStreaming?: boolean
 }
 
+export type UiAttachmentKind = 'image' | 'text' | 'file'
+export type UiAttachmentStatus = 'reading' | 'ready' | 'error'
+
+export type UiAttachment = {
+  id: string
+  name: string
+  mimeType: string
+  size: number
+  kind: UiAttachmentKind
+  status: UiAttachmentStatus
+  error?: string
+  dataBase64?: string
+  textContent?: string
+  previewUrl?: string
+}
+
 export type UiMessage = {
   id: string
   role: 'user' | 'assistant' | 'system'
   text: string
   skills?: Array<{ name: string; path: string }>
+  attachments?: UiAttachment[]
   fileChanges?: UiFileChange[]
   fileChangeStatus?: UiFileChangeStatus
   messageType?: string

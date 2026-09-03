@@ -85,11 +85,54 @@ function modelDescriptor(modelConfig) {
     id: modelId,
     name: modelId,
     reasoning: false,
-    input: ["text"],
+    // Codex 的用户输入协议将图片作为独立 input_image；Pi 这里只做边界适配，
+    // 不改变图片的 data URL 和 MIME，避免把二进制内容拼成普通文字。
+    input: ["text", "image"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: Number(modelConfig?.context_window) || DEFAULT_CONTEXT_WINDOW,
     maxTokens: Number(modelConfig?.max_tokens) || DEFAULT_MAX_TOKENS,
   };
+}
+
+function attachmentDataUrl(attachment) {
+  const imageUrl = String(attachment?.image_url ?? "").trim();
+  if (imageUrl.startsWith("data:")) return imageUrl;
+  const encoded = String(attachment?.data_base64 ?? "").trim();
+  if (!encoded) return "";
+  const mimeType = String(attachment?.mime_type ?? "application/octet-stream").trim() || "application/octet-stream";
+  return `data:${mimeType};base64,${encoded}`;
+}
+
+function codexImageInputs(attachments) {
+  return attachments
+    .filter((attachment) => attachment?.kind === "image" && !attachment?.error)
+    .map((attachment) => {
+      const dataUrl = attachmentDataUrl(attachment);
+      const separator = dataUrl.indexOf(",");
+      if (separator < 0) return null;
+      const header = dataUrl.slice(5, separator);
+      const data = dataUrl.slice(separator + 1);
+      const mimeType = header.split(";", 1)[0] || "application/octet-stream";
+      return data ? { type: "image", data, mimeType } : null;
+    })
+    .filter(Boolean);
+}
+
+function attachmentPromptText(attachments) {
+  return attachments
+    .map((attachment) => {
+      const name = String(attachment?.name ?? "未命名附件").trim() || "未命名附件";
+      if (typeof attachment?.text_content === "string" && attachment.text_content.length > 0) {
+        return `附件「${name}」的内容：\n${attachment.text_content}`;
+      }
+      if (attachment?.kind === "image" && !attachment?.error) {
+        return `附件「${name}」是一张图片，请直接查看本轮附加的图片。`;
+      }
+      if (attachment?.error) return `附件「${name}」暂时无法读取：${attachment.error}`;
+      return `附件「${name}」已添加，类型为 ${String(attachment?.mime_type ?? "未知")}。`;
+    })
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function makeToolDefinition(tool, sendToolRequest) {
@@ -387,12 +430,19 @@ async function ensureSession(config) {
 
 async function runPrompt(config) {
   const session = await ensureSession(config);
+  const attachments = Array.isArray(config.attachments) ? config.attachments : [];
   const message = String(config.message ?? "").trim();
-  if (!message) throw new Error("请输入要交给 Agent 的任务");
+  const attachmentText = attachmentPromptText(attachments);
+  const promptText = message && attachmentText
+    ? `${message}\n\n${attachmentText}`
+    : message || attachmentText || (codexImageInputs(attachments).length > 0 ? "请查看本轮附加的图片。" : "");
+  const images = codexImageInputs(attachments);
+  if (!promptText && images.length === 0) throw new Error("请输入任务或添加一个可读取的图片/文本附件");
+  const promptOptions = images.length > 0 ? { images } : {};
   if (session.isStreaming) {
-    await session.prompt(message, { streamingBehavior: "followUp" });
+    await session.prompt(promptText, { ...promptOptions, streamingBehavior: "followUp" });
   } else {
-    await session.prompt(message);
+    await session.prompt(promptText, promptOptions);
   }
   return {
     type: "result",

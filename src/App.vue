@@ -41,6 +41,7 @@ import {
 } from './api/plcBridge'
 import type {
   CollaborationModeKind,
+  UiAttachment,
   UiLiveOverlay,
   UiMessage,
   UiThreadTokenUsage,
@@ -182,6 +183,32 @@ function newId(prefix: string): string {
   return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`
 }
 
+function messageAttachments(attachments: UiAttachment[]): UiAttachment[] {
+  return attachments.map((attachment) => ({
+    ...attachment,
+    previewUrl: attachment.kind === 'image' && attachment.dataBase64
+      ? `data:${attachment.mimeType};base64,${attachment.dataBase64}`
+      : undefined,
+  }))
+}
+
+function restoredImageAttachment(imageUrl: string, messageIndex: number, imageIndex: number): UiAttachment {
+  const [header, encoded = ''] = imageUrl.split(',', 2)
+  const mimeType = header.startsWith('data:')
+    ? (header.slice(5).split(';', 1)[0] || 'application/octet-stream')
+    : 'application/octet-stream'
+  return {
+    id: `restored-image-${messageIndex}-${imageIndex}`,
+    name: `图片 ${imageIndex + 1}`,
+    mimeType,
+    size: Math.ceil(encoded.length * 0.75),
+    kind: 'image',
+    status: 'ready',
+    dataBase64: encoded,
+    previewUrl: imageUrl,
+  }
+}
+
 function showNotice(message: string): void {
   notice.value = message
   window.setTimeout(() => {
@@ -242,13 +269,14 @@ function eventToMessage(event: AgentEvent, turnIndex: number): UiMessage {
   }
 }
 
-function appendAgentResult(result: AgentResult, userText: string, selectedSkills: Array<{ name: string; path: string }> = []): void {
+function appendAgentResult(result: AgentResult, userText: string, selectedSkills: Array<{ name: string; path: string }> = [], attachments: SubmitPayload['attachments'] = []): void {
   const turnIndex = messages.value.filter((item) => item.role === 'user').length
   const userMessage: UiMessage = {
     id: newId('user'),
     role: 'user',
     text: userText,
     skills: selectedSkills.length > 0 ? selectedSkills : undefined,
+    attachments: attachments.length > 0 ? attachments : undefined,
     turnId: `turn-${turnIndex}`,
     turnIndex,
   }
@@ -303,7 +331,9 @@ function insertFileMention(): void {
 
 async function onSubmit(payload: SubmitPayload): Promise<void> {
   const text = payload.text.trim()
-  if (!text || isBusy.value) return
+  const attachments = (payload.attachments ?? []).filter((attachment) => attachment.status === 'ready')
+  const visibleAttachments = messageAttachments(attachments)
+  if ((!text && attachments.length === 0) || isBusy.value) return
   isBusy.value = true
   liveOverlay.value = {
     activityLabel: '正在处理 PLC 任务',
@@ -314,24 +344,31 @@ async function onSubmit(payload: SubmitPayload): Promise<void> {
   const baseMessages = messages.value
   messages.value = [
     ...baseMessages,
-    { id: newId('user'), role: 'user', text },
+    { id: newId('user'), role: 'user', text, attachments: visibleAttachments.length > 0 ? visibleAttachments : undefined },
     { id: `pending-assistant-${newId('turn')}`, role: 'assistant', text: '正在读取工程上下文…' },
   ]
   try {
     const history = baseMessages
       .filter((item) => item.role === 'user' || item.role === 'assistant')
-      .map((item) => ({ role: item.role, content: item.text }))
+      .map((item) => ({
+        role: item.role,
+        content: item.text,
+        images: item.attachments
+          ?.filter((attachment) => attachment.kind === 'image' && attachment.dataBase64)
+          .map((attachment) => ({ image_url: `data:${attachment.mimeType};base64,${attachment.dataBase64}` })),
+      }))
     const runOptions: AgentRunOptions = {
       model: selectedModel.value,
       reasoningEffort: reasoningEffort.value,
       collaborationMode: collaborationMode.value,
       skills: payload.skills,
+      attachments,
     }
     const result = await runAgent(text, history, agentContext.value, runOptions)
     // runAgent 返回的是本轮完整结果；以发送前的历史为基线，避免把本轮用户消息
     // 误当成历史再次拼接，或者在占位消息清理时误删上一轮消息。
     messages.value = baseMessages
-    appendAgentResult(result, text, payload.skills)
+    appendAgentResult(result, text, payload.skills, visibleAttachments)
     await refresh()
   } catch (error) {
     messages.value = messages.value.map((item) => item.id.startsWith('pending-assistant-')
@@ -422,6 +459,7 @@ async function onResumeSession(record: SessionRecord): Promise<void> {
       id: newId(item.role),
       role: item.role === 'assistant' ? 'assistant' : 'user',
       text: item.content,
+      attachments: (item.images ?? []).map((image, imageIndex) => restoredImageAttachment(image.image_url, index, imageIndex)),
       turnIndex: index,
       turnId: `restored-${index}`,
     }))
@@ -514,7 +552,7 @@ function chooseCommand(command: string, supportsArgs: boolean): void {
     skills: [],
   }
   composerRef.value?.hydrateDraft(payload)
-  if (!supportsArgs) void onSubmit({ text: command, skills: [], mode: 'steer' })
+  if (!supportsArgs) void onSubmit({ text: command, skills: [], attachments: [], mode: 'steer' })
 }
 
 function startNewThread(): void {
