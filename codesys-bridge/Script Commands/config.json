@@ -1,0 +1,8 @@
+[
+  {
+    "Name": "PLC Pilot：同步当前 CODESYS 工程",
+    "Desc": "只读导出当前主工程路径和文本对象到本地 Bridge 目录",
+    "Icon": "plc_pilot_sync.ico",
+    "Path": "plc_pilot_sync.py"
+  }
+]

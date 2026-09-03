@@ -1,0 +1,6223 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use similar::TextDiff;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
+    process::{Child, Command},
+    sync::Mutex,
+    time::{sleep, timeout},
+};
+use uuid::Uuid;
+use walkdir::WalkDir;
+
+const APP_VERSION: &str = "0.1.0";
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MAX_AGENT_TURNS: usize = 8;
+const PI_HOST_TIMEOUT_SECONDS: u64 = 240;
+const MAX_SESSION_PREVIEW_MESSAGES: usize = 80;
+const MAX_SESSION_PREVIEW_CHARS: usize = 6000;
+const RPC_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const RPC_PROTOCOL_VERSION: u32 = 1;
+const RPC_REQUEST_TIMEOUT_SECONDS: u64 = 300;
+
+const CODESYS_SKILL: &str = include_str!("../../skills/codesys-agent/SKILL.md");
+const PLC_SAFETY_SKILL: &str = include_str!("../../skills/plc-safety/SKILL.md");
+const IEC_ST_SKILL: &str = include_str!("../../skills/iec61131-st/SKILL.md");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    Responses,
+    Messages,
+    ChatCompletions,
+    Ollama,
+}
+
+impl Default for ProviderKind {
+    fn default() -> Self {
+        Self::Responses
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub provider: ProviderKind,
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+}
+
+fn default_max_tokens() -> u32 {
+    4096
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            provider: ProviderKind::Responses,
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-5".to_string(),
+            api_key: None,
+            max_tokens: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default = "default_mcp_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectContext {
+    pub path: Option<String>,
+    #[serde(default)]
+    pub source_root: Option<String>,
+    #[serde(default)]
+    pub project_directory: Option<String>,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub project_key: Option<String>,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub exists: bool,
+    pub extension: Option<String>,
+    #[serde(default)]
+    pub file_count: usize,
+    #[serde(default)]
+    pub pou_count: usize,
+    #[serde(default)]
+    pub source_files: Vec<String>,
+    #[serde(default = "default_scan_status")]
+    pub scan_status: String,
+    #[serde(default)]
+    pub scan_message: Option<String>,
+    #[serde(default)]
+    pub active_object: Option<String>,
+    #[serde(default)]
+    pub active_object_guid: Option<String>,
+    #[serde(default)]
+    pub active_file: Option<String>,
+    #[serde(default)]
+    pub active_file_relative: Option<String>,
+    #[serde(default)]
+    pub active_text: Option<String>,
+    #[serde(default)]
+    pub selected_text: Option<String>,
+    #[serde(default)]
+    pub selection_start: usize,
+    #[serde(default)]
+    pub selection_length: usize,
+    #[serde(default)]
+    pub active_editor_available: bool,
+    #[serde(default)]
+    pub active_text_truncated: bool,
+}
+
+fn default_scan_status() -> String {
+    "not_scanned".to_string()
+}
+
+impl Default for ProjectContext {
+    fn default() -> Self {
+        Self {
+            path: None,
+            source_root: None,
+            project_directory: None,
+            working_directory: None,
+            snapshot_id: None,
+            project_key: None,
+            name: None,
+            version: None,
+            exists: false,
+            extension: None,
+            file_count: 0,
+            pou_count: 0,
+            source_files: Vec::new(),
+            scan_status: default_scan_status(),
+            scan_message: None,
+            active_object: None,
+            active_object_guid: None,
+            active_file: None,
+            active_file_relative: None,
+            active_text: None,
+            selected_text: None,
+            selection_start: 0,
+            selection_length: 0,
+            active_editor_available: false,
+            active_text_truncated: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSnapshot {
+    pub app_version: String,
+    pub model: ModelSummary,
+    pub mcp_servers: Vec<McpSummary>,
+    pub project: ProjectContext,
+    pub codesys: CodesysStatus,
+    pub skills: Vec<SkillSummary>,
+    pub commands: Vec<CommandSummary>,
+    pub tools: Vec<ToolSummary>,
+    pub sessions: Vec<SessionRecord>,
+    pub pending_changes: Vec<PendingChangeSummary>,
+    pub session: AgentSessionSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSummary {
+    pub provider: ProviderKind,
+    pub base_url: String,
+    pub model: String,
+    pub configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSummary {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub enabled: bool,
+    pub connected: bool,
+    pub tool_count: usize,
+    pub last_error: Option<String>,
+    pub transport: String,
+    pub url: Option<String>,
+    pub last_checked: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodesysStatus {
+    pub detected: bool,
+    pub executable: Option<String>,
+    pub supported_version: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    pub scope: String,
+    pub path: Option<String>,
+    pub content_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandSummary {
+    pub command: String,
+    pub label: String,
+    pub detail: String,
+    pub category: String,
+    pub supports_args: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub name: Option<String>,
+    pub path: String,
+    pub modified_at: Option<String>,
+    pub message_count: usize,
+    #[serde(default)]
+    pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentRequest {
+    pub message: String,
+    #[serde(default)]
+    pub history: Vec<ChatMessage>,
+    #[serde(default)]
+    pub codesys_context: Option<AgentContextBinding>,
+    /// 本轮临时覆盖的模型名称；为空时使用设置中的默认模型。
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Pi 思考级别，前端的 none 会在宿主侧转换为 off。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// 执行模式或只读计划模式。
+    #[serde(default)]
+    pub collaboration_mode: Option<String>,
+    /// 本轮重点 Skill 的 id 或路径。
+    #[serde(default)]
+    pub skills: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentContextBinding {
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    #[serde(default)]
+    pub project_directory: Option<String>,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub project_key: Option<String>,
+    #[serde(default)]
+    pub active_object: Option<String>,
+    #[serde(default)]
+    pub active_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRunResult {
+    pub text: String,
+    pub events: Vec<AgentEvent>,
+    pub pending_changes: Vec<PendingChangeSummary>,
+    pub diagnostics: Vec<DiagnosticItem>,
+    pub session: AgentSessionSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentSessionSummary {
+    pub session_id: Option<String>,
+    pub session_file: Option<String>,
+    pub name: Option<String>,
+    pub is_streaming: bool,
+    pub is_compacting: bool,
+    pub auto_compaction_enabled: bool,
+    pub message_count: usize,
+    pub context_tokens: u64,
+    pub context_window: u64,
+    pub context_percent: f64,
+    pub tokens: TokenSummary,
+    #[serde(default)]
+    pub compaction_count: usize,
+    #[serde(default)]
+    pub last_compacted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenSummary {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub detail: Option<String>,
+    pub status: String,
+    pub tool: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticItem {
+    pub severity: String,
+    pub code: Option<String>,
+    pub message: String,
+    pub location: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingChangeSummary {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub diff: String,
+    pub server_id: String,
+    pub tool_name: String,
+    pub risk: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSummary {
+    pub qualified_name: String,
+    pub server_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+    pub mutating: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigureMcpRequest {
+    pub servers: Vec<McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRequest {
+    pub server_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub arguments: Value,
+    #[serde(default)]
+    pub codesys_context: Option<AgentContextBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallResult {
+    pub content: Vec<Value>,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComposerFileSuggestion {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FileChangesRequest {
+    #[serde(alias = "threadId")]
+    thread_id: String,
+    #[serde(alias = "turnId")]
+    turn_id: String,
+    cwd: String,
+    action: String,
+    #[serde(default, alias = "patchIds")]
+    patch_ids: Vec<String>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangesResult {
+    pub changed: usize,
+    pub errors: Vec<String>,
+    pub reverted_patch_ids: Vec<String>,
+    pub applied_patch_ids: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub inner: Arc<Mutex<RuntimeState>>,
+    pub agent_runs: Arc<Mutex<()>>,
+    /// 由界面停止按钮设置；运行中的宿主在等待模型输出时会及时检查它。
+    pub abort_requested: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeState {
+    pub model: ModelConfig,
+    pub mcp_servers: Vec<McpServerConfig>,
+    pub project: ProjectContext,
+    pub pending: HashMap<String, PendingChange>,
+    pub patches: HashMap<String, AppliedFilePatch>,
+    pub session: AgentSessionSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedRuntimeConfig {
+    #[serde(default)]
+    model: Option<ModelConfig>,
+    #[serde(default)]
+    mcp_servers: Vec<McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DesktopEndpoint {
+    protocol: u32,
+    host: String,
+    port: u16,
+    token: String,
+    pid: u32,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingChange {
+    pub summary: PendingChangeSummary,
+    pub arguments: Value,
+}
+
+/// 已经通过审批并写入工程的文件补丁。补丁只保留在当前桌面进程内，
+/// 回滚前会再次比较文件正文，避免覆盖用户在外部编辑器中的新改动。
+#[derive(Debug, Clone)]
+pub struct AppliedFilePatch {
+    pub id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub path: String,
+    pub before: String,
+    pub after: String,
+    pub active: bool,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            model: ModelConfig::default(),
+            mcp_servers: Vec::new(),
+            project: ProjectContext::default(),
+            pending: HashMap::new(),
+            patches: HashMap::new(),
+            session: AgentSessionSummary::default(),
+        }
+    }
+}
+
+fn app_data_root() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("PLC Pilot")
+}
+
+fn config_file_path() -> PathBuf {
+    app_data_root().join("config.json")
+}
+
+fn load_runtime_state() -> RuntimeState {
+    let mut state = RuntimeState::default();
+    let path = config_file_path();
+    let Ok(content) = fs::read_to_string(&path) else {
+        return state;
+    };
+    match serde_json::from_str::<PersistedRuntimeConfig>(&content) {
+        Ok(config) => {
+            if let Some(model) = config.model {
+                state.model = model;
+            }
+            state.mcp_servers = config.mcp_servers;
+        }
+        Err(error) => {
+            eprintln!("PLC Pilot 配置读取未完成：{error}");
+        }
+    }
+    state
+}
+
+fn persist_runtime_state(state: &RuntimeState) -> Result<(), AppError> {
+    let root = app_data_root();
+    fs::create_dir_all(&root).map_err(|error| {
+        AppError::Configuration(format!("创建 PLC Pilot 配置目录未完成：{error}"))
+    })?;
+    // API 密钥只保留在当前进程内存，不写入 config.json；重启后需要重新输入。
+    let config = PersistedRuntimeConfig {
+        model: Some(ModelConfig {
+            api_key: None,
+            ..state.model.clone()
+        }),
+        mcp_servers: state.mcp_servers.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&config)
+        .map_err(|error| AppError::Configuration(format!("编码 PLC Pilot 配置未完成：{error}")))?;
+    let temporary = root.join(format!("config.json.{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, bytes)
+        .map_err(|error| AppError::Configuration(format!("写入 PLC Pilot 配置未完成：{error}")))?;
+    if let Err(error) = fs::rename(&temporary, config_file_path()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(AppError::Configuration(format!(
+            "替换 PLC Pilot 配置未完成：{error}"
+        )));
+    }
+    Ok(())
+}
+
+fn write_desktop_endpoint(endpoint: &DesktopEndpoint) -> Result<(), AppError> {
+    let root = app_data_root().join("codesys-bridge");
+    fs::create_dir_all(&root)
+        .map_err(|error| AppError::Internal(format!("创建 CODESYS 桥接目录未完成：{error}")))?;
+    let content = serde_json::to_vec_pretty(endpoint)
+        .map_err(|error| AppError::Internal(format!("编码桌面桥接 endpoint 未完成：{error}")))?;
+    let path = root.join("desktop-endpoint.json");
+    let temporary = root.join(format!("desktop-endpoint.json.{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, content)
+        .map_err(|error| AppError::Internal(format!("写入桌面桥接 endpoint 未完成：{error}")))?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(AppError::Internal(format!(
+            "替换桌面桥接 endpoint 未完成：{error}"
+        )));
+    }
+    Ok(())
+}
+
+async fn start_local_rpc(app: tauri::AppHandle, state: AppState) -> Result<(), AppError> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.map_err(|error| {
+        AppError::Internal(format!("绑定 PLC Pilot 本机桥接端口未完成：{error}"))
+    })?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| AppError::Internal(format!("读取本机桥接端口未完成：{error}")))?;
+    let endpoint = DesktopEndpoint {
+        protocol: RPC_PROTOCOL_VERSION,
+        host: "127.0.0.1".to_string(),
+        port: address.port(),
+        token: Uuid::new_v4().to_string(),
+        pid: std::process::id(),
+        updated_at: now_iso(),
+    };
+    write_desktop_endpoint(&endpoint)?;
+    eprintln!("PLC Pilot 本机桥接已监听 127.0.0.1:{}", address.port());
+
+    let shared_state = Arc::new(state);
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| AppError::Internal(format!("接受本机桥接连接未完成：{error}")))?;
+        let app_handle = app.clone();
+        let state = shared_state.clone();
+        let token = endpoint.token.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_local_rpc(stream, app_handle, state, token).await {
+                eprintln!("PLC Pilot 本机桥接连接结束：{error}");
+            }
+        });
+    }
+}
+
+async fn handle_local_rpc(
+    stream: TcpStream,
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+    token: String,
+) -> Result<(), AppError> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let count = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| AppError::Internal(format!("读取本机桥接请求未完成：{error}")))?;
+        if count == 0 {
+            return Ok(());
+        }
+        if line.len() > RPC_MAX_REQUEST_BYTES {
+            write_rpc_response(
+                &mut writer,
+                None,
+                false,
+                None,
+                Some("本机桥接请求超过允许大小".to_string()),
+            )
+            .await?;
+            continue;
+        }
+        let value = match serde_json::from_str::<Value>(line.trim()) {
+            Ok(value) => value,
+            Err(error) => {
+                write_rpc_response(
+                    &mut writer,
+                    None,
+                    false,
+                    None,
+                    Some(format!("本机桥接请求 JSON 无法解析：{error}")),
+                )
+                .await?;
+                continue;
+            }
+        };
+        let request_id = value
+            .get("requestId")
+            .or_else(|| value.get("request_id"))
+            .or_else(|| value.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if value.get("token").and_then(Value::as_str) != Some(token.as_str()) {
+            write_rpc_response(
+                &mut writer,
+                request_id,
+                false,
+                None,
+                Some("本机桥接令牌校验未通过".to_string()),
+            )
+            .await?;
+            continue;
+        }
+        let command = value
+            .get("command")
+            .or_else(|| value.get("method"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let args = value
+            .get("args")
+            .or_else(|| value.get("params"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let result = timeout(
+            Duration::from_secs(RPC_REQUEST_TIMEOUT_SECONDS),
+            dispatch_local_rpc(&app, state.clone(), &command, args),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Internal(format!(
+                "本机桥接请求超过 {RPC_REQUEST_TIMEOUT_SECONDS} 秒仍未返回"
+            ))
+        })?;
+        match result {
+            Ok(result) => {
+                write_rpc_response(&mut writer, request_id, true, Some(result), None).await?
+            }
+            Err(error) => {
+                write_rpc_response(
+                    &mut writer,
+                    request_id,
+                    false,
+                    None,
+                    Some(error.to_string()),
+                )
+                .await?
+            }
+        }
+    }
+}
+
+async fn write_rpc_response(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    request_id: Option<String>,
+    ok: bool,
+    result: Option<Value>,
+    error: Option<String>,
+) -> Result<(), AppError> {
+    let mut response = json!({
+        "type": "plc-pilot.response",
+        "requestId": request_id.unwrap_or_default(),
+        "ok": ok,
+    });
+    if let Some(request_id) = response.get("requestId").and_then(Value::as_str) {
+        response["id"] = Value::String(request_id.to_string());
+    }
+    if ok {
+        response["result"] = result.unwrap_or(Value::Null);
+    } else {
+        response["error"] =
+            Value::String(error.unwrap_or_else(|| "本机桥接没有返回结果".to_string()));
+    }
+    let mut bytes = serde_json::to_vec(&response)
+        .map_err(|error| AppError::Internal(format!("编码本机桥接响应未完成：{error}")))?;
+    bytes.push(b'\n');
+    writer
+        .write_all(&bytes)
+        .await
+        .map_err(|error| AppError::Internal(format!("写入本机桥接响应未完成：{error}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| AppError::Internal(format!("刷新本机桥接响应未完成：{error}")))
+}
+
+async fn dispatch_local_rpc(
+    app: &tauri::AppHandle,
+    state: Arc<AppState>,
+    command: &str,
+    args: Value,
+) -> Result<Value, AppError> {
+    let command = command.trim().to_lowercase();
+    let value = match command.as_str() {
+        // 兼容 Codex app-server 的最小线程/轮次方法集合；底层仍复用本地
+        // JSONL 会话和同一套审批、上下文校验，不启动额外的 WebSocket 服务。
+        "thread/list" => json!({"threads": list_session_records()}),
+        "thread/start" => {
+            let mut guard = state.inner.lock().await;
+            guard.session = AgentSessionSummary::default();
+            serde_json::to_value(guard.session.clone())
+                .map_err(|error| AppError::Internal(format!("编码新线程结果未完成：{error}")))?
+        }
+        "thread/read" => {
+            let requested_id = args
+                .get("threadId")
+                .or_else(|| args.get("thread_id"))
+                .or_else(|| args.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let requested_path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            let record = list_session_records().into_iter().find(|item| {
+                (!requested_id.is_empty() && item.session_id == requested_id)
+                    || (!requested_path.is_empty()
+                        && session_paths_equal(&item.path, requested_path))
+            });
+            serde_json::to_value(record.unwrap_or_else(|| SessionRecord {
+                session_id: requested_id.to_string(),
+                name: None,
+                path: String::new(),
+                modified_at: None,
+                message_count: 0,
+                messages: Vec::new(),
+            }))
+            .map_err(|error| AppError::Internal(format!("编码线程读取结果未完成：{error}")))?
+        }
+        "thread/resume" => {
+            let path = args
+                .get("path")
+                .or_else(|| args.get("session_file"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| AppError::Configuration("thread/resume 需要 path".to_string()))?;
+            serde_json::to_value(resume_session_inner(path, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码线程恢复结果未完成：{error}")))?
+        }
+        "turn/start" => {
+            let message = args
+                .get("message")
+                .or_else(|| args.get("prompt"))
+                .or_else(|| args.get("input"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::Configuration("turn/start 需要 message 或 prompt".to_string())
+                })?
+                .to_string();
+            let history = args
+                .get("history")
+                .cloned()
+                .map(|value| serde_json::from_value::<Vec<ChatMessage>>(value))
+                .transpose()
+                .map_err(|error| {
+                    AppError::Configuration(format!("turn/start history 无法解析：{error}"))
+                })?
+                .unwrap_or_default();
+            let skills = args
+                .get("skills")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let request = AgentRequest {
+                message,
+                history,
+                codesys_context: context_binding_from_args(&args),
+                model: args
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                reasoning_effort: args
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                collaboration_mode: args
+                    .get("collaboration_mode")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                skills,
+                ..AgentRequest::default()
+            };
+            serde_json::to_value(run_agent_inner(app.clone(), request, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码轮次结果未完成：{error}")))?
+        }
+        "context/compact" => {
+            let instructions = args
+                .get("instructions")
+                .or_else(|| args.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            serde_json::to_value(
+                compact_context_inner(
+                    app.clone(),
+                    instructions,
+                    context_binding_from_args(&args),
+                    &state,
+                )
+                .await?,
+            )
+            .map_err(|error| AppError::Internal(format!("编码上下文压缩结果未完成：{error}")))?
+        }
+        "get_snapshot" => serde_json::to_value(snapshot_from_app_state_ref(&state).await?)
+            .map_err(|error| AppError::Internal(format!("编码快照未完成：{error}")))?,
+        "configure_model" => {
+            let config = nested_arg::<ModelConfig>(&args, "config")?;
+            serde_json::to_value(configure_model_inner(config, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码模型配置未完成：{error}")))?
+        }
+        "configure_mcp" => {
+            let request = nested_arg::<ConfigureMcpRequest>(&args, "request")?;
+            serde_json::to_value(configure_mcp_inner(request, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码 MCP 配置未完成：{error}")))?
+        }
+        "select_project" => {
+            let path = required_string_arg(&args, "path")?;
+            serde_json::to_value(select_project_inner(path, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码工程上下文未完成：{error}")))?
+        }
+        "detect_codesys" => serde_json::to_value(detect_codesys_installation())
+            .map_err(|error| AppError::Internal(format!("编码 CODESYS 状态未完成：{error}")))?,
+        "list_mcp_tools" => serde_json::to_value(list_mcp_tools_inner(&state).await?)
+            .map_err(|error| AppError::Internal(format!("编码 MCP 工具未完成：{error}")))?,
+        "call_mcp_tool" => {
+            let request = nested_arg_or_self::<ToolCallRequest>(&args, "request")?;
+            let current_project = sync_current_project_inner(&state).await?;
+            validate_codesys_context_binding(&current_project, request.codesys_context.as_ref())?;
+            serde_json::to_value(call_mcp_tool_inner(request, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码 MCP 调用结果未完成：{error}")))?
+        }
+        "approve_change" => {
+            let id = required_string_arg(&args, "id")?;
+            serde_json::to_value(approve_change_inner(id, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码审批结果未完成：{error}")))?
+        }
+        "reject_change" => {
+            let id = required_string_arg(&args, "id")?;
+            reject_change_inner(id, &state).await?;
+            Value::Null
+        }
+        "compile_project" => serde_json::to_value(compile_project_inner(&state).await?)
+            .map_err(|error| AppError::Internal(format!("编码编译结果未完成：{error}")))?,
+        "run_agent" => {
+            let mut request = nested_arg::<AgentRequest>(&args, "request")?;
+            if let Some(binding) = context_binding_from_args(&args) {
+                request.codesys_context = Some(binding);
+            }
+            serde_json::to_value(run_agent_inner(app.clone(), request, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码 Agent 结果未完成：{error}")))?
+        }
+        "compact_context" => {
+            let instructions = args
+                .get("instructions")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let binding = context_binding_from_args(&args);
+            serde_json::to_value(
+                compact_context_inner(app.clone(), instructions, binding, &state).await?,
+            )
+            .map_err(|error| AppError::Internal(format!("编码压缩结果未完成：{error}")))?
+        }
+        "get_skill_content" => {
+            let id = required_string_arg(&args, "id")?;
+            let skill = get_skill_content_inner(id, &state).await?;
+            Value::String(skill)
+        }
+        "list_sessions" => serde_json::to_value(list_session_records())
+            .map_err(|error| AppError::Internal(format!("编码会话列表未完成：{error}")))?,
+        "resume_session" => {
+            let path = required_string_arg(&args, "path")?;
+            serde_json::to_value(resume_session_inner(path, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码会话未完成：{error}")))?
+        }
+        "scan_project" => serde_json::to_value(scan_project_inner(&state).await?)
+            .map_err(|error| AppError::Internal(format!("编码工程扫描未完成：{error}")))?,
+        "sync_current_project" => {
+            serde_json::to_value(sync_current_project_inner(&state).await?)
+                .map_err(|error| AppError::Internal(format!("编码工程同步未完成：{error}")))?
+        }
+        "search_project_files" => {
+            let cwd = args
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+            serde_json::to_value(search_project_files_inner(cwd, query, limit, &state).await?)
+                .map_err(|error| {
+                    AppError::Internal(format!("编码工程文件搜索结果未完成：{error}"))
+                })?
+        }
+        "update_thread_file_changes" => {
+            let request = nested_arg_or_self::<FileChangesRequest>(&args, "request")?;
+            serde_json::to_value(update_thread_file_changes_inner(request, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码工程回滚结果未完成：{error}")))?
+        }
+        "open_desktop" => json!({"opened": true, "message": "PLC Pilot 桌面运行时已连接"}),
+        _ => {
+            return Err(AppError::Configuration(format!(
+                "PLC Pilot 不支持本机命令：{command}"
+            )))
+        }
+    };
+    Ok(value)
+}
+
+fn nested_arg<T>(args: &Value, key: &str) -> Result<T, AppError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let value = args
+        .get(key)
+        .cloned()
+        .ok_or_else(|| AppError::Configuration(format!("本机桥接请求缺少参数：{key}")))?;
+    serde_json::from_value(value)
+        .map_err(|error| AppError::Configuration(format!("本机桥接参数 {key} 无法解析：{error}")))
+}
+
+fn nested_arg_or_self<T>(args: &Value, key: &str) -> Result<T, AppError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if args.get(key).is_some() {
+        nested_arg(args, key)
+    } else {
+        serde_json::from_value(args.clone())
+            .map_err(|error| AppError::Configuration(format!("本机桥接参数无法解析：{error}")))
+    }
+}
+
+fn required_string_arg(args: &Value, key: &str) -> Result<String, AppError> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| AppError::Configuration(format!("本机桥接请求缺少参数：{key}")))
+}
+
+fn context_binding_from_args(args: &Value) -> Option<AgentContextBinding> {
+    args.get("codesys_context")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn normalize_context_path(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+fn validate_codesys_context_binding(
+    project: &ProjectContext,
+    binding: Option<&AgentContextBinding>,
+) -> Result<(), AppError> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+
+    // 根本原因：旧校验只比较工程键和路径，同一工程内切换 POU、修改未保存正文或
+    // 改变选区时，这两个字段都不会变化，页面提交的旧上下文仍可能被模型使用。
+    // 解决方式：原生插件在 CODESYS UI 线程采集后生成 snapshot_id，桌面运行时重新
+    // 读取快照时必须精确匹配；不匹配就终止本轮，让页面基于最新快照重新发送。
+    if let Some(expected) = binding
+        .snapshot_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let actual = project.snapshot_id.as_deref().unwrap_or_default().trim();
+        if actual != expected {
+            return Err(AppError::Project(
+                "CODESYS 编辑器或工程内容已变化，请基于最新上下文重新发送任务".to_string(),
+            ));
+        }
+    }
+
+    if let Some(expected) = binding
+        .project_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let actual = project.project_key.as_deref().unwrap_or_default().trim();
+        if actual != expected {
+            return Err(AppError::Project(
+                "CODESYS 工程在本次请求前后发生变化，请重新读取当前工程上下文后再试".to_string(),
+            ));
+        }
+    }
+
+    if let Some(expected) = binding
+        .project_path
+        .as_deref()
+        .map(normalize_context_path)
+        .filter(|value| !value.is_empty())
+    {
+        let actual = project
+            .path
+            .as_deref()
+            .map(normalize_context_path)
+            .unwrap_or_default();
+        if actual != expected {
+            return Err(AppError::Project(
+                "当前 CODESYS 工程路径已切换，请重新读取工程后再发送任务".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct McpTool {
+    server_id: String,
+    name: String,
+    description: Option<String>,
+    input_schema: Value,
+}
+
+const BUILTIN_SERVER_ID: &str = "builtin";
+
+/// PLC Pilot 自带的工程工具。它们不经过外部 MCP 进程，直接在受控 Rust 层执行，
+/// 这样常用的读取、Diff 和诊断不需要用户另行安装服务，也不会把工程路径交给未知进程。
+fn builtin_tools() -> Vec<McpTool> {
+    vec![
+        McpTool {
+            server_id: BUILTIN_SERVER_ID.to_string(),
+            name: "project_snapshot".to_string(),
+            description: Some("读取当前 CODESYS 工程、编辑器和扫描状态快照。".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
+            server_id: BUILTIN_SERVER_ID.to_string(),
+            name: "list_pous".to_string(),
+            description: Some("列出工程中的 PROGRAM、FUNCTION_BLOCK、FUNCTION、GVL、DUT 和接口源对象。".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500}
+                },
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
+            server_id: BUILTIN_SERVER_ID.to_string(),
+            name: "read_st_source".to_string(),
+            description: Some("读取工程范围内的 Structured Text 源文件，可按行号截取。".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "相对工程根目录的文件路径"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
+            server_id: BUILTIN_SERVER_ID.to_string(),
+            name: "search_project".to_string(),
+            description: Some("在工程源文件中搜索文本并返回文件、行号和上下文。".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "case_sensitive": {"type": "boolean"}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
+            server_id: BUILTIN_SERVER_ID.to_string(),
+            name: "propose_edit".to_string(),
+            description: Some("基于当前文件正文生成可审阅的统一 Diff；只创建待审批动作，不直接写盘。支持完整 content 或单次 find/replace。".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string", "description": "修改后的完整 UTF-8 文件正文"},
+                    "find": {"type": "string", "description": "要替换的唯一原文片段"},
+                    "replace": {"type": "string", "description": "替换后的文本"},
+                    "replace_all": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                    "expected": {"type": "string", "description": "可选：期望的当前完整文件正文，用于防止过期写入"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
+            server_id: BUILTIN_SERVER_ID.to_string(),
+            name: "compile_project".to_string(),
+            description: Some("执行本地静态 IEC 61131-3 结构诊断；若已配置外部 CODESYS MCP，桌面层会优先调用真实编译工具。".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        McpTool {
+            server_id: BUILTIN_SERVER_ID.to_string(),
+            name: "diagnostics".to_string(),
+            description: Some("读取当前工程的静态诊断结果，并明确标注是否执行了目标 CODESYS 编译器。".to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodesysBridgeSnapshot {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    project_path: Option<String>,
+    #[serde(default)]
+    project_name: Option<String>,
+    #[serde(default)]
+    source_root: Option<String>,
+    #[serde(default)]
+    project_directory: Option<String>,
+    #[serde(default)]
+    working_directory: Option<String>,
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    #[serde(default)]
+    project_key: Option<String>,
+    #[serde(default)]
+    source_files: Vec<String>,
+    #[serde(default)]
+    codesys_version: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    active_object: Option<String>,
+    #[serde(default)]
+    active_object_guid: Option<String>,
+    #[serde(default)]
+    active_file: Option<String>,
+    #[serde(default)]
+    active_file_relative: Option<String>,
+    #[serde(default)]
+    active_text: Option<String>,
+    #[serde(default)]
+    selected_text: Option<String>,
+    #[serde(default)]
+    selection_start: usize,
+    #[serde(default)]
+    selection_length: usize,
+    #[serde(default)]
+    active_editor_available: bool,
+    #[serde(default)]
+    active_text_truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionCall {
+    name: String,
+    arguments: Value,
+    call_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModelResponse {
+    text: String,
+    tool_calls: Vec<FunctionCall>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error("配置不完整：{0}")]
+    Configuration(String),
+    #[error("网络请求未完成：{0}")]
+    Network(String),
+    #[error("MCP 工具未完成：{0}")]
+    Mcp(String),
+    #[error("工程路径不可用：{0}")]
+    Project(String),
+    #[error("内部处理未完成：{0}")]
+    Internal(String),
+}
+
+impl serde::Serialize for AppError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+pub fn run() {
+    let state = AppState {
+        inner: Arc::new(Mutex::new(load_runtime_state())),
+        agent_runs: Arc::new(Mutex::new(())),
+        abort_requested: Arc::new(AtomicBool::new(false)),
+    };
+
+    tauri::Builder::default()
+        .manage(state)
+        .setup(|app| {
+            let state = app.state::<AppState>().inner().clone();
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = start_local_rpc(handle, state).await {
+                    eprintln!("PLC Pilot 本机桥接服务未启动：{error}");
+                }
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_snapshot,
+            configure_model,
+            configure_mcp,
+            select_project,
+            detect_codesys,
+            list_mcp_tools,
+            call_mcp_tool,
+            run_agent,
+            abort_agent,
+            approve_change,
+            reject_change,
+            compile_project,
+            get_skill_content,
+            list_sessions,
+            resume_session,
+            scan_project,
+            sync_current_project,
+            compact_context,
+            search_project_files,
+            update_thread_file_changes
+        ])
+        .run(tauri::generate_context!())
+        .expect("PLC Pilot 启动失败");
+}
+
+#[tauri::command]
+async fn get_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, AppError> {
+    snapshot_from_app_state(&state).await
+}
+
+#[tauri::command]
+async fn configure_model(
+    config: ModelConfig,
+    state: State<'_, AppState>,
+) -> Result<ModelSummary, AppError> {
+    configure_model_inner(config, &state).await
+}
+
+async fn configure_model_inner(
+    config: ModelConfig,
+    state: &AppState,
+) -> Result<ModelSummary, AppError> {
+    if config.model.trim().is_empty() {
+        return Err(AppError::Configuration("模型名称不能为空".to_string()));
+    }
+    if config.base_url.trim().is_empty() {
+        return Err(AppError::Configuration("接口地址不能为空".to_string()));
+    }
+    let summary = model_summary(&config);
+    state.inner.lock().await.model = config;
+    let persisted = state.inner.lock().await.clone();
+    persist_runtime_state(&persisted)?;
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn configure_mcp(
+    request: ConfigureMcpRequest,
+    state: State<'_, AppState>,
+) -> Result<Vec<McpSummary>, AppError> {
+    configure_mcp_inner(request, &state).await
+}
+
+async fn configure_mcp_inner(
+    mut request: ConfigureMcpRequest,
+    state: &AppState,
+) -> Result<Vec<McpSummary>, AppError> {
+    for server in &mut request.servers {
+        if server.id.trim().is_empty() {
+            return Err(AppError::Configuration("MCP 服务需要 id".to_string()));
+        }
+        server.id = server.id.trim().to_string();
+        server.name = if server.name.trim().is_empty() {
+            server.id.clone()
+        } else {
+            server.name.trim().to_string()
+        };
+        if server.transport.trim().is_empty() {
+            server.transport = if server.url.as_deref().unwrap_or_default().trim().is_empty() {
+                "stdio".to_string()
+            } else {
+                "http".to_string()
+            };
+        }
+        server.transport = server.transport.trim().to_lowercase();
+        if !matches!(server.transport.as_str(), "stdio" | "http") {
+            return Err(AppError::Configuration(
+                "MCP 传输方式只能是 stdio 或 http".to_string(),
+            ));
+        }
+        server.command = server.command.trim().to_string();
+        server.url = server
+            .url
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if server.transport == "stdio" && server.command.trim().is_empty() {
+            return Err(AppError::Configuration(
+                "stdio MCP 服务需要启动命令".to_string(),
+            ));
+        }
+        if server.transport == "http" && server.url.as_deref().unwrap_or_default().trim().is_empty()
+        {
+            return Err(AppError::Configuration(
+                "HTTP MCP 服务需要填写 URL".to_string(),
+            ));
+        }
+    }
+    state.inner.lock().await.mcp_servers = request.servers;
+    let persisted = state.inner.lock().await.clone();
+    persist_runtime_state(&persisted)?;
+    Ok(summarize_mcp_servers(state.inner.clone()).await)
+}
+
+#[tauri::command]
+async fn select_project(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectContext, AppError> {
+    select_project_inner(path, &state).await
+}
+
+async fn select_project_inner(path: String, state: &AppState) -> Result<ProjectContext, AppError> {
+    let normalized = path.trim().trim_matches('"');
+    if normalized.is_empty() {
+        return Err(AppError::Project(
+            "请提供 CODESYS 工程文件或目录路径".to_string(),
+        ));
+    }
+    let path_buf = PathBuf::from(normalized);
+    let metadata = std::fs::metadata(&path_buf)
+        .map_err(|error| AppError::Project(format!("无法读取路径：{error}")))?;
+    let name = path_buf
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(normalized)
+        .to_string();
+    let extension = path_buf
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_lowercase);
+    let project_directory = if metadata.is_dir() {
+        Some(normalized.to_string())
+    } else {
+        path_buf
+            .parent()
+            .and_then(|value| value.to_str())
+            .map(str::to_string)
+    };
+    let project = ProjectContext {
+        path: Some(normalized.to_string()),
+        project_directory,
+        name: Some(name),
+        version: Some("SP22（目标版本）".to_string()),
+        exists: metadata.is_file() || metadata.is_dir(),
+        extension,
+        ..ProjectContext::default()
+    };
+    let scanned = scan_project_context(project);
+    state.inner.lock().await.project = scanned.clone();
+    Ok(scanned)
+}
+
+#[tauri::command]
+async fn detect_codesys() -> Result<CodesysStatus, AppError> {
+    Ok(detect_codesys_installation())
+}
+
+#[tauri::command]
+async fn list_sessions() -> Result<Vec<SessionRecord>, AppError> {
+    Ok(list_session_records())
+}
+
+#[tauri::command]
+async fn resume_session(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<SessionRecord, AppError> {
+    resume_session_inner(path, &state).await
+}
+
+async fn resume_session_inner(path: String, state: &AppState) -> Result<SessionRecord, AppError> {
+    let requested = path.trim().trim_matches('"');
+    if requested.is_empty() {
+        return Err(AppError::Configuration("请选择一个会话文件".to_string()));
+    }
+    // 只允许恢复由本应用会话目录发现出来的 JSONL，避免把任意本机文件交给 Pi 解析。
+    let record = list_session_records()
+        .into_iter()
+        .find(|item| session_paths_equal(&item.path, requested))
+        .ok_or_else(|| AppError::Configuration("会话文件不在 PLC Pilot 会话目录中".to_string()))?;
+    state.inner.lock().await.session = AgentSessionSummary {
+        session_id: Some(record.session_id.clone()),
+        session_file: Some(record.path.clone()),
+        name: record.name.clone(),
+        message_count: record.message_count,
+        ..AgentSessionSummary::default()
+    };
+    Ok(record)
+}
+
+#[tauri::command]
+async fn scan_project(state: State<'_, AppState>) -> Result<ProjectContext, AppError> {
+    scan_project_inner(&state).await
+}
+
+async fn scan_project_inner(state: &AppState) -> Result<ProjectContext, AppError> {
+    let current = state.inner.lock().await.project.clone();
+    let scanned = scan_project_context(current);
+    state.inner.lock().await.project = scanned.clone();
+    Ok(scanned)
+}
+
+#[tauri::command]
+async fn sync_current_project(state: State<'_, AppState>) -> Result<ProjectContext, AppError> {
+    sync_current_project_inner(&state).await
+}
+
+async fn sync_current_project_inner(state: &AppState) -> Result<ProjectContext, AppError> {
+    let current = state.inner.lock().await.project.clone();
+    let synced = sync_project_from_codesys(current);
+    state.inner.lock().await.project = synced.clone();
+    Ok(synced)
+}
+
+#[tauri::command]
+async fn search_project_files(
+    cwd: String,
+    query: String,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<ComposerFileSuggestion>, AppError> {
+    search_project_files_inner(cwd, query, limit.unwrap_or(20), &state).await
+}
+
+async fn search_project_files_inner(
+    cwd: String,
+    query: String,
+    limit: usize,
+    state: &AppState,
+) -> Result<Vec<ComposerFileSuggestion>, AppError> {
+    let project = state.inner.lock().await.project.clone();
+    if !project.exists {
+        return Ok(Vec::new());
+    }
+    let root = project_root(&project)?;
+    if let Some(requested_cwd) = cwd
+        .trim()
+        .trim_matches('"')
+        .strip_prefix("file://")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let cwd_path = PathBuf::from(requested_cwd);
+        if cwd_path.exists() {
+            let cwd_path = fs::canonicalize(cwd_path)
+                .map_err(|error| AppError::Project(format!("解析搜索工作目录未完成：{error}")))?;
+            if !root.starts_with(&cwd_path) && !cwd_path.starts_with(&root) {
+                return Err(AppError::Project(
+                    "文件搜索工作目录与当前工程不一致".to_string(),
+                ));
+            }
+        }
+    }
+    let needle = query.trim().to_lowercase();
+    let cap = limit.clamp(1, 100);
+    let mut result = Vec::new();
+    for (_, relative) in project_file_entries(&project, 2000)? {
+        if needle.is_empty() || relative.to_lowercase().contains(&needle) {
+            result.push(ComposerFileSuggestion { path: relative });
+            if result.len() >= cap {
+                break;
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn update_thread_file_changes(
+    request: FileChangesRequest,
+    state: State<'_, AppState>,
+) -> Result<FileChangesResult, AppError> {
+    update_thread_file_changes_inner(request, &state).await
+}
+
+async fn update_thread_file_changes_inner(
+    request: FileChangesRequest,
+    state: &AppState,
+) -> Result<FileChangesResult, AppError> {
+    let action = request.action.trim().to_lowercase();
+    if action != "undo" && action != "redo" {
+        return Err(AppError::Configuration(
+            "文件变更动作只能是 undo 或 redo".to_string(),
+        ));
+    }
+    let project = state.inner.lock().await.project.clone();
+    let root = project_root(&project)?;
+    let requested_cwd_value = request.cwd.trim().trim_matches('"');
+    if !requested_cwd_value.is_empty() {
+        let requested_cwd = PathBuf::from(requested_cwd_value);
+        if !requested_cwd.exists() {
+            return Err(AppError::Project("回滚工作目录不存在".to_string()));
+        }
+        let requested_cwd = fs::canonicalize(requested_cwd)
+            .map_err(|error| AppError::Project(format!("解析回滚工作目录未完成：{error}")))?;
+        if !root.starts_with(&requested_cwd) && !requested_cwd.starts_with(&root) {
+            return Err(AppError::Project(
+                "回滚工作目录与当前工程不一致".to_string(),
+            ));
+        }
+    }
+    let candidates = {
+        let guard = state.inner.lock().await;
+        let include_later = request.scope.as_deref() == Some("turn_and_later");
+        let exact = |patch: &&AppliedFilePatch| {
+            let thread_matches = request.thread_id.trim().is_empty()
+                || patch.thread_id == request.thread_id
+                || patch.thread_id == "local-plc-thread";
+            let turn_matches = include_later
+                || request.turn_id.trim().is_empty()
+                || patch.turn_id == request.turn_id;
+            let state_matches = if action == "undo" {
+                patch.active
+            } else {
+                !patch.active
+            };
+            thread_matches && turn_matches && state_matches
+        };
+        let mut selected = if request.patch_ids.is_empty() {
+            guard
+                .patches
+                .values()
+                .filter(exact)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            guard
+                .patches
+                .values()
+                .filter(|patch| request.patch_ids.iter().any(|id| id == &patch.id))
+                .filter(exact)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // Pi/Codex 的消息元数据可能只有 turnId，而审批动作产生时尚未拿到该元数据。
+        // 兼容这种情况时只能接受“当前工程内唯一可逆补丁”。旧实现会把所有同方向补丁
+        // 一次性加入候选，用户点击一次撤回就可能覆盖多个文件；候选超过一个时必须让
+        // 调用方带上明确的 patchIds/turnId，宁可暂缓也不能扩大写入范围。
+        if selected.is_empty() && request.patch_ids.is_empty() {
+            let fallback = guard
+                .patches
+                .values()
+                .filter(|patch| {
+                    let state_matches = if action == "undo" {
+                        patch.active
+                    } else {
+                        !patch.active
+                    };
+                    state_matches && Path::new(&patch.path).starts_with(&root)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            match fallback.len() {
+                0 => {}
+                1 => selected = fallback,
+                count => {
+                    let ids = fallback
+                        .iter()
+                        .map(|patch| patch.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(AppError::Configuration(format!(
+                        "无法唯一定位要{}的工程补丁：当前有 {count} 个候选（{ids}）；请提供 patchIds 或 turnId",
+                        if action == "undo" { "撤回" } else { "重做" }
+                    )));
+                }
+            }
+        }
+        selected
+    };
+    if candidates.is_empty() {
+        return Ok(FileChangesResult {
+            changed: 0,
+            errors: vec!["当前会话没有可执行的工程补丁；外部 MCP 修改无法由桌面回滚。".to_string()],
+            reverted_patch_ids: Vec::new(),
+            applied_patch_ids: Vec::new(),
+        });
+    }
+    let mut changed = 0usize;
+    let mut errors = Vec::new();
+    let mut reverted_patch_ids = Vec::new();
+    let mut applied_patch_ids = Vec::new();
+    for patch in candidates {
+        let path = PathBuf::from(&patch.path);
+        if !path.starts_with(&root) || !path.is_file() {
+            errors.push(format!("补丁目标不在当前工程内：{}", patch.path));
+            continue;
+        }
+        let current = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                errors.push(format!("读取补丁目标 {} 未完成：{error}", patch.path));
+                continue;
+            }
+        };
+        let (expected, next) = if action == "undo" {
+            (&patch.after, &patch.before)
+        } else {
+            (&patch.before, &patch.after)
+        };
+        if &current != expected {
+            errors.push(format!("{} 在回滚前已被外部修改，已跳过", patch.path));
+            continue;
+        }
+        if let Err(error) = write_project_text(&path, next) {
+            errors.push(error.to_string());
+            continue;
+        }
+        let mut guard = state.inner.lock().await;
+        if let Some(item) = guard.patches.get_mut(&patch.id) {
+            item.active = action == "redo";
+        }
+        changed += 1;
+        if action == "undo" {
+            reverted_patch_ids.push(patch.id);
+        } else {
+            applied_patch_ids.push(patch.id);
+        }
+    }
+    let refreshed = scan_project_context(project);
+    state.inner.lock().await.project = refreshed;
+    Ok(FileChangesResult {
+        changed,
+        errors,
+        reverted_patch_ids,
+        applied_patch_ids,
+    })
+}
+
+#[tauri::command]
+async fn compact_context(
+    app: AppHandle,
+    instructions: String,
+    codesys_context: Option<AgentContextBinding>,
+    state: State<'_, AppState>,
+) -> Result<AgentRunResult, AppError> {
+    compact_context_inner(app, instructions, codesys_context, &state).await
+}
+
+async fn compact_context_inner(
+    app: AppHandle,
+    instructions: String,
+    codesys_context: Option<AgentContextBinding>,
+    state: &AppState,
+) -> Result<AgentRunResult, AppError> {
+    let suffix = instructions.trim();
+    let message = if suffix.is_empty() {
+        "/compact".to_string()
+    } else {
+        format!("/compact {suffix}")
+    };
+    run_agent_inner(
+        app,
+        AgentRequest {
+            message,
+            history: Vec::new(),
+            codesys_context,
+            ..AgentRequest::default()
+        },
+        state,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn list_mcp_tools(state: State<'_, AppState>) -> Result<Vec<ToolSummary>, AppError> {
+    list_mcp_tools_inner(&state).await
+}
+
+async fn list_mcp_tools_inner(state: &AppState) -> Result<Vec<ToolSummary>, AppError> {
+    let servers = state.inner.lock().await.mcp_servers.clone();
+    let mut all_tools = builtin_tools()
+        .into_iter()
+        .map(tool_summary_from_mcp)
+        .collect::<Vec<_>>();
+    for server in servers.into_iter().filter(|server| server.enabled) {
+        if let Ok(tools) = McpClient::new(server.clone()).list_tools().await {
+            all_tools.extend(tools.into_iter().map(tool_summary_from_mcp));
+        }
+    }
+    Ok(all_tools)
+}
+
+#[tauri::command]
+async fn call_mcp_tool(
+    request: ToolCallRequest,
+    state: State<'_, AppState>,
+) -> Result<ToolCallResult, AppError> {
+    call_mcp_tool_inner(request, &state).await
+}
+
+async fn call_mcp_tool_inner(
+    request: ToolCallRequest,
+    state: &AppState,
+) -> Result<ToolCallResult, AppError> {
+    if is_forbidden_tool(&request.tool_name) {
+        return Err(AppError::Mcp(
+            "这个工具属于默认关闭的高风险在线操作，不能直接调用".to_string(),
+        ));
+    }
+    if is_mutating_tool(&request.tool_name) {
+        return Err(AppError::Mcp(
+            "这个工具可能改变工程，必须先通过审批卡片执行".to_string(),
+        ));
+    }
+    if request.server_id == BUILTIN_SERVER_ID {
+        return call_builtin_tool(state, &request.tool_name, request.arguments).await;
+    }
+    let server = find_server(state, &request.server_id).await?;
+    McpClient::new(server)
+        .call_tool(&request.tool_name, request.arguments)
+        .await
+}
+
+#[tauri::command]
+async fn approve_change(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<ToolCallResult, AppError> {
+    approve_change_inner(id, &state).await
+}
+
+async fn approve_change_inner(id: String, state: &AppState) -> Result<ToolCallResult, AppError> {
+    let pending = state
+        .inner
+        .lock()
+        .await
+        .pending
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| AppError::Mcp("待审批动作不存在或已经处理".to_string()))?;
+    if pending.summary.status != "pending" {
+        return Err(AppError::Mcp("这个动作已经处理过了".to_string()));
+    }
+    let result = if pending.summary.server_id == BUILTIN_SERVER_ID {
+        apply_builtin_pending_change(state, &pending).await?
+    } else {
+        let server = find_server(state, &pending.summary.server_id).await?;
+        McpClient::new(server)
+            .call_tool(&pending.summary.tool_name, pending.arguments)
+            .await?
+    };
+    let mut guard = state.inner.lock().await;
+    if let Some(item) = guard.pending.get_mut(&id) {
+        item.summary.status = if result.is_error { "error" } else { "approved" }.to_string();
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn reject_change(id: String, state: State<'_, AppState>) -> Result<(), AppError> {
+    reject_change_inner(id, &state).await
+}
+
+async fn reject_change_inner(id: String, state: &AppState) -> Result<(), AppError> {
+    let mut guard = state.inner.lock().await;
+    let item = guard
+        .pending
+        .get_mut(&id)
+        .ok_or_else(|| AppError::Mcp("待审批动作不存在或已经处理".to_string()))?;
+    item.summary.status = "rejected".to_string();
+    Ok(())
+}
+
+#[tauri::command]
+async fn compile_project(state: State<'_, AppState>) -> Result<ToolCallResult, AppError> {
+    compile_project_inner(&state).await
+}
+
+async fn compile_project_inner(state: &AppState) -> Result<ToolCallResult, AppError> {
+    let project = state.inner.lock().await.project.clone();
+    if !project.exists {
+        return Err(AppError::Project(
+            "请先选择一个存在的 CODESYS 工程".to_string(),
+        ));
+    }
+    let tools = list_mcp_tools_inner(state).await?;
+    let compile_tool = tools.iter().find(|tool| {
+        let name = tool.name.to_lowercase();
+        tool.server_id != BUILTIN_SERVER_ID
+            && !tool.mutating
+            && (name.contains("compile") || name.contains("build") || name.contains("diagnostic"))
+    });
+    if let Some(tool) = compile_tool {
+        return call_mcp_tool_inner(
+            ToolCallRequest {
+                server_id: tool.server_id.clone(),
+                tool_name: tool.name.clone(),
+                arguments: json!({ "project_path": project.path }),
+                codesys_context: None,
+            },
+            state,
+        )
+        .await;
+    }
+    // 没有真实 CODESYS 编译 MCP 时仍执行本地静态诊断，但明确告诉调用方没有运行
+    // 目标编译器，避免把“语法结构检查”误报成 CODESYS 编译通过。
+    call_builtin_tool(state, "compile_project", json!({})).await
+}
+
+#[tauri::command]
+async fn run_agent_legacy(
+    app: AppHandle,
+    request: AgentRequest,
+    state: &AppState,
+) -> Result<AgentRunResult, AppError> {
+    if request.message.trim().is_empty() {
+        return Err(AppError::Configuration(
+            "请输入要交给 Agent 的任务".to_string(),
+        ));
+    }
+    let (base_model, project, servers) = {
+        let guard = state.inner.lock().await;
+        (
+            guard.model.clone(),
+            guard.project.clone(),
+            guard.mcp_servers.clone(),
+        )
+    };
+    let model = model_for_request(&base_model, &request)?;
+    validate_model_config(&model)?;
+    let plan_mode = request_is_plan_mode(&request);
+
+    let mut events = Vec::new();
+    let tools = discover_tools(&servers, &mut events).await;
+    for event in events.clone() {
+        emit_event(&app, event);
+    }
+    let system = build_agent_system_prompt(&project, &request);
+    let mut messages = request.history;
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: request.message,
+    });
+    push_event(
+        &app,
+        &mut events,
+        AgentEvent::new(
+            "context",
+            "context",
+            "已加载工程上下文与 PLC 安全边界",
+            Some(if project.exists {
+                project.path.clone().unwrap_or_default()
+            } else {
+                "尚未选择工程，当前只能讨论方案".to_string()
+            }),
+            "done",
+            None,
+        ),
+    );
+
+    let mut final_text = String::new();
+    let mut diagnostics = Vec::new();
+    for turn in 0..MAX_AGENT_TURNS {
+        push_event(
+            &app,
+            &mut events,
+            AgentEvent::new(
+                &format!("model-{turn}"),
+                "model",
+                "请求模型分析任务",
+                None,
+                "running",
+                None,
+            ),
+        );
+        let response = call_model(&model, &system, &messages, &tools).await?;
+        if !response.text.trim().is_empty() {
+            final_text = response.text.clone();
+        }
+        if response.tool_calls.is_empty() {
+            push_event(
+                &app,
+                &mut events,
+                AgentEvent::new(
+                    &format!("model-{turn}-done"),
+                    "model",
+                    "模型返回分析结果",
+                    Some(response.text),
+                    "done",
+                    None,
+                ),
+            );
+            break;
+        }
+
+        for call in response.tool_calls {
+            let parsed = split_qualified_tool(&call.name).or_else(|| {
+                if builtin_tools().iter().any(|tool| tool.name == call.name) {
+                    Some((BUILTIN_SERVER_ID.to_string(), call.name.clone()))
+                } else if servers.len() == 1 {
+                    Some((servers[0].id.clone(), call.name.clone()))
+                } else {
+                    None
+                }
+            });
+            let (server_id, tool_name) = parsed
+                .ok_or_else(|| AppError::Mcp(format!("模型请求了未绑定的工具：{}", call.name)))?;
+            let tool_response = process_pi_tool_request(
+                &app,
+                state,
+                &servers,
+                json!({
+                    "request_id": format!("legacy-{}", call.call_id),
+                    "tool_call_id": call.call_id,
+                    "server_id": server_id,
+                    "tool_name": tool_name,
+                    "arguments": call.arguments,
+                }),
+                &mut events,
+                &mut diagnostics,
+                plan_mode,
+            )
+            .await?;
+            let feedback = tool_response
+                .get("content")
+                .map(|value| serde_json::to_string(value).unwrap_or_else(|_| value.to_string()))
+                .unwrap_or_else(|| tool_response.to_string());
+            messages.push(tool_feedback(&call.name, &truncate(&feedback, 12000)));
+        }
+        if turn == MAX_AGENT_TURNS - 1 {
+            final_text =
+                "Agent 已达到本次任务的最大工具轮次，请检查工具时间线和待审批动作。".to_string();
+        }
+    }
+
+    let pending_changes = state
+        .inner
+        .lock()
+        .await
+        .pending
+        .values()
+        .filter(|item| item.summary.status == "pending")
+        .map(|item| item.summary.clone())
+        .collect();
+    Ok(AgentRunResult {
+        text: if final_text.trim().is_empty() {
+            "模型没有返回文字结果，请检查接口配置或工具诊断。".to_string()
+        } else {
+            final_text
+        },
+        events,
+        pending_changes,
+        diagnostics,
+        session: state.inner.lock().await.session.clone(),
+    })
+}
+
+#[tauri::command]
+async fn run_agent(
+    app: AppHandle,
+    request: AgentRequest,
+    state: State<'_, AppState>,
+) -> Result<AgentRunResult, AppError> {
+    run_agent_inner(app, request, &state).await
+}
+
+/// 请求取消正在运行的 Agent。取消只终止当前模型/工具轮次，已审批写入不会被回滚。
+#[tauri::command]
+async fn abort_agent(state: State<'_, AppState>) -> Result<Value, AppError> {
+    let running = state.agent_runs.try_lock().is_err();
+    if running {
+        state.abort_requested.store(true, Ordering::SeqCst);
+    }
+    Ok(json!({ "aborted": running }))
+}
+
+async fn run_agent_inner(
+    app: AppHandle,
+    request: AgentRequest,
+    state: &AppState,
+) -> Result<AgentRunResult, AppError> {
+    if request.message.trim().is_empty() {
+        return Err(AppError::Configuration(
+            "请输入要交给 Agent 的任务".to_string(),
+        ));
+    }
+
+    // 每次 Agent 请求都重新合并原生 CODESYS 快照，确保工程切换、编辑器和选区变化不会沿用旧上下文。
+    // CODESYS 宿主还会把刚采集的 snapshot_id 注入请求；若文件在请求间隙被替换，
+    // 直接拒绝本轮而不把上一工程内容交给模型。
+    let current_project = sync_current_project_inner(state).await?;
+    validate_codesys_context_binding(&current_project, request.codesys_context.as_ref())?;
+
+    // 同一工程会话只允许一个 Agent 运行，避免两个模型请求同时写入同一份 JSONL 会话。
+    let _run_guard = state.agent_runs.lock().await;
+    state.abort_requested.store(false, Ordering::SeqCst);
+    let command = request.message.trim();
+    let mut command_parts = command.split_whitespace();
+    let command_name = command_parts.next().unwrap_or_default().to_lowercase();
+    let command_args = command_parts.collect::<Vec<_>>();
+    match command_name.as_str() {
+        "/help" => {
+            let help = available_commands()
+                .into_iter()
+                .map(|item| format!("{}  {}", item.command, item.detail))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(agent_result_from_state(
+                state,
+                format!("可用命令：\n{help}\n\n工程读取、ST 修改、编译和诊断请直接描述目标；任何写入动作都会先进入审批页。"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await);
+        }
+        "/skills" => {
+            let project = state.inner.lock().await.project.clone();
+            let skills = discover_skills(&project);
+            if let Some(requested_id) = command_args.first().copied() {
+                let skill = skills
+                    .iter()
+                    .find(|skill| skill.id == requested_id)
+                    .ok_or_else(|| {
+                        AppError::Configuration(format!("未找到 Skill：{requested_id}"))
+                    })?;
+                let content = match builtin_skill_content(requested_id) {
+                    Some(content) => content.to_string(),
+                    None => skill
+                        .path
+                        .as_deref()
+                        .ok_or_else(|| {
+                            AppError::Configuration("这个 Skill 没有可读取的文件".to_string())
+                        })
+                        .and_then(|path| {
+                            std::fs::read_to_string(path).map_err(|error| {
+                                AppError::Configuration(format!("读取 Skill 未完成：{error}"))
+                            })
+                        })?,
+                };
+                return Ok(agent_result_from_state(
+                    state,
+                    format!("{}\n\n{}", skill.name, truncate(&content, 16000)),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await);
+            }
+            return Ok(agent_result_from_state(
+                state,
+                skills
+                    .into_iter()
+                    .map(|skill| {
+                        format!("- [{}] {}：{}", skill.scope, skill.name, skill.description)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await);
+        }
+        "/mcp" => {
+            let summaries = summarize_mcp_servers(state.inner.clone()).await;
+            let text = if summaries.is_empty() {
+                "尚未配置 MCP 服务。".to_string()
+            } else {
+                summaries
+                    .into_iter()
+                    .map(|server| {
+                        format!(
+                            "- {}：{}，{} 个工具{}",
+                            server.name,
+                            if server.connected {
+                                "在线"
+                            } else {
+                                "未连接"
+                            },
+                            server.tool_count,
+                            server
+                                .last_error
+                                .map(|error| format!("（{}）", truncate(&error, 160)))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            return Ok(agent_result_from_state(state, text, Vec::new(), Vec::new()).await);
+        }
+        "/tools" => {
+            let servers = state.inner.lock().await.mcp_servers.clone();
+            let tools = list_tools_for_servers(&servers).await;
+            let text = if tools.is_empty() {
+                "当前没有发现可调用的 MCP 工具。请检查服务配置和连接日志。".to_string()
+            } else {
+                tools
+                    .iter()
+                    .map(|tool| {
+                        format!(
+                            "- {}{}",
+                            tool.qualified_name,
+                            if tool.mutating {
+                                "（需要审批）"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            return Ok(agent_result_from_state(state, text, Vec::new(), Vec::new()).await);
+        }
+        "/sessions" => {
+            let records = list_session_records();
+            let text = if records.is_empty() {
+                "还没有保存的会话。发送第一条任务后会自动建立会话。".to_string()
+            } else {
+                records
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "- {} · {} 条消息 · {}",
+                            item.name.as_deref().unwrap_or(&item.session_id),
+                            item.message_count,
+                            item.modified_at.as_deref().unwrap_or("时间未知")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            return Ok(agent_result_from_state(state, text, Vec::new(), Vec::new()).await);
+        }
+        "/model" => {
+            let guard = state.inner.lock().await;
+            let text = format!(
+                "接口：{:?}\n模型：{}\n地址：{}\n密钥：{}",
+                guard.model.provider,
+                guard.model.model,
+                guard.model.base_url,
+                if guard
+                    .model
+                    .api_key
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    "未设置"
+                } else {
+                    "已设置（不显示）"
+                }
+            );
+            drop(guard);
+            return Ok(agent_result_from_state(state, text, Vec::new(), Vec::new()).await);
+        }
+        "/scan" => {
+            let current = state.inner.lock().await.project.clone();
+            let scanned = scan_project_context(current);
+            let text = if scanned.exists {
+                format!(
+                    "工程扫描完成：{} 个文件，{} 个可能的 POU/源对象。\n{}",
+                    scanned.file_count,
+                    scanned.pou_count,
+                    scanned.scan_message.clone().unwrap_or_default()
+                )
+            } else {
+                "请先选择一个存在的 CODESYS 工程文件或目录。".to_string()
+            };
+            state.inner.lock().await.project = scanned;
+            return Ok(agent_result_from_state(
+                state,
+                text,
+                vec![AgentEvent::new(
+                    "scan",
+                    "project",
+                    "已扫描 CODESYS 工程概览",
+                    None,
+                    "done",
+                    None,
+                )],
+                Vec::new(),
+            )
+            .await);
+        }
+        "/rename" => {
+            let name = command_args.join(" ").trim().to_string();
+            if name.is_empty() {
+                return Ok(agent_result_from_state(
+                    state,
+                    "用法：/rename 会话名称".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await);
+            }
+            state.inner.lock().await.session.name = Some(name.clone());
+            return Ok(agent_result_from_state(
+                state,
+                format!("当前会话已命名为：{name}"),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await);
+        }
+        "/compile" => {
+            let result = compile_project_inner(state).await?;
+            let diagnostics = if result.is_error {
+                extract_diagnostics(&result.content)
+            } else {
+                Vec::new()
+            };
+            return Ok(agent_result_from_state(
+                state,
+                if result.is_error {
+                    "编译返回了诊断，请查看诊断页。".to_string()
+                } else {
+                    "编译调用已完成。".to_string()
+                },
+                vec![AgentEvent::new(
+                    "compile",
+                    "compile",
+                    "调用 CODESYS 编译工具",
+                    Some(serde_json::to_string(&result.content).unwrap_or_default()),
+                    if result.is_error { "warning" } else { "done" },
+                    Some("compile".to_string()),
+                )],
+                diagnostics,
+            )
+            .await);
+        }
+        "/diagnostics" | "/diag" => {
+            let result = call_builtin_tool(state, "diagnostics", json!({})).await?;
+            let detail = result
+                .content
+                .first()
+                .and_then(|value| value.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let diagnostics = extract_diagnostics(&result.content);
+            return Ok(agent_result_from_state(
+                state,
+                detail.clone(),
+                vec![AgentEvent::new(
+                    "diagnostics",
+                    "diagnostics",
+                    "已完成 PLC 静态诊断",
+                    Some(detail),
+                    if result.is_error { "warning" } else { "done" },
+                    Some("plc__diagnostics".to_string()),
+                )],
+                diagnostics,
+            )
+            .await);
+        }
+        "/approve" => {
+            let id = command_args
+                .first()
+                .copied()
+                .unwrap_or_default()
+                .to_string();
+            if id.is_empty() {
+                return Ok(agent_result_from_state(
+                    state,
+                    "用法：/approve <审批动作 ID>".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await);
+            }
+            let result = approve_change_inner(id, state).await?;
+            return Ok(agent_result_from_state(
+                state,
+                serde_json::to_string_pretty(&result.content)
+                    .unwrap_or_else(|_| "工程修改已批准。".to_string()),
+                vec![AgentEvent::new(
+                    "approve",
+                    "approval",
+                    "已批准工程修改",
+                    None,
+                    if result.is_error { "warning" } else { "done" },
+                    Some("plc__propose_edit".to_string()),
+                )],
+                Vec::new(),
+            )
+            .await);
+        }
+        "/reject" => {
+            let id = command_args
+                .first()
+                .copied()
+                .unwrap_or_default()
+                .to_string();
+            if id.is_empty() {
+                return Ok(agent_result_from_state(
+                    state,
+                    "用法：/reject <审批动作 ID>".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await);
+            }
+            reject_change_inner(id, state).await?;
+            return Ok(agent_result_from_state(
+                state,
+                "已拒绝工程修改，文件没有变化。".to_string(),
+                vec![AgentEvent::new(
+                    "reject",
+                    "approval",
+                    "已拒绝工程修改",
+                    None,
+                    "done",
+                    Some("plc__propose_edit".to_string()),
+                )],
+                Vec::new(),
+            )
+            .await);
+        }
+        "/status" => {
+            let guard = state.inner.lock().await;
+            let project = guard
+                .project
+                .path
+                .clone()
+                .unwrap_or_else(|| "未选择工程".to_string());
+            let model = format!("{:?} / {}", guard.model.provider, guard.model.model);
+            let session = if guard.session.session_id.is_some() {
+                format!(
+                    "会话 {}，上下文 {:.0}%",
+                    guard
+                        .session
+                        .session_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(8)
+                        .collect::<String>(),
+                    guard.session.context_percent
+                )
+            } else {
+                "尚未建立会话".to_string()
+            };
+            drop(guard);
+            return Ok(agent_result_from_state(
+                state,
+                format!(
+                    "工程：{}\n模型：{}\n{}\n写入策略：审批后执行",
+                    project, model, session
+                ),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await);
+        }
+        "/new" | "/clear" => {
+            state.inner.lock().await.session = AgentSessionSummary::default();
+            return Ok(agent_result_from_state(
+                state,
+                if command_name == "/new" {
+                    "已新建会话，工程文件没有改动。".to_string()
+                } else {
+                    "已清空当前会话，工程文件没有改动。".to_string()
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await);
+        }
+        "/stop" => {
+            return Ok(agent_result_from_state(
+                state,
+                "当前任务会在本轮工具调用结束后停止；未执行新的工程动作。".to_string(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await);
+        }
+        _ => {}
+    }
+
+    let (base_model, servers, previous_session) = {
+        let guard = state.inner.lock().await;
+        (
+            guard.model.clone(),
+            guard.mcp_servers.clone(),
+            guard.session.clone(),
+        )
+    };
+    // 根本原因：工程轮询可以在校验完成后更新全局 state；若这里再次从 state 取工程，
+    // 模型拿到的可能不是上面通过 snapshot_id 校验的那一份。固定使用本轮刚读取的
+    // current_project，后续 Pi cwd、系统提示和工具上下文都保持同一个快照。
+    let project = current_project;
+    let model = model_for_request(&base_model, &request)?;
+    validate_model_config(&model)?;
+
+    let mut events = Vec::new();
+    let tools = discover_tools(&servers, &mut events).await;
+    for event in events.clone() {
+        emit_event(&app, event);
+    }
+    let action = if command_name == "/compact" {
+        "compact"
+    } else {
+        "prompt"
+    };
+    let session_name = previous_session.name.clone();
+    let result = run_pi_host(
+        &app,
+        state,
+        &request,
+        &model,
+        &project,
+        &servers,
+        &tools,
+        &previous_session,
+        action,
+        &mut events,
+        session_name,
+    )
+    .await;
+
+    state.abort_requested.store(false, Ordering::SeqCst);
+
+    match result {
+        Ok(result) => Ok(result),
+        Err(AppError::Internal(message)) if message.starts_with("PI_HOST_UNAVAILABLE:") => {
+            // 兼容没有 Node.js 或未安装 Pi 依赖的开发环境，保留原有 Rust Agent 作为真实后备链路。
+            run_agent_legacy(app, request, &state).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn agent_result_from_state(
+    state: &AppState,
+    text: String,
+    events: Vec<AgentEvent>,
+    diagnostics: Vec<DiagnosticItem>,
+) -> AgentRunResult {
+    let guard = state.inner.lock().await;
+    let pending_changes = guard
+        .pending
+        .values()
+        .filter(|item| item.summary.status == "pending")
+        .map(|item| item.summary.clone())
+        .collect();
+    AgentRunResult {
+        text,
+        events,
+        pending_changes,
+        diagnostics,
+        session: guard.session.clone(),
+    }
+}
+
+fn agent_host_path(app: &AppHandle) -> PathBuf {
+    if let Ok(override_path) = std::env::var("PLC_PILOT_AGENT_HOST") {
+        let path = PathBuf::from(override_path.trim());
+        if path.is_file() {
+            return path;
+        }
+    }
+
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let bundled_source = source_root
+        .join("agent-host")
+        .join("pi-agent-host.bundle.mjs");
+    let legacy_source = source_root.join("agent-host").join("pi-agent-host.mjs");
+    let mut candidates = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        // 安装包只携带一个压缩后的宿主脚本，放在资源根目录可以避开
+        // Windows WiX/NSIS 对深层 node_modules 路径的 MAX_PATH 限制。
+        // 额外保留旧目录布局，便于已有开发目录平滑升级。
+        candidates.extend([
+            resource_dir.join("pi-agent-host.bundle.mjs"),
+            resource_dir
+                .join("agent-host")
+                .join("pi-agent-host.bundle.mjs"),
+            resource_dir
+                .join("resources")
+                .join("pi-agent-host.bundle.mjs"),
+            resource_dir
+                .join("resources")
+                .join("agent-host")
+                .join("pi-agent-host.bundle.mjs"),
+            resource_dir.join("pi-agent-host.mjs"),
+            resource_dir.join("agent-host").join("pi-agent-host.mjs"),
+            resource_dir.join("resources").join("pi-agent-host.mjs"),
+            resource_dir
+                .join("resources")
+                .join("agent-host")
+                .join("pi-agent-host.mjs"),
+        ]);
+    }
+    candidates.extend([bundled_source.clone(), legacy_source]);
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or(bundled_source)
+}
+
+fn agent_node_command(app: &AppHandle) -> String {
+    if let Ok(override_path) = std::env::var("PLC_PILOT_NODE") {
+        if !override_path.trim().is_empty() {
+            return override_path;
+        }
+    }
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        for candidate in [
+            resource_dir.join("node").join("node.exe"),
+            resource_dir.join("resources").join("node").join("node.exe"),
+        ] {
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "node".to_string()
+}
+
+fn agent_session_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("PLC Pilot")
+        .join("sessions")
+}
+
+fn agent_cwd(project: &ProjectContext) -> PathBuf {
+    if let Some(source_root) = project.source_root.as_deref() {
+        let source_root = PathBuf::from(source_root);
+        if is_allowed_bridge_source_root(&source_root) {
+            return source_root;
+        }
+    }
+    let path = project.path.as_deref().map(PathBuf::from);
+    match path {
+        Some(path) if path.is_dir() => path,
+        Some(path) => path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
+async fn run_pi_host(
+    app: &AppHandle,
+    state: &AppState,
+    request: &AgentRequest,
+    model: &ModelConfig,
+    project: &ProjectContext,
+    servers: &[McpServerConfig],
+    tools: &[McpTool],
+    previous_session: &AgentSessionSummary,
+    action: &str,
+    events: &mut Vec<AgentEvent>,
+    session_name: Option<String>,
+) -> Result<AgentRunResult, AppError> {
+    let script = agent_host_path(app);
+    if !script.is_file() {
+        return Err(AppError::Internal(format!(
+            "PI_HOST_UNAVAILABLE:找不到 Pi 宿主脚本：{}",
+            script.display()
+        )));
+    }
+    let cwd = agent_cwd(project);
+    let mut command = Command::new(agent_node_command(app));
+    command
+        .arg(&script)
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        AppError::Internal(format!("PI_HOST_UNAVAILABLE:无法启动 Node.js：{error}"))
+    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::Internal("Pi 宿主 stdin 不可用".to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::Internal("Pi 宿主 stdout 不可用".to_string()))?;
+    let stderr = child.stderr.take();
+    let stderr_log = Arc::new(Mutex::new(String::new()));
+    if let Some(stderr) = stderr {
+        let log = stderr_log.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                let mut current = log.lock().await;
+                current.push_str(&line);
+                if current.len() > 8000 {
+                    let keep_from = current.len().saturating_sub(8000);
+                    *current = current[keep_from..].to_string();
+                }
+                line.clear();
+            }
+        });
+    }
+    let mut reader = BufReader::new(stdout);
+    let request_id = Uuid::new_v4().to_string();
+    let tool_payload = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "qualified_name": qualify_tool(&tool.server_id, &tool.name),
+                "server_id": tool.server_id,
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    let model_payload = json!({
+        "provider": model.provider,
+        "base_url": model.base_url,
+        "model": model.model,
+        "api_key": model.api_key,
+        "max_tokens": model.max_tokens,
+    });
+    let host_request = json!({
+        "type": "run",
+        "request_id": request_id,
+        "action": action,
+        "message": request.message,
+        "instructions": request
+            .message
+            .strip_prefix("/compact")
+            .unwrap_or_default()
+            .trim(),
+        "cwd": cwd,
+        "project": project,
+        "model": model_payload,
+        "session_file": previous_session.session_file,
+        "session_name": session_name,
+        "session_dir": agent_session_dir(),
+        "mcp_tools": tool_payload,
+        "system_prompt": build_agent_system_prompt(project, request),
+        "reasoning_effort": request_thinking_level(request),
+        "collaboration_mode": if request_is_plan_mode(request) { "plan" } else { "default" },
+        "skills": request.skills,
+    });
+
+    let result = async {
+        let ready = read_host_json_or_abort(&mut reader, &state.abort_requested).await?;
+        if ready.get("type").and_then(Value::as_str) != Some("ready") {
+            return Err(AppError::Internal(format!(
+                "PI_HOST_UNAVAILABLE:Pi 宿主未就绪：{}",
+                ready
+            )));
+        }
+        if state.abort_requested.load(Ordering::SeqCst) {
+            return Err(AppError::Internal("当前 Agent 任务已中止".to_string()));
+        }
+        write_host_json(&mut stdin, host_request).await?;
+        let mut diagnostics = Vec::new();
+        let mut session = previous_session.clone();
+        let final_text = loop {
+            let value = read_host_json_or_abort(&mut reader, &state.abort_requested).await?;
+            match value.get("type").and_then(Value::as_str) {
+                Some("event") => {
+                    if let Some(event) = value.get("event") {
+                        let parsed = serde_json::from_value::<AgentEvent>(event.clone()).map_err(
+                            |error| AppError::Internal(format!("Pi 事件格式不正确：{error}")),
+                        )?;
+                        push_event(app, events, parsed);
+                    }
+                }
+                Some("delta") => {
+                    // 文本增量交给前端的最终消息处理，这里只保留完整结果，避免时间线被拆成数百行。
+                }
+                Some("tool_request") => {
+                    let response = tokio::select! {
+                        result = process_pi_tool_request(
+                            app,
+                            state,
+                            servers,
+                            value,
+                            events,
+                            &mut diagnostics,
+                            request_is_plan_mode(request),
+                        ) => result?,
+                        _ = wait_for_abort(state.abort_requested.clone()) => {
+                            return Err(AppError::Internal("当前 Agent 任务已中止".to_string()));
+                        }
+                    };
+                    write_host_json(&mut stdin, response).await?;
+                }
+                Some("result") => {
+                    let final_text = value
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(value) = value.get("session") {
+                        if let Ok(parsed) =
+                            serde_json::from_value::<AgentSessionSummary>(value.clone())
+                        {
+                            session = parsed;
+                        }
+                    }
+                    break final_text;
+                }
+                Some("error") => {
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Pi 宿主返回了未知问题")
+                        .to_string();
+                    return Err(AppError::Network(message));
+                }
+                _ => {}
+            }
+        };
+        state.inner.lock().await.session = session.clone();
+        Ok(agent_result_from_state(state, final_text, events.clone(), diagnostics).await)
+    }
+    .await;
+    let _ = child.kill().await;
+    if let Err(AppError::Internal(message)) = &result {
+        if message.starts_with("PI_HOST_UNAVAILABLE:") {
+            let stderr = stderr_log.lock().await.clone();
+            if !stderr.trim().is_empty() {
+                return Err(AppError::Internal(format!(
+                    "{message}\n{}",
+                    truncate(&stderr, 1200)
+                )));
+            }
+        }
+    }
+    result
+}
+
+async fn process_pi_tool_request(
+    app: &AppHandle,
+    state: &AppState,
+    servers: &[McpServerConfig],
+    value: Value,
+    events: &mut Vec<AgentEvent>,
+    diagnostics: &mut Vec<DiagnosticItem>,
+    plan_mode: bool,
+) -> Result<Value, AppError> {
+    let request_id = value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let call_id = value
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .unwrap_or("pi-tool-call")
+        .to_string();
+    let server_id = value
+        .get("server_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let tool_name = value
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let arguments = value.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let qualified = qualify_tool(&server_id, &tool_name);
+    if is_forbidden_tool(&tool_name) {
+        push_event(
+            app,
+            events,
+            AgentEvent::new(
+                &call_id,
+                "safety",
+                "已阻止高风险在线操作",
+                Some("下载、RUN/STOP、Force、Reset、在线写变量和脚本执行默认关闭。".to_string()),
+                "blocked",
+                Some(qualified.clone()),
+            ),
+        );
+        return Ok(json!({
+            "type": "tool_result",
+            "request_id": request_id,
+            "content": [{"type":"text","text":"这个工具被 PLC Pilot 的安全策略阻止，不能执行。"}],
+            "is_error": true,
+            "decision": "blocked",
+        }));
+    }
+    if plan_mode && is_mutating_tool(&tool_name) {
+        push_event(
+            app,
+            events,
+            AgentEvent::new(
+                &call_id,
+                "safety",
+                "计划模式已阻止工程写入",
+                Some(
+                    "当前只允许读取、分析和生成计划；请切换到执行模式后再提交修改审批。"
+                        .to_string(),
+                ),
+                "blocked",
+                Some(qualified.clone()),
+            ),
+        );
+        return Ok(json!({
+            "type": "tool_result",
+            "request_id": request_id,
+            "content": [{"type":"text","text":"当前处于计划模式，工程写入工具未执行。"}],
+            "is_error": true,
+            "decision": "blocked",
+        }));
+    }
+    if server_id == BUILTIN_SERVER_ID {
+        if tool_name == "propose_edit" {
+            match propose_builtin_edit(state, arguments).await {
+                Ok(summary) => {
+                    push_event(
+                        app,
+                        events,
+                        AgentEvent::new(
+                            &call_id,
+                            "approval",
+                            "已生成工程修改 Diff，等待审批",
+                            Some(summary.title.clone()),
+                            "waiting",
+                            Some(qualified),
+                        ),
+                    );
+                    return Ok(json!({
+                        "type": "tool_result",
+                        "request_id": request_id,
+                        "content": [{"type":"text","text":"已生成待审批工程 Diff。请等待用户确认后再写入。"}],
+                        "is_error": true,
+                        "decision": "pending",
+                        "details": {"change_id": summary.id, "diff": summary.diff},
+                    }));
+                }
+                Err(error) => {
+                    push_event(
+                        app,
+                        events,
+                        AgentEvent::new(
+                            &call_id,
+                            "approval",
+                            "工程修改 Diff 尚未生成",
+                            Some(error.to_string()),
+                            "error",
+                            Some(qualified),
+                        ),
+                    );
+                    return Ok(json!({
+                        "type": "tool_result",
+                        "request_id": request_id,
+                        "content": [{"type":"text","text":error.to_string()}],
+                        "is_error": true,
+                        "decision": "error",
+                    }));
+                }
+            }
+        }
+        push_event(
+            app,
+            events,
+            AgentEvent::new(
+                &call_id,
+                "tool",
+                &format!("调用 PLC 内置工具 {tool_name}"),
+                None,
+                "running",
+                Some(qualified.clone()),
+            ),
+        );
+        match call_builtin_tool(state, &tool_name, arguments).await {
+            Ok(result) => {
+                let result_text = serde_json::to_string(&result.content)
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                let status = if result.is_error { "warning" } else { "done" };
+                push_event(
+                    app,
+                    events,
+                    AgentEvent::new(
+                        &call_id,
+                        "tool",
+                        if result.is_error {
+                            "内置工具返回了诊断"
+                        } else {
+                            "PLC 内置工具调用完成"
+                        },
+                        Some(result_text),
+                        status,
+                        Some(qualified),
+                    ),
+                );
+                if looks_like_diagnostics(&result.content) {
+                    diagnostics.extend(extract_diagnostics(&result.content));
+                }
+                return Ok(json!({
+                    "type": "tool_result",
+                    "request_id": request_id,
+                    "content": result.content,
+                    "is_error": result.is_error,
+                    "decision": "executed",
+                }));
+            }
+            Err(error) => {
+                push_event(
+                    app,
+                    events,
+                    AgentEvent::new(
+                        &call_id,
+                        "tool",
+                        "PLC 内置工具调用未完成",
+                        Some(error.to_string()),
+                        "error",
+                        Some(qualified),
+                    ),
+                );
+                return Ok(json!({
+                    "type": "tool_result",
+                    "request_id": request_id,
+                    "content": [{"type":"text","text":error.to_string()}],
+                    "is_error": true,
+                    "decision": "error",
+                }));
+            }
+        }
+    }
+    let server = servers
+        .iter()
+        .find(|server| server.id == server_id && server.enabled)
+        .cloned()
+        .ok_or_else(|| AppError::Mcp(format!("未找到已启用的 MCP 服务：{server_id}")))?;
+    if is_mutating_tool(&tool_name) {
+        let id = Uuid::new_v4().to_string();
+        let summary = PendingChangeSummary {
+            id: id.clone(),
+            title: format!("审批后执行 {tool_name}"),
+            description: "Agent 请求了会改变工程状态的 MCP 工具。请确认参数和 Diff 后再执行。"
+                .to_string(),
+            diff: render_change_preview(&tool_name, &arguments),
+            server_id: server.id.clone(),
+            tool_name: tool_name.clone(),
+            risk: "需要人工审批".to_string(),
+            status: "pending".to_string(),
+        };
+        state.inner.lock().await.pending.insert(
+            id,
+            PendingChange {
+                summary: summary.clone(),
+                arguments,
+            },
+        );
+        push_event(
+            app,
+            events,
+            AgentEvent::new(
+                &call_id,
+                "approval",
+                "已拦截需要审批的工程修改",
+                Some(summary.title.clone()),
+                "waiting",
+                Some(qualified),
+            ),
+        );
+        return Ok(json!({
+            "type": "tool_result",
+            "request_id": request_id,
+            "content": [{"type":"text","text":"已生成待审批动作。请等待用户确认后再执行。"}],
+            "is_error": true,
+            "decision": "pending",
+            "details": {"change_id": summary.id},
+        }));
+    }
+
+    push_event(
+        app,
+        events,
+        AgentEvent::new(
+            &call_id,
+            "tool",
+            &format!("调用 {tool_name}"),
+            None,
+            "running",
+            Some(qualified.clone()),
+        ),
+    );
+    match McpClient::new(server)
+        .call_tool(&tool_name, arguments)
+        .await
+    {
+        Ok(result) => {
+            let result_text = serde_json::to_string(&result.content)
+                .map_err(|error| AppError::Internal(error.to_string()))?;
+            let status = if result.is_error { "warning" } else { "done" };
+            push_event(
+                app,
+                events,
+                AgentEvent::new(
+                    &call_id,
+                    "tool",
+                    if result.is_error {
+                        "工具返回了可处理的诊断"
+                    } else {
+                        "工具调用完成"
+                    },
+                    Some(result_text),
+                    status,
+                    Some(qualified),
+                ),
+            );
+            if looks_like_diagnostics(&result.content) {
+                diagnostics.extend(extract_diagnostics(&result.content));
+            }
+            Ok(json!({
+                "type": "tool_result",
+                "request_id": request_id,
+                "content": result.content,
+                "is_error": result.is_error,
+                "decision": "executed",
+            }))
+        }
+        Err(error) => {
+            push_event(
+                app,
+                events,
+                AgentEvent::new(
+                    &call_id,
+                    "tool",
+                    "工具调用未完成",
+                    Some(error.to_string()),
+                    "error",
+                    Some(qualified),
+                ),
+            );
+            Ok(json!({
+                "type": "tool_result",
+                "request_id": request_id,
+                "content": [{"type":"text","text":error.to_string()}],
+                "is_error": true,
+                "decision": "error",
+            }))
+        }
+    }
+}
+
+async fn write_host_json<W>(writer: &mut W, value: Value) -> Result<(), AppError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut bytes = serde_json::to_vec(&value)
+        .map_err(|error| AppError::Internal(format!("Pi 请求无法编码：{error}")))?;
+    bytes.push(b'\n');
+    writer
+        .write_all(&bytes)
+        .await
+        .map_err(|error| AppError::Internal(format!("Pi 宿主写入未完成：{error}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| AppError::Internal(format!("Pi 宿主刷新未完成：{error}")))
+}
+
+async fn read_host_json<R>(reader: &mut R) -> Result<Value, AppError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut line = String::new();
+    let result = timeout(Duration::from_secs(PI_HOST_TIMEOUT_SECONDS), async {
+        loop {
+            line.clear();
+            let count = reader
+                .read_line(&mut line)
+                .await
+                .map_err(|error| AppError::Internal(format!("Pi 宿主读取未完成：{error}")))?;
+            if count == 0 {
+                return Err(AppError::Internal(
+                    "PI_HOST_UNAVAILABLE:Pi 宿主提前结束".to_string(),
+                ));
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
+                return Ok(value);
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        AppError::Internal(format!(
+            "Pi 宿主响应超过 {PI_HOST_TIMEOUT_SECONDS} 秒仍未返回"
+        ))
+    })?;
+    result
+}
+
+async fn read_host_json_or_abort<R>(
+    reader: &mut R,
+    abort_requested: &AtomicBool,
+) -> Result<Value, AppError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    if abort_requested.load(Ordering::SeqCst) {
+        return Err(AppError::Internal("当前 Agent 任务已中止".to_string()));
+    }
+    tokio::select! {
+        result = read_host_json(reader) => result,
+        _ = wait_for_abort_ref(abort_requested) => {
+            Err(AppError::Internal("当前 Agent 任务已中止".to_string()))
+        }
+    }
+}
+
+async fn wait_for_abort_ref(abort_requested: &AtomicBool) {
+    while !abort_requested.load(Ordering::SeqCst) {
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_abort(abort_requested: Arc<AtomicBool>) {
+    wait_for_abort_ref(&abort_requested).await;
+}
+
+fn push_event(app: &AppHandle, events: &mut Vec<AgentEvent>, event: AgentEvent) {
+    emit_event(app, event.clone());
+    events.push(event);
+}
+
+fn tool_feedback(tool: &str, content: &str) -> ChatMessage {
+    ChatMessage {
+        role: "user".to_string(),
+        content: format!("[PLC Pilot 工具结果: {tool}]\n{content}"),
+    }
+}
+
+async fn discover_tools(servers: &[McpServerConfig], events: &mut Vec<AgentEvent>) -> Vec<McpTool> {
+    let mut tools = builtin_tools();
+    events.push(AgentEvent::new(
+        "mcp-builtin",
+        "mcp",
+        &format!("已加载 {} 个 PLC 内置工具", tools.len()),
+        Some("工程读取、Diff 审批、编译结构诊断直接在桌面运行时执行。".to_string()),
+        "done",
+        Some(BUILTIN_SERVER_ID.to_string()),
+    ));
+    for server in servers.iter().filter(|server| server.enabled) {
+        match McpClient::new(server.clone()).list_tools().await {
+            Ok(server_tools) => {
+                let usable = server_tools
+                    .into_iter()
+                    .filter(|tool| !is_forbidden_tool(&tool.name))
+                    .collect::<Vec<_>>();
+                events.push(AgentEvent::new(
+                    &format!("mcp-{}", server.id),
+                    "mcp",
+                    &format!("发现 {} 个 {} 工具", usable.len(), server.name),
+                    None,
+                    "done",
+                    Some(server.id.clone()),
+                ));
+                tools.extend(usable);
+            }
+            Err(error) => events.push(AgentEvent::new(
+                &format!("mcp-{}", server.id),
+                "mcp",
+                &format!("无法连接 {}", server.name),
+                Some(error.to_string()),
+                "warning",
+                Some(server.id.clone()),
+            )),
+        }
+    }
+    tools
+}
+
+fn tool_summary_from_mcp(tool: McpTool) -> ToolSummary {
+    ToolSummary {
+        qualified_name: qualify_tool(&tool.server_id, &tool.name),
+        server_id: tool.server_id.clone(),
+        name: tool.name.clone(),
+        description: tool.description.clone(),
+        input_schema: tool.input_schema.clone(),
+        mutating: tool.name.eq_ignore_ascii_case("propose_edit") || is_mutating_tool(&tool.name),
+    }
+}
+
+fn project_root(project: &ProjectContext) -> Result<PathBuf, AppError> {
+    if let Some(source_root) = project
+        .source_root
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir() && is_allowed_bridge_source_root(path))
+    {
+        return fs::canonicalize(source_root)
+            .map_err(|error| AppError::Project(format!("读取 Bridge 源目录未完成：{error}")));
+    }
+    let path = project
+        .path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| AppError::Project("当前没有可读的 CODESYS 工程目录".to_string()))?;
+    let root = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| AppError::Project("工程文件没有可用的父目录".to_string()))?
+    };
+    if !root.is_dir() {
+        return Err(AppError::Project("工程源目录不存在或不可读取".to_string()));
+    }
+    fs::canonicalize(root)
+        .map_err(|error| AppError::Project(format!("读取工程源目录未完成：{error}")))
+}
+
+fn resolve_project_file(
+    project: &ProjectContext,
+    requested: &str,
+    allow_missing: bool,
+) -> Result<(PathBuf, String), AppError> {
+    let root = project_root(project)?;
+    let requested = requested.trim().trim_matches('"');
+    if requested.is_empty() {
+        return Err(AppError::Project("工程文件路径不能为空".to_string()));
+    }
+    let raw = PathBuf::from(requested);
+    let candidate = if raw.is_absolute() {
+        raw
+    } else {
+        if raw
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(AppError::Project(
+                "工程文件路径不能包含上级目录".to_string(),
+            ));
+        }
+        root.join(raw)
+    };
+    let resolved = if candidate.exists() {
+        fs::canonicalize(&candidate)
+            .map_err(|error| AppError::Project(format!("解析工程文件路径未完成：{error}")))?
+    } else if allow_missing {
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| AppError::Project("工程文件父目录不可用".to_string()))?;
+        let parent = fs::canonicalize(parent)
+            .map_err(|error| AppError::Project(format!("解析工程文件父目录未完成：{error}")))?;
+        if !parent.starts_with(&root) {
+            return Err(AppError::Project(
+                "工程文件必须位于当前工程目录内".to_string(),
+            ));
+        }
+        parent.join(
+            candidate
+                .file_name()
+                .ok_or_else(|| AppError::Project("工程文件名不可用".to_string()))?,
+        )
+    } else {
+        return Err(AppError::Project(format!("工程文件不存在：{requested}")));
+    };
+    if !resolved.starts_with(&root) {
+        return Err(AppError::Project(
+            "工程文件必须位于当前工程目录内".to_string(),
+        ));
+    }
+    if !allow_missing && !resolved.is_file() {
+        return Err(AppError::Project(
+            "目标路径不是可读取的工程文件".to_string(),
+        ));
+    }
+    let relative = resolved
+        .strip_prefix(&root)
+        .map_err(|_| AppError::Project("工程文件不在当前工程目录内".to_string()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok((resolved, relative))
+}
+
+fn project_file_entries(
+    project: &ProjectContext,
+    limit: usize,
+) -> Result<Vec<(PathBuf, String)>, AppError> {
+    let root = project_root(project)?;
+    let ignored = [".git", "node_modules", "target", "bin", "obj"];
+    let mut entries = Vec::new();
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            !entry
+                .file_name()
+                .to_str()
+                .map(|name| ignored.iter().any(|item| name.eq_ignore_ascii_case(item)))
+                .unwrap_or(false)
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(&root)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        entries.push((entry.path().to_path_buf(), relative));
+        if entries.len() >= limit {
+            break;
+        }
+    }
+    Ok(entries)
+}
+
+fn text_content(value: impl Into<String>, is_error: bool) -> ToolCallResult {
+    ToolCallResult {
+        content: vec![json!({"type": "text", "text": value.into()})],
+        is_error,
+    }
+}
+
+fn json_content(value: &Value, is_error: bool) -> ToolCallResult {
+    text_content(
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+        is_error,
+    )
+}
+
+fn source_extensions() -> &'static [&'static str] {
+    &["st", "pou", "gvl", "dut", "itf", "fb", "exp"]
+}
+
+fn is_source_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| {
+            source_extensions()
+                .iter()
+                .any(|item| value.eq_ignore_ascii_case(item))
+        })
+        .unwrap_or(false)
+}
+
+fn list_builtin_pous(project: &ProjectContext, limit: usize) -> Result<Value, AppError> {
+    let mut result = Vec::new();
+    for (path, relative) in project_file_entries(project, 2000)? {
+        if !is_source_file(&path) {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let mut found = false;
+        for (line_index, line) in content.lines().enumerate() {
+            let upper = line.trim().to_ascii_uppercase();
+            let kind = [
+                "FUNCTION_BLOCK",
+                "PROGRAM",
+                "FUNCTION",
+                "INTERFACE",
+                "TYPE",
+                "VAR_GLOBAL",
+            ]
+            .iter()
+            .find(|candidate| {
+                upper.starts_with(*candidate)
+                    && upper
+                        .chars()
+                        .nth(candidate.len())
+                        .map(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+                        .unwrap_or(true)
+            });
+            if let Some(kind) = kind {
+                let name = upper
+                    .strip_prefix(kind)
+                    .unwrap_or_default()
+                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .find(|value| !value.is_empty())
+                    .unwrap_or_else(|| relative.rsplit('/').next().unwrap_or(&relative))
+                    .to_string();
+                result.push(json!({
+                    "name": name,
+                    "kind": *kind,
+                    "path": relative,
+                    "line": line_index + 1,
+                }));
+                found = true;
+                if result.len() >= limit {
+                    return Ok(Value::Array(result));
+                }
+            }
+        }
+        if !found {
+            result.push(json!({
+                "name": relative.rsplit('/').next().unwrap_or(&relative),
+                "kind": "SOURCE",
+                "path": relative,
+                "line": 1,
+            }));
+            if result.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(Value::Array(result))
+}
+
+fn read_builtin_source(project: &ProjectContext, arguments: &Value) -> Result<Value, AppError> {
+    let requested = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Project("read_st_source 需要 path".to_string()))?;
+    let (path, relative) = resolve_project_file(project, requested, false)?;
+    let content = fs::read_to_string(&path)
+        .map_err(|error| AppError::Project(format!("读取 {relative} 未完成：{error}")))?;
+    let total_lines = content.lines().count().max(1);
+    let start = arguments
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let end = arguments
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .unwrap_or(total_lines as u64)
+        .max(start as u64) as usize;
+    let lines = content
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| *index + 1 >= start && *index < end)
+        .map(|(index, line)| format!("{:>5} | {}", index + 1, line))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "path": relative,
+        "start_line": start,
+        "end_line": end.min(total_lines),
+        "content": lines.join("\n"),
+        "total_lines": total_lines,
+    }))
+}
+
+fn search_builtin_project(project: &ProjectContext, arguments: &Value) -> Result<Value, AppError> {
+    let query = arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Project("search_project 需要非空 query".to_string()))?;
+    let case_sensitive = arguments
+        .get("case_sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .clamp(1, 200) as usize;
+    let needle = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+    let mut matches = Vec::new();
+    for (path, relative) in project_file_entries(project, 2000)? {
+        if !is_source_file(&path) {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for (line_index, line) in content.lines().enumerate() {
+            let haystack = if case_sensitive {
+                line.to_string()
+            } else {
+                line.to_lowercase()
+            };
+            if haystack.contains(&needle) {
+                matches.push(json!({
+                    "path": relative,
+                    "line": line_index + 1,
+                    "text": line,
+                }));
+                if matches.len() >= limit {
+                    return Ok(Value::Array(matches));
+                }
+            }
+        }
+    }
+    Ok(Value::Array(matches))
+}
+
+fn strip_st_comments(content: &str) -> String {
+    let mut output = String::with_capacity(content.len());
+    let mut block_comment = false;
+    for line in content.lines() {
+        let mut chars = line.chars().peekable();
+        let mut in_string = false;
+        while let Some(ch) = chars.next() {
+            if block_comment {
+                if ch == '*' && chars.peek() == Some(&')') {
+                    let _ = chars.next();
+                    block_comment = false;
+                }
+                continue;
+            }
+            if !in_string && ch == '(' && chars.peek() == Some(&'*') {
+                let _ = chars.next();
+                block_comment = true;
+                continue;
+            }
+            if !in_string && ch == '/' && chars.peek() == Some(&'/') {
+                break;
+            }
+            if ch == '\'' {
+                in_string = !in_string;
+            }
+            output.push(if in_string { ' ' } else { ch });
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn static_project_diagnostics(
+    project: &ProjectContext,
+) -> Result<(Vec<DiagnosticItem>, usize), AppError> {
+    let entries = project_file_entries(project, 2000)?;
+    let mut diagnostics = Vec::new();
+    let mut source_count = 0usize;
+    let pairs = [
+        ("IF", "END_IF"),
+        ("CASE", "END_CASE"),
+        ("FOR", "END_FOR"),
+        ("WHILE", "END_WHILE"),
+        ("REPEAT", "END_REPEAT"),
+        ("PROGRAM", "END_PROGRAM"),
+        ("FUNCTION_BLOCK", "END_FUNCTION_BLOCK"),
+        ("FUNCTION", "END_FUNCTION"),
+        ("TYPE", "END_TYPE"),
+        ("VAR", "END_VAR"),
+        ("VAR_INPUT", "END_VAR"),
+        ("VAR_OUTPUT", "END_VAR"),
+        ("VAR_IN_OUT", "END_VAR"),
+        ("VAR_GLOBAL", "END_VAR"),
+    ];
+    for (path, relative) in entries {
+        if !is_source_file(&path) {
+            continue;
+        }
+        source_count += 1;
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                diagnostics.push(DiagnosticItem {
+                    severity: "error".to_string(),
+                    code: Some("PLC001".to_string()),
+                    message: format!("源文件不是可读取的 UTF-8 文本：{error}"),
+                    location: Some(relative.clone()),
+                });
+                continue;
+            }
+        };
+        let cleaned = strip_st_comments(&content);
+        let mut stack: Vec<(&str, usize)> = Vec::new();
+        for (line_index, line) in cleaned.lines().enumerate() {
+            let tokens = line
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .filter(|token| !token.is_empty())
+                .map(|token| token.to_ascii_uppercase())
+                .collect::<Vec<_>>();
+            for token in tokens {
+                if let Some((_, end_token)) = pairs.iter().find(|(start, _)| *start == token) {
+                    stack.push((end_token, line_index + 1));
+                    continue;
+                }
+                if let Some((start_token, _)) = pairs.iter().find(|(_, end)| *end == token) {
+                    match stack.pop() {
+                        Some((expected, _)) if expected == token => {}
+                        Some((expected, start_line)) => {
+                            diagnostics.push(DiagnosticItem {
+                                severity: "error".to_string(),
+                                code: Some("PLC002".to_string()),
+                                message: format!(
+                                    "{} 应闭合为 {}，实际遇到 {}",
+                                    start_token, expected, token
+                                ),
+                                location: Some(format!("{relative}:{}", line_index + 1)),
+                            });
+                            stack.push((expected, start_line));
+                        }
+                        None => diagnostics.push(DiagnosticItem {
+                            severity: "error".to_string(),
+                            code: Some("PLC003".to_string()),
+                            message: format!("没有对应开始标记的 {}", token),
+                            location: Some(format!("{relative}:{}", line_index + 1)),
+                        }),
+                    }
+                }
+            }
+        }
+        for (expected, start_line) in stack {
+            diagnostics.push(DiagnosticItem {
+                severity: "error".to_string(),
+                code: Some("PLC004".to_string()),
+                message: format!("缺少 {} 闭合标记", expected),
+                location: Some(format!("{relative}:{start_line}")),
+            });
+        }
+    }
+    if source_count == 0 {
+        diagnostics.push(DiagnosticItem {
+            severity: "warning".to_string(),
+            code: Some("PLC005".to_string()),
+            message: "工程中没有发现可做静态检查的 ST/POU 源文件".to_string(),
+            location: None,
+        });
+    }
+    Ok((diagnostics, source_count))
+}
+
+fn builtin_diagnostics_result(
+    project: &ProjectContext,
+    mode: &str,
+) -> Result<ToolCallResult, AppError> {
+    let (diagnostics, source_count) = static_project_diagnostics(project)?;
+    let compiler = detect_codesys_installation();
+    let has_errors = diagnostics.iter().any(|item| item.severity == "error");
+    let payload = json!({
+        "mode": mode,
+        "compiler_executed": false,
+        "compiler_available": compiler.detected,
+        "compiler": compiler.executable,
+        "target": "CODESYS 3.5.22",
+        "source_count": source_count,
+        "diagnostics": diagnostics,
+        "note": "当前结果是桌面层静态 IEC 61131-3 结构诊断，未执行 CODESYS 目标编译器。",
+    });
+    Ok(json_content(&payload, has_errors))
+}
+
+async fn call_builtin_tool(
+    state: &AppState,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<ToolCallResult, AppError> {
+    let project = state.inner.lock().await.project.clone();
+    if !project.exists {
+        return Err(AppError::Project(
+            "请先选择一个存在的 CODESYS 工程或 Bridge 源目录".to_string(),
+        ));
+    }
+    match tool_name {
+        "project_snapshot" => Ok(json_content(
+            &serde_json::to_value(project)
+                .map_err(|error| AppError::Internal(error.to_string()))?,
+            false,
+        )),
+        "list_pous" => {
+            let limit = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .clamp(1, 500) as usize;
+            Ok(json_content(&list_builtin_pous(&project, limit)?, false))
+        }
+        "read_st_source" => Ok(json_content(
+            &read_builtin_source(&project, &arguments)?,
+            false,
+        )),
+        "search_project" => Ok(json_content(
+            &search_builtin_project(&project, &arguments)?,
+            false,
+        )),
+        "compile_project" => builtin_diagnostics_result(&project, "static_compile"),
+        "diagnostics" => builtin_diagnostics_result(&project, "diagnostics"),
+        "propose_edit" => Err(AppError::Mcp(
+            "propose_edit 必须通过 Agent 审批流程调用，不能直接执行".to_string(),
+        )),
+        _ => Err(AppError::Mcp(format!("未知 PLC 内置工具：{tool_name}"))),
+    }
+}
+
+async fn propose_builtin_edit(
+    state: &AppState,
+    arguments: Value,
+) -> Result<PendingChangeSummary, AppError> {
+    let project = state.inner.lock().await.project.clone();
+    if !project.exists {
+        return Err(AppError::Project(
+            "请先选择工程，再提出文件修改".to_string(),
+        ));
+    }
+    let requested = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Project("propose_edit 需要 path".to_string()))?;
+    let (path, relative) = resolve_project_file(&project, requested, false)?;
+    let before = fs::read_to_string(&path)
+        .map_err(|error| AppError::Project(format!("读取 {relative} 未完成：{error}")))?;
+    if let Some(expected) = arguments.get("expected").and_then(Value::as_str) {
+        if expected != before {
+            return Err(AppError::Project(
+                "文件内容已变化，不能基于过期正文生成修改".to_string(),
+            ));
+        }
+    }
+    let after = if let Some(content) = arguments.get("content").and_then(Value::as_str) {
+        content.to_string()
+    } else {
+        let find = arguments
+            .get("find")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AppError::Project(
+                    "propose_edit 需要 content，或同时提供 find 和 replace".to_string(),
+                )
+            })?;
+        let replace = arguments
+            .get("replace")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let replace_all = arguments
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let occurrences = before.matches(find).count();
+        if occurrences == 0 {
+            return Err(AppError::Project(
+                "find 片段在当前文件中没有找到".to_string(),
+            ));
+        }
+        if occurrences > 1 && !replace_all {
+            return Err(AppError::Project(
+                "find 片段出现多次；请确认后设置 replace_all".to_string(),
+            ));
+        }
+        if replace_all {
+            before.replace(find, replace)
+        } else {
+            before.replacen(find, replace, 1)
+        }
+    };
+    if before == after {
+        return Err(AppError::Project("修改前后文件正文没有变化".to_string()));
+    }
+    let id = Uuid::new_v4().to_string();
+    let diff = TextDiff::from_lines(&before, &after)
+        .unified_diff()
+        .header(&format!("a/{relative}"), &format!("b/{relative}"))
+        .to_string();
+    let reason = arguments
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Agent 提出的工程源文件修改")
+        .to_string();
+    let summary = PendingChangeSummary {
+        id: id.clone(),
+        title: format!("审批后修改 {relative}"),
+        description: reason,
+        diff,
+        server_id: BUILTIN_SERVER_ID.to_string(),
+        tool_name: "propose_edit".to_string(),
+        risk: "写入工程前需人工审批".to_string(),
+        status: "pending".to_string(),
+    };
+    let stored_arguments = json!({
+        "path": relative,
+        "before": before,
+        "after": after,
+        "thread_id": state.inner.lock().await.session.session_id,
+    });
+    state.inner.lock().await.pending.insert(
+        id,
+        PendingChange {
+            summary: summary.clone(),
+            arguments: stored_arguments,
+        },
+    );
+    Ok(summary)
+}
+
+fn write_project_text(path: &Path, content: &str) -> Result<(), AppError> {
+    fs::write(path, content).map_err(|error| {
+        AppError::Project(format!("写入工程文件 {} 未完成：{error}", path.display()))
+    })
+}
+
+async fn apply_builtin_pending_change(
+    state: &AppState,
+    pending: &PendingChange,
+) -> Result<ToolCallResult, AppError> {
+    let project = state.inner.lock().await.project.clone();
+    let requested = pending
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Project("待审批动作缺少工程文件路径".to_string()))?;
+    let (path, relative) = resolve_project_file(&project, requested, false)?;
+    let before = pending
+        .arguments
+        .get("before")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Project("待审批动作缺少原始文件正文".to_string()))?;
+    let after = pending
+        .arguments
+        .get("after")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::Project("待审批动作缺少修改后文件正文".to_string()))?;
+    let current = fs::read_to_string(&path)
+        .map_err(|error| AppError::Project(format!("复核 {relative} 未完成：{error}")))?;
+    if current != before {
+        return Err(AppError::Project(
+            "文件在审批期间发生变化；为避免覆盖新内容，本次写入已停止".to_string(),
+        ));
+    }
+    write_project_text(&path, after)?;
+    let session = state.inner.lock().await.session.clone();
+    let thread_id = pending
+        .arguments
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("local-plc-thread")
+        .to_string();
+    let turn_id = pending
+        .arguments
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("turn-{}", session.message_count));
+    state.inner.lock().await.patches.insert(
+        pending.summary.id.clone(),
+        AppliedFilePatch {
+            id: pending.summary.id.clone(),
+            thread_id,
+            turn_id,
+            path: path.to_string_lossy().to_string(),
+            before: before.to_string(),
+            after: after.to_string(),
+            active: true,
+        },
+    );
+    let mut refreshed = project;
+    refreshed = scan_project_context(refreshed);
+    state.inner.lock().await.project = refreshed;
+    Ok(json_content(
+        &json!({
+            "decision": "approved",
+            "path": relative,
+            "patch_id": pending.summary.id,
+            "message": "工程文件已按审批内容写入；请继续执行编译诊断。",
+        }),
+        false,
+    ))
+}
+
+async fn call_model(
+    config: &ModelConfig,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[McpTool],
+) -> Result<ModelResponse, AppError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| AppError::Network(error.to_string()))?;
+    match config.provider {
+        ProviderKind::Responses => call_responses(&client, config, system, messages, tools).await,
+        ProviderKind::Messages => call_messages(&client, config, system, messages, tools).await,
+        ProviderKind::ChatCompletions => {
+            call_chat_completions(&client, config, system, messages, tools).await
+        }
+        ProviderKind::Ollama => call_ollama(&client, config, system, messages, tools).await,
+    }
+}
+
+async fn call_responses(
+    client: &reqwest::Client,
+    config: &ModelConfig,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[McpTool],
+) -> Result<ModelResponse, AppError> {
+    let body = json!({
+        "model": config.model,
+        "instructions": system,
+        "input": normalized_messages(messages),
+        "tools": response_tools(tools),
+        "max_output_tokens": config.max_tokens,
+    });
+    let value = send_json(
+        client,
+        config,
+        &endpoint(&config.base_url, "responses"),
+        body,
+        ApiFlavor::OpenAi,
+    )
+    .await?;
+    let mut response = ModelResponse::default();
+    if let Some(output) = value.get("output").and_then(Value::as_array) {
+        for item in output {
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    if let Some(content) = item.get("content").and_then(Value::as_array) {
+                        for part in content {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                response.text.push_str(text);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => response.tool_calls.push(FunctionCall {
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    arguments: parse_arguments(item.get("arguments")),
+                    call_id: item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("response-call")
+                        .to_string(),
+                }),
+                _ => {}
+            }
+        }
+    }
+    if response.text.is_empty() {
+        response.text = value
+            .get("output_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
+    Ok(response)
+}
+
+async fn call_messages(
+    client: &reqwest::Client,
+    config: &ModelConfig,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[McpTool],
+) -> Result<ModelResponse, AppError> {
+    let body = json!({
+        "model": config.model,
+        "system": system,
+        "messages": normalized_messages(messages),
+        "tools": anthropic_tools(tools),
+        "max_tokens": config.max_tokens,
+    });
+    let value = send_json(
+        client,
+        config,
+        &endpoint(&config.base_url, "messages"),
+        body,
+        ApiFlavor::Anthropic,
+    )
+    .await?;
+    let mut response = ModelResponse::default();
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        for part in content {
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => response
+                    .text
+                    .push_str(part.get("text").and_then(Value::as_str).unwrap_or_default()),
+                Some("tool_use") => response.tool_calls.push(FunctionCall {
+                    name: part
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    arguments: part.get("input").cloned().unwrap_or_else(|| json!({})),
+                    call_id: part
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("anthropic-call")
+                        .to_string(),
+                }),
+                _ => {}
+            }
+        }
+    }
+    Ok(response)
+}
+
+async fn call_chat_completions(
+    client: &reqwest::Client,
+    config: &ModelConfig,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[McpTool],
+) -> Result<ModelResponse, AppError> {
+    let mut input = vec![json!({"role": "system", "content": system})];
+    input.extend(normalized_messages(messages));
+    let body = json!({
+        "model": config.model,
+        "messages": input,
+        "tools": chat_tools(tools),
+        "temperature": 0.2,
+    });
+    let value = send_json(
+        client,
+        config,
+        &endpoint(&config.base_url, "chat/completions"),
+        body,
+        ApiFlavor::OpenAi,
+    )
+    .await?;
+    let message = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("message"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut response = ModelResponse {
+        text: message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        ..Default::default()
+    };
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            let function = call.get("function").cloned().unwrap_or_else(|| json!({}));
+            response.tool_calls.push(FunctionCall {
+                name: function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                arguments: parse_arguments(function.get("arguments")),
+                call_id: call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("chat-call")
+                    .to_string(),
+            });
+        }
+    }
+    Ok(response)
+}
+
+async fn call_ollama(
+    client: &reqwest::Client,
+    config: &ModelConfig,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[McpTool],
+) -> Result<ModelResponse, AppError> {
+    let mut input = vec![json!({"role": "system", "content": system})];
+    input.extend(normalized_messages(messages));
+    let body = json!({
+        "model": config.model,
+        "messages": input,
+        "tools": chat_tools(tools),
+        "stream": false,
+    });
+    let value = send_json(
+        client,
+        config,
+        &endpoint(&config.base_url, "api/chat"),
+        body,
+        ApiFlavor::Ollama,
+    )
+    .await?;
+    let message = value.get("message").cloned().unwrap_or_else(|| json!({}));
+    let mut response = ModelResponse {
+        text: message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        ..Default::default()
+    };
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            let function = call.get("function").cloned().unwrap_or_else(|| json!({}));
+            response.tool_calls.push(FunctionCall {
+                name: function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                arguments: function
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                call_id: Uuid::new_v4().to_string(),
+            });
+        }
+    }
+    Ok(response)
+}
+
+fn normalized_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let role = if message.role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
+            json!({"role": role, "content": message.content})
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum ApiFlavor {
+    OpenAi,
+    Anthropic,
+    Ollama,
+}
+
+async fn send_json(
+    client: &reqwest::Client,
+    config: &ModelConfig,
+    endpoint: &str,
+    body: Value,
+    flavor: ApiFlavor,
+) -> Result<Value, AppError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    match flavor {
+        ApiFlavor::OpenAi => {
+            if let Some(key) = config
+                .api_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+            {
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {key}"))
+                        .map_err(|error| AppError::Configuration(error.to_string()))?,
+                );
+            }
+        }
+        ApiFlavor::Anthropic => {
+            if let Some(key) = config
+                .api_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+            {
+                headers.insert(
+                    HeaderName::from_static("x-api-key"),
+                    HeaderValue::from_str(key)
+                        .map_err(|error| AppError::Configuration(error.to_string()))?,
+                );
+            }
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        ApiFlavor::Ollama => {}
+    }
+    let response = client
+        .post(endpoint)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| AppError::Network(error.to_string()))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| AppError::Network(error.to_string()))?;
+    if !status.is_success() {
+        return Err(AppError::Network(format!(
+            "HTTP {}：{}",
+            status.as_u16(),
+            truncate(&text, 600)
+        )));
+    }
+    serde_json::from_str(&text)
+        .map_err(|error| AppError::Network(format!("接口返回不是 JSON：{error}")))
+}
+
+fn response_tools(tools: &[McpTool]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": qualify_tool(&tool.server_id, &tool.name),
+                "description": tool.description.clone().unwrap_or_default(),
+                "parameters": tool.input_schema,
+            })
+        })
+        .collect()
+}
+
+fn anthropic_tools(tools: &[McpTool]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": qualify_tool(&tool.server_id, &tool.name),
+                "description": tool.description.clone().unwrap_or_default(),
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect()
+}
+
+fn chat_tools(tools: &[McpTool]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": qualify_tool(&tool.server_id, &tool.name),
+                    "description": tool.description.clone().unwrap_or_default(),
+                    "parameters": tool.input_schema,
+                }
+            })
+        })
+        .collect()
+}
+
+fn parse_arguments(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(text)) => {
+            serde_json::from_str(text).unwrap_or_else(|_| json!({ "raw": text }))
+        }
+        Some(value) => value.clone(),
+        None => json!({}),
+    }
+}
+
+fn looks_like_diagnostics(content: &[Value]) -> bool {
+    let text = content
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    [
+        "error",
+        "warning",
+        "diagnostic",
+        "compile",
+        "编译",
+        "错误",
+        "警告",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+}
+
+fn extract_diagnostics(content: &[Value]) -> Vec<DiagnosticItem> {
+    let mut result = Vec::new();
+    for item in content {
+        collect_diagnostics_value(item, &mut result);
+    }
+    result
+}
+
+fn collect_diagnostics_value(value: &Value, result: &mut Vec<DiagnosticItem>) {
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_diagnostics_value(item, result);
+        }
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    if let Some(message) = object.get("message").and_then(Value::as_str) {
+        result.push(DiagnosticItem {
+            severity: object
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("info")
+                .to_string(),
+            code: object
+                .get("code")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            message: message.to_string(),
+            location: object
+                .get("location")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+    }
+    if let Some(diagnostics) = object.get("diagnostics") {
+        collect_diagnostics_value(diagnostics, result);
+    }
+    if let Some(text) = object.get("text").and_then(Value::as_str) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+            collect_diagnostics_value(&parsed, result);
+        }
+    }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    value.chars().take(max).collect::<String>() + "..."
+}
+
+#[tauri::command]
+async fn get_skill_content(id: String, state: State<'_, AppState>) -> Result<String, AppError> {
+    get_skill_content_inner(id, &state).await
+}
+
+async fn get_skill_content_inner(id: String, state: &AppState) -> Result<String, AppError> {
+    let requested = id.trim();
+    if requested.is_empty() {
+        return Err(AppError::Configuration("Skill id 不能为空".to_string()));
+    }
+    if let Some(content) = builtin_skill_content(requested) {
+        return Ok(content.to_string());
+    }
+    let project = state.inner.lock().await.project.clone();
+    let skill = discover_skills(&project)
+        .into_iter()
+        .find(|skill| skill.id == requested)
+        .ok_or_else(|| AppError::Configuration(format!("未找到 Skill：{requested}")))?;
+    let path = skill
+        .path
+        .ok_or_else(|| AppError::Configuration("这个 Skill 没有可读取的文件".to_string()))?;
+    std::fs::read_to_string(&path)
+        .map_err(|error| AppError::Configuration(format!("读取 Skill 未完成：{error}")))
+}
+
+fn builtin_skill_content(id: &str) -> Option<&'static str> {
+    match id {
+        "codesys-agent" => Some(CODESYS_SKILL),
+        "plc-safety" => Some(PLC_SAFETY_SKILL),
+        "iec61131-st" => Some(IEC_ST_SKILL),
+        _ => None,
+    }
+}
+
+async fn snapshot_from_app_state(state: &State<'_, AppState>) -> Result<AppSnapshot, AppError> {
+    snapshot_from_app_state_ref(state.inner()).await
+}
+
+async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, AppError> {
+    // CODESYS 脚本命令会把当前主工程写入桥接快照；每次刷新先合并该快照，避免侧栏停留在旧的手动路径。
+    let current_project = state.inner.lock().await.project.clone();
+    let synced_project = sync_project_from_codesys(current_project);
+    state.inner.lock().await.project = synced_project;
+    let guard = state.inner.lock().await;
+    let model = model_summary(&guard.model);
+    let project = guard.project.clone();
+    let pending_changes = guard
+        .pending
+        .values()
+        .filter(|item| item.summary.status == "pending")
+        .map(|item| item.summary.clone())
+        .collect();
+    let servers = guard.mcp_servers.clone();
+    let session = guard.session.clone();
+    let project_for_skills = project.clone();
+    drop(guard);
+    // 一次刷新只探测每个 MCP 服务一次，避免启动两遍 stdio 进程并让有状态的
+    // HTTP MCP 服务收到重复初始化请求。
+    let (mcp_servers, tools) = inspect_mcp_servers(&servers).await;
+    Ok(AppSnapshot {
+        app_version: APP_VERSION.to_string(),
+        model,
+        mcp_servers,
+        project,
+        codesys: detect_codesys_installation(),
+        skills: discover_skills(&project_for_skills),
+        commands: available_commands(),
+        tools,
+        sessions: list_session_records(),
+        pending_changes,
+        session,
+    })
+}
+
+fn model_summary(config: &ModelConfig) -> ModelSummary {
+    ModelSummary {
+        provider: config.provider.clone(),
+        base_url: config.base_url.clone(),
+        model: config.model.clone(),
+        configured: config
+            .api_key
+            .as_deref()
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false)
+            || matches!(config.provider, ProviderKind::Ollama),
+    }
+}
+
+fn now_iso() -> String {
+    // 不额外引入时间库；对 UI 来说单调的 Unix 秒值足够用于“最近检查”排序。
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn mcp_transport(server: &McpServerConfig) -> String {
+    if server.transport.trim().is_empty() {
+        if server.url.as_deref().unwrap_or_default().trim().is_empty() {
+            "stdio".to_string()
+        } else {
+            "http".to_string()
+        }
+    } else {
+        server.transport.to_lowercase()
+    }
+}
+
+fn available_commands() -> Vec<CommandSummary> {
+    [
+        (
+            "/help",
+            "帮助",
+            "查看命令、能力和安全边界",
+            "session",
+            false,
+        ),
+        (
+            "/status",
+            "状态",
+            "查看工程、模型、MCP 和会话状态",
+            "session",
+            false,
+        ),
+        (
+            "/new",
+            "新建会话",
+            "创建一个干净的工作会话",
+            "session",
+            false,
+        ),
+        (
+            "/clear",
+            "清空会话",
+            "移除当前对话记录，不改工程文件",
+            "session",
+            false,
+        ),
+        (
+            "/sessions",
+            "会话历史",
+            "列出本机保存的工作会话",
+            "session",
+            false,
+        ),
+        (
+            "/rename",
+            "重命名会话",
+            "给当前会话设置一个易识别的名称",
+            "session",
+            true,
+        ),
+        (
+            "/compact",
+            "压缩上下文",
+            "保留关键结论并释放上下文空间",
+            "session",
+            true,
+        ),
+        (
+            "/scan",
+            "扫描工程",
+            "读取工程树、POU 和源文件概览",
+            "project",
+            false,
+        ),
+        (
+            "/compile",
+            "编译工程",
+            "优先调用已连接的 CODESYS 编译工具，否则执行本地静态诊断",
+            "project",
+            false,
+        ),
+        (
+            "/diagnostics",
+            "静态诊断",
+            "查看 IEC 61131-3 结构诊断和编译器执行边界",
+            "project",
+            false,
+        ),
+        (
+            "/skills",
+            "Skills",
+            "查看已加载的内置、用户和工程 Skills",
+            "tools",
+            true,
+        ),
+        (
+            "/mcp",
+            "MCP 服务",
+            "查看 MCP 连接和工具发现结果",
+            "tools",
+            true,
+        ),
+        (
+            "/tools",
+            "工具目录",
+            "列出当前可调用的 MCP 工具",
+            "tools",
+            false,
+        ),
+        ("/model", "模型", "查看当前模型接口配置", "tools", false),
+        (
+            "/approve",
+            "批准修改",
+            "执行审批卡片中的工程写入",
+            "safety",
+            true,
+        ),
+        (
+            "/reject",
+            "拒绝修改",
+            "丢弃审批卡片中的工程写入",
+            "safety",
+            true,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(command, label, detail, category, supports_args)| CommandSummary {
+            command: command.to_string(),
+            label: label.to_string(),
+            detail: detail.to_string(),
+            category: category.to_string(),
+            supports_args,
+        },
+    )
+    .collect()
+}
+
+async fn list_tools_for_servers(servers: &[McpServerConfig]) -> Vec<ToolSummary> {
+    inspect_mcp_servers(servers).await.1
+}
+
+fn scan_project_context(mut project: ProjectContext) -> ProjectContext {
+    let path = project.path.as_deref().map(PathBuf::from);
+    let bridge_root = project
+        .source_root
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|value| is_allowed_bridge_source_root(value));
+    let project_path_exists = path.as_ref().map(|value| value.exists()).unwrap_or(false);
+    if !project_path_exists && bridge_root.is_none() {
+        project.scan_status = "warning".to_string();
+        project.scan_message = Some("工程路径不存在，无法读取工程树。".to_string());
+        return project;
+    }
+    // 根本原因：未保存的 CODESYS 工程没有 project.path，但原生插件已经把对象正文
+    // 导出到受控 source_root。扫描必须优先使用该目录，否则侧栏能显示对象、Agent 却
+    // 因 path 为空直接丢失所有代码上下文。
+    let root = if let Some(source_root) = bridge_root {
+        source_root
+    } else if let Some(path) = path {
+        if path.is_dir() {
+            path
+        } else {
+            path.parent().map(PathBuf::from).unwrap_or(path)
+        }
+    } else {
+        project.scan_status = "warning".to_string();
+        project.scan_message = Some("当前工程没有可读取的文件目录。".to_string());
+        return project;
+    };
+    let mut file_count = 0usize;
+    let mut pou_count = 0usize;
+    let mut source_files = Vec::new();
+    let mut capped = false;
+    let ignored = [".git", "node_modules", "target", "bin", "obj"];
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            !entry
+                .file_name()
+                .to_str()
+                .map(|name| ignored.iter().any(|item| name.eq_ignore_ascii_case(item)))
+                .unwrap_or(false)
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        file_count += 1;
+        let relative = entry
+            .path()
+            .strip_prefix(&root)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        if ["st", "pou", "gvl", "dut", "itf", "fb"].contains(&extension.as_str())
+            || relative.to_lowercase().contains("pou")
+        {
+            pou_count += 1;
+        }
+        if source_files.len() < 80
+            && [
+                "st",
+                "pou",
+                "gvl",
+                "dut",
+                "itf",
+                "fb",
+                "project",
+                "projectarchive",
+                "library",
+            ]
+            .contains(&extension.as_str())
+        {
+            source_files.push(relative);
+        }
+        if file_count >= 800 {
+            capped = true;
+            break;
+        }
+    }
+    project.file_count = file_count;
+    project.pou_count = pou_count;
+    project.source_files = source_files;
+    project.scan_status = if capped { "warning" } else { "scanned" }.to_string();
+    project.scan_message = if capped {
+        Some("工程文件超过 800 个，概览已截取前 800 个文件。".to_string())
+    } else {
+        Some("工程树概览已读取；二进制工程对象仍需通过 CODESYS Bridge 解析。".to_string())
+    };
+    project
+}
+
+fn parse_skill_frontmatter(content: &str, fallback_id: &str) -> (String, String) {
+    let mut name = fallback_id.replace(['-', '_'], " ");
+    let mut description = "用户提供的工程 Skill".to_string();
+    for line in content.lines().take(30) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']);
+        match key.trim().to_lowercase().as_str() {
+            "name" if !value.is_empty() => name = value.to_string(),
+            "description" if !value.is_empty() => description = value.to_string(),
+            _ => {}
+        }
+    }
+    (name, description)
+}
+
+fn discover_skills(project: &ProjectContext) -> Vec<SkillSummary> {
+    let mut result = builtin_skills();
+    let mut seen: HashSet<String> = result.iter().map(|skill| skill.id.clone()).collect();
+    let mut roots: Vec<(PathBuf, &str)> = Vec::new();
+    if let Some(path) = project.path.as_deref() {
+        let project_path = PathBuf::from(path);
+        let project_root = if project_path.is_dir() {
+            project_path
+        } else {
+            project_path.parent().map(PathBuf::from).unwrap_or_default()
+        };
+        // 工程级资源只从 PLC Pilot 自有目录读取，避免误载入 Codex/Pi 的配置。
+        roots.push((project_root.join(".plc-pilot").join("skills"), "project"));
+    }
+    roots.push((app_data_root().join("skills"), "user"));
+    roots.push((
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("skills"),
+        "project",
+    ));
+    for (root, scope) in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let directory = entry.path();
+            let skill_file = directory.join("SKILL.md");
+            if !skill_file.is_file() {
+                continue;
+            }
+            let id = directory
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("skill")
+                .to_string();
+            if seen.contains(&id) {
+                continue;
+            }
+            let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
+            let (name, description) = parse_skill_frontmatter(&content, &id);
+            seen.insert(id.clone());
+            result.push(SkillSummary {
+                id,
+                name,
+                description,
+                enabled: true,
+                scope: scope.to_string(),
+                path: skill_file.to_str().map(str::to_string),
+                content_available: !content.trim().is_empty(),
+            });
+        }
+    }
+    result
+}
+
+fn list_session_records() -> Vec<SessionRecord> {
+    let root = agent_session_dir();
+    let mut records = Vec::new();
+    if !root.is_dir() {
+        return records;
+    }
+    // Pi 默认把文件放在根目录；保留两层递归是为了兼容用户手动整理过的会话目录。
+    for entry in WalkDir::new(root)
+        .max_depth(3)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !entry.file_type().is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        {
+            continue;
+        }
+        if let Some(record) = parse_session_record(path) {
+            records.push(record);
+        }
+    }
+    records.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    records.truncate(30);
+    records
+}
+
+fn parse_session_record(path: &Path) -> Option<SessionRecord> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut session_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut name = None;
+    let mut messages = Vec::new();
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match entry.get("type").and_then(Value::as_str) {
+            Some("session") => {
+                if let Some(id) = entry.get("id").and_then(Value::as_str) {
+                    session_id = id.to_string();
+                }
+            }
+            Some("session_info") => {
+                name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            Some("message") => {
+                let Some(message) = entry.get("message") else {
+                    continue;
+                };
+                let Some(role) = message.get("role").and_then(Value::as_str) else {
+                    continue;
+                };
+                if role != "user" && role != "assistant" {
+                    continue;
+                }
+                let text = extract_session_message_text(message);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if messages.len() >= MAX_SESSION_PREVIEW_MESSAGES {
+                    messages.remove(0);
+                }
+                messages.push(ChatMessage {
+                    role: role.to_string(),
+                    content: truncate(&text, MAX_SESSION_PREVIEW_CHARS),
+                });
+            }
+            // 兼容早期实验版本曾写入的 session_name 字段。
+            _ if entry.get("session_name").is_some() && name.is_none() => {
+                name = entry
+                    .get("session_name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    let modified_at = std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs().to_string());
+    let message_count = content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("message"))
+        .filter(|entry| {
+            matches!(
+                entry
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str),
+                Some("user") | Some("assistant")
+            )
+        })
+        .count();
+    Some(SessionRecord {
+        session_id,
+        name,
+        path: path.to_string_lossy().to_string(),
+        message_count,
+        messages,
+        modified_at,
+    })
+}
+
+fn extract_session_message_text(message: &Value) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let Some(blocks) = content.as_array() else {
+        return content.to_string();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| {
+            if let Some(text) = block.as_str() {
+                return Some(text.to_string());
+            }
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if matches!(block_type, "text" | "input_text" | "output_text") {
+                return block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            None
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn session_paths_equal(left: &str, right: &str) -> bool {
+    let left_path = PathBuf::from(left);
+    let right_path = PathBuf::from(right);
+    match (
+        std::fs::canonicalize(left_path),
+        std::fs::canonicalize(right_path),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left.eq_ignore_ascii_case(right),
+    }
+}
+
+async fn summarize_mcp_servers(state: Arc<Mutex<RuntimeState>>) -> Vec<McpSummary> {
+    let servers = state.lock().await.mcp_servers.clone();
+    inspect_mcp_servers(&servers).await.0
+}
+
+async fn inspect_mcp_servers(servers: &[McpServerConfig]) -> (Vec<McpSummary>, Vec<ToolSummary>) {
+    let builtin = builtin_tools();
+    let mut result = vec![McpSummary {
+        id: BUILTIN_SERVER_ID.to_string(),
+        name: "PLC Pilot 内置工具".to_string(),
+        command: String::new(),
+        enabled: true,
+        connected: true,
+        tool_count: builtin.len(),
+        last_error: None,
+        transport: "builtin".to_string(),
+        url: None,
+        last_checked: Some(now_iso()),
+    }];
+    let mut all_tools = builtin
+        .into_iter()
+        .map(tool_summary_from_mcp)
+        .collect::<Vec<_>>();
+    for server in servers {
+        let transport = mcp_transport(&server);
+        let url = server.url.clone();
+        if !server.enabled {
+            result.push(McpSummary {
+                id: server.id.clone(),
+                name: server.name.clone(),
+                command: server.command.clone(),
+                enabled: false,
+                connected: false,
+                tool_count: 0,
+                last_error: None,
+                transport,
+                url,
+                last_checked: Some(now_iso()),
+            });
+            continue;
+        }
+        match McpClient::new(server.clone()).list_tools().await {
+            Ok(tools) => {
+                let tool_count = tools.len();
+                all_tools.extend(tools.into_iter().map(tool_summary_from_mcp));
+                result.push(McpSummary {
+                    id: server.id.clone(),
+                    name: server.name.clone(),
+                    command: server.command.clone(),
+                    enabled: true,
+                    connected: true,
+                    tool_count,
+                    last_error: None,
+                    transport: transport.clone(),
+                    url: url.clone(),
+                    last_checked: Some(now_iso()),
+                });
+            }
+            Err(error) => result.push(McpSummary {
+                id: server.id.clone(),
+                name: server.name.clone(),
+                command: server.command.clone(),
+                enabled: true,
+                connected: false,
+                tool_count: 0,
+                last_error: Some(error.to_string()),
+                transport,
+                url,
+                last_checked: Some(now_iso()),
+            }),
+        }
+    }
+    (result, all_tools)
+}
+
+fn builtin_skills() -> Vec<SkillSummary> {
+    vec![
+        SkillSummary {
+            id: "codesys-agent".to_string(),
+            name: "CODESYS 工程工作流".to_string(),
+            description: "先探查、再 Diff、审批后写入，最后编译诊断。".to_string(),
+            enabled: true,
+            scope: "builtin".to_string(),
+            path: None,
+            content_available: true,
+        },
+        SkillSummary {
+            id: "plc-safety".to_string(),
+            name: "PLC 安全审查".to_string(),
+            description: "检查扫描周期、互锁、状态机和失效安全边界。".to_string(),
+            enabled: true,
+            scope: "builtin".to_string(),
+            path: None,
+            content_available: true,
+        },
+        SkillSummary {
+            id: "iec61131-st".to_string(),
+            name: "IEC 61131-3 Structured Text".to_string(),
+            description: "遵循 CODESYS ST 类型、库和实例生命周期约定。".to_string(),
+            enabled: true,
+            scope: "builtin".to_string(),
+            path: None,
+            content_available: true,
+        },
+    ]
+}
+
+fn build_system_prompt(project: &ProjectContext) -> String {
+    let project_line = if project.exists {
+        match project
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(path) => format!("当前工程路径：{path}"),
+            None => "当前 CODESYS 工程尚未保存；只能读取原生插件导出的源对象，不得编造正式工程文件路径。"
+                .to_string(),
+        }
+    } else {
+        "当前没有可读工程，不得声称已经读取或修改工程。".to_string()
+    };
+    let location_line = format!(
+        "工程所在目录：{}\nCODESYS 工作目录：{}\nAgent 可读源目录：{}\n工程快照标识：{}",
+        project.project_directory.as_deref().unwrap_or("未提供"),
+        project.working_directory.as_deref().unwrap_or("未提供"),
+        project.source_root.as_deref().unwrap_or("未提供"),
+        project.snapshot_id.as_deref().unwrap_or("未提供")
+    );
+    let scan_line = if project.scan_status == "scanned" || project.scan_status == "warning" {
+        format!(
+            "工程扫描：{} 个文件，{} 个可能的 POU/源对象。{}",
+            project.file_count,
+            project.pou_count,
+            project.scan_message.clone().unwrap_or_default()
+        )
+    } else {
+        "工程扫描尚未完成；不得声称已经读取工程对象。".to_string()
+    };
+    let editor_line = match (
+        project.active_object.as_deref().filter(|value| !value.trim().is_empty()),
+        project.active_file.as_deref().filter(|value| !value.trim().is_empty()),
+    ) {
+        (Some(object), Some(file)) => format!(
+            "当前编辑器对象：{object}\n当前编辑器文件：{file}\n当前编辑器全文：{}\n当前选中文本（起点 {}, 长度 {}）：{}",
+            truncate(project.active_text.as_deref().unwrap_or_default(), 160000),
+            project.selection_start,
+            project.selection_length,
+            truncate(project.selected_text.as_deref().unwrap_or_default(), 32000)
+        ),
+        (Some(object), None) => format!(
+            "当前编辑器对象：{object}\n当前编辑器全文：{}\n当前选中文本（起点 {}, 长度 {}）：{}",
+            truncate(project.active_text.as_deref().unwrap_or_default(), 160000),
+            project.selection_start,
+            project.selection_length,
+            truncate(project.selected_text.as_deref().unwrap_or_default(), 32000)
+        ),
+        _ => "当前没有可读取的前台 CODESYS 编辑器；不要猜测用户正在查看的 POU。".to_string(),
+    };
+    let mut skill_sections = vec![
+        CODESYS_SKILL.to_string(),
+        PLC_SAFETY_SKILL.to_string(),
+        IEC_ST_SKILL.to_string(),
+    ];
+    for skill in discover_skills(project)
+        .into_iter()
+        .filter(|skill| skill.scope != "builtin")
+    {
+        if let Some(path) = skill.path {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                skill_sections.push(truncate(&content, 12000));
+            }
+        }
+    }
+    format!(
+        "你是 PLC Pilot，一个面向 CODESYS 3.5.22（SP22）的本地工程 Agent。\n\n{project_line}\n{location_line}\n{scan_line}\n{editor_line}\n\n强制边界：\n- 先读取工程上下文，再提出修改。\n- 任何写代码、删除、重命名、安装库、覆盖工程的工具调用必须等待用户审批。\n- 默认禁止 PLC 下载、RUN/STOP、在线写变量、Force/Unforce、Reset 和任意 Shell。\n- 不能把未连接的 CODESYS 或未完成的编译说成已完成。\n- 生成 Structured Text 时遵循扫描周期、互锁、状态机和失效安全要求。\n- 每次回答先给结论，再列已执行工具、证据、风险和下一步。\n\n已加载 Skills：\n{}",
+        skill_sections.join("\n\n")
+    )
+}
+
+/// 将本轮输入区的临时选项合并到持久化模型配置，避免用户切换下拉框后仍悄悄使用旧模型。
+fn model_for_request(base: &ModelConfig, request: &AgentRequest) -> Result<ModelConfig, AppError> {
+    let mut model = base.clone();
+    if let Some(requested) = request
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        model.model = requested.to_string();
+    }
+    if model.model.trim().is_empty() {
+        return Err(AppError::Configuration("本轮模型名称不能为空".to_string()));
+    }
+    Ok(model)
+}
+
+fn request_is_plan_mode(request: &AgentRequest) -> bool {
+    request
+        .collaboration_mode
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("plan"))
+        .unwrap_or(false)
+}
+
+fn request_thinking_level(request: &AgentRequest) -> &'static str {
+    match request
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "none" | "off" => "off",
+        "minimal" => "minimal",
+        "low" => "low",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        // 未传或传入未知值时使用稳定的中等级别，避免把非法字符串交给 Pi。
+        _ => "medium",
+    }
+}
+
+fn selected_skill_label(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some(id) = trimmed.strip_prefix("builtin://") {
+        return id.to_string();
+    }
+    let path = Path::new(trimmed);
+    if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+        if let Some(parent) = path.parent().and_then(|parent| parent.file_name()) {
+            if let Some(name) = parent.to_str() {
+                return name.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// 为本轮请求附加计划模式和重点 Skill 约束；基础 PLC 安全提示始终保留。
+fn build_agent_system_prompt(project: &ProjectContext, request: &AgentRequest) -> String {
+    let mut prompt = build_system_prompt(project);
+    prompt.push_str(&format!(
+        "\n\n本轮思考级别：{}。请在该级别下保持结论、证据和风险表达清晰。",
+        request_thinking_level(request)
+    ));
+    if request_is_plan_mode(request) {
+        prompt.push_str(
+            "\n\n本轮工作模式：计划模式。只读取工程、分析风险并输出可执行计划；不要调用任何会改变工程或在线状态的工具。",
+        );
+    } else {
+        prompt.push_str(
+            "\n\n本轮工作模式：执行模式。仍须遵守先读取、生成 Diff、人工审批后写入的安全流程。",
+        );
+    }
+    let selected = request
+        .skills
+        .iter()
+        .map(|value| selected_skill_label(value))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if !selected.is_empty() {
+        prompt.push_str(&format!(
+            "\n本轮重点应用 Skills：{}。回答时优先引用这些规则。",
+            selected.join("、")
+        ));
+        let known_skills = discover_skills(project);
+        for selected_value in &request.skills {
+            let selected_id = selected_value
+                .trim()
+                .strip_prefix("builtin://")
+                .unwrap_or_else(|| selected_value.trim());
+            let content = builtin_skill_content(selected_id)
+                .map(str::to_string)
+                .or_else(|| {
+                    known_skills
+                        .iter()
+                        .find(|skill| {
+                            skill.id == selected_id
+                                || skill.path.as_deref() == Some(selected_value.trim())
+                        })
+                        .and_then(|skill| skill.path.as_deref())
+                        .and_then(|path| std::fs::read_to_string(path).ok())
+                });
+            if let Some(content) = content {
+                prompt.push_str("\n\n本轮 Skill 原文：\n");
+                prompt.push_str(&truncate(&content, 8000));
+            }
+        }
+    }
+    prompt
+}
+
+fn validate_model_config(config: &ModelConfig) -> Result<(), AppError> {
+    if config.model.trim().is_empty() || config.base_url.trim().is_empty() {
+        return Err(AppError::Configuration(
+            "请先在设置中填写接口地址和模型名称".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn qualify_tool(server_id: &str, tool_name: &str) -> String {
+    if server_id == BUILTIN_SERVER_ID {
+        format!("plc__{tool_name}")
+    } else {
+        format!("mcp__{server_id}__{tool_name}")
+    }
+}
+
+async fn find_server(state: &AppState, id: &str) -> Result<McpServerConfig, AppError> {
+    state
+        .inner
+        .lock()
+        .await
+        .mcp_servers
+        .iter()
+        .find(|server| server.id == id && server.enabled)
+        .cloned()
+        .ok_or_else(|| AppError::Mcp(format!("未找到已启用的 MCP 服务：{id}")))
+}
+
+fn endpoint(base_url: &str, suffix: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with(suffix) {
+        base.to_string()
+    } else {
+        format!("{base}/{suffix}")
+    }
+}
+
+fn split_qualified_tool(value: &str) -> Option<(String, String)> {
+    if let Some(value) = value.strip_prefix("plc__") {
+        return Some((BUILTIN_SERVER_ID.to_string(), value.to_string()));
+    }
+    let value = value.strip_prefix("mcp__")?;
+    let (server, tool) = value.split_once("__")?;
+    Some((server.to_string(), tool.to_string()))
+}
+
+fn is_mutating_tool(name: &str) -> bool {
+    let name = name.to_lowercase();
+    [
+        "write",
+        "edit",
+        "modify",
+        "update",
+        "delete",
+        "remove",
+        "rename",
+        "create",
+        "set",
+        "install",
+        "overwrite",
+        "save",
+        "import",
+        "propose",
+        "apply_patch",
+    ]
+    .iter()
+    .any(|word| name.contains(word))
+}
+
+fn is_forbidden_tool(name: &str) -> bool {
+    let name = name.to_lowercase();
+    [
+        "download",
+        "deploy",
+        "login",
+        "logout",
+        "plc_run",
+        "plc_start",
+        "plc_stop",
+        "reset",
+        "force",
+        "unforce",
+        "write_variable",
+        "online_write",
+        "shell",
+        "ironpython",
+        "execute_script",
+        "run_script",
+    ]
+    .iter()
+    .any(|word| name.contains(word))
+}
+
+fn render_change_preview(tool_name: &str, arguments: &Value) -> String {
+    let pretty = serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string());
+    format!(
+        "工具：{tool_name}\n\n参数：\n{pretty}\n\n写入前仍需由用户确认工程路径、对象范围和编译影响。"
+    )
+}
+
+fn detect_codesys_installation() -> CodesysStatus {
+    let mut candidates = Vec::new();
+    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+        let Ok(root) = std::env::var(variable) else {
+            continue;
+        };
+        let root = PathBuf::from(root);
+        candidates.push(
+            root.join("CODESYS 3.5")
+                .join("CODESYS")
+                .join("Common")
+                .join("CODESYS.exe"),
+        );
+        // CODESYS Installer 的实际目录通常带完整版本号，例如 3.5.22.0。
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if name.starts_with("codesys 3.5.") && entry.path().is_dir() {
+                    candidates.push(
+                        entry
+                            .path()
+                            .join("CODESYS")
+                            .join("Common")
+                            .join("CODESYS.exe"),
+                    );
+                }
+            }
+        }
+    }
+    candidates.push(PathBuf::from(
+        r"C:\Program Files\CODESYS 3.5.22.0\CODESYS\Common\CODESYS.exe",
+    ));
+    let executable = candidates.into_iter().find(|path| path.is_file());
+    CodesysStatus {
+        detected: executable.is_some(),
+        executable: executable.and_then(|path| path.to_str().map(str::to_string)),
+        supported_version: "CODESYS SP22".to_string(),
+        note: "检测到安装目录不等于工程已连接；当前工程路径和源代码由 ScriptEngine Bridge 同步。"
+            .to_string(),
+    }
+}
+
+fn codesys_bridge_snapshot_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("PLC Pilot")
+        .join("codesys-bridge")
+        .join("current-project.json")
+}
+
+fn is_allowed_bridge_source_root(path: &Path) -> bool {
+    let snapshot_path = codesys_bridge_snapshot_path();
+    let Some(bridge_root) = snapshot_path.parent() else {
+        return false;
+    };
+    let Ok(root) = std::fs::canonicalize(bridge_root) else {
+        return false;
+    };
+    let Ok(candidate) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    candidate.starts_with(root.join("projects")) && candidate.is_dir()
+}
+
+fn read_codesys_bridge_snapshot() -> Option<CodesysBridgeSnapshot> {
+    let path = codesys_bridge_snapshot_path();
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<CodesysBridgeSnapshot>(&content).ok()
+}
+
+fn sync_project_from_codesys(current: ProjectContext) -> ProjectContext {
+    if let Some(snapshot) = read_codesys_bridge_snapshot() {
+        if snapshot.status.as_deref() == Some("error") {
+            let mut project = current;
+            project.scan_status = "warning".to_string();
+            project.scan_message = Some(snapshot.error.unwrap_or_else(|| {
+                "CODESYS Bridge 同步需要处理；请在 CODESYS 中重新执行同步命令。".to_string()
+            }));
+            return project;
+        }
+        if snapshot.status.as_deref() == Some("no_project") {
+            // 仅清除上一轮由 Bridge 产生的上下文；用户手动选择的工程不应被空快照覆盖。
+            return if current.source_root.is_some() {
+                ProjectContext::default()
+            } else {
+                current
+            };
+        }
+        let project_path = snapshot
+            .project_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let source_root = snapshot
+            .source_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|value| is_allowed_bridge_source_root(value));
+        if project_path.is_some() || source_root.is_some() {
+            let path = project_path.as_deref().map(PathBuf::from);
+            let exists =
+                path.as_ref().map(|value| value.exists()).unwrap_or(false) || source_root.is_some();
+            let name = snapshot
+                .project_name
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    path.as_ref()?
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| Some("未保存的 CODESYS 工程".to_string()));
+            let extension = path
+                .as_ref()
+                .and_then(|value| value.extension())
+                .and_then(|value| value.to_str())
+                .map(str::to_lowercase);
+            let mut project = ProjectContext {
+                path: project_path.clone(),
+                source_root: source_root
+                    .as_ref()
+                    .and_then(|value| value.to_str().map(str::to_string)),
+                project_directory: snapshot
+                    .project_directory
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                working_directory: snapshot
+                    .working_directory
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                snapshot_id: snapshot
+                    .snapshot_id
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                project_key: snapshot
+                    .project_key
+                    .clone()
+                    .filter(|value| !value.trim().is_empty()),
+                name,
+                version: snapshot
+                    .codesys_version
+                    .clone()
+                    .or_else(|| Some("SP22（目标版本）".to_string())),
+                exists,
+                extension,
+                active_object: snapshot.active_object.clone(),
+                active_object_guid: snapshot.active_object_guid.clone(),
+                active_file: snapshot.active_file.clone(),
+                active_file_relative: snapshot.active_file_relative.clone(),
+                active_text: snapshot.active_text.clone(),
+                selected_text: snapshot.selected_text.clone(),
+                selection_start: snapshot.selection_start,
+                selection_length: snapshot.selection_length,
+                active_editor_available: snapshot.active_editor_available,
+                active_text_truncated: snapshot.active_text_truncated,
+                ..ProjectContext::default()
+            };
+            project = scan_project_context(project);
+            let mut seen = project.source_files.iter().cloned().collect::<HashSet<_>>();
+            for file in snapshot.source_files {
+                let relative = file.replace('\\', "/");
+                if relative.is_empty()
+                    || Path::new(&relative)
+                        .components()
+                        .any(|component| component == std::path::Component::ParentDir)
+                {
+                    continue;
+                }
+                if seen.insert(relative.clone()) {
+                    project.source_files.push(relative);
+                }
+            }
+            project.source_files.truncate(200);
+            project.scan_message = Some(if source_root.is_some() && project_path.is_none() {
+                "已从当前尚未保存的 CODESYS 主工程导出可读源对象；保存工程后才会产生正式工程路径。"
+                    .to_string()
+            } else if source_root.is_some() {
+                "已从当前 CODESYS 主工程同步路径和可读源文件；写入仍须经过审批。".to_string()
+            } else {
+                "已检测到当前 CODESYS 主工程路径；源对象读取需要 Bridge 导出目录。".to_string()
+            });
+            return project;
+        }
+    }
+
+    // 不再从 CODESYS.exe 命令行或窗口标题猜测工程路径。未收到原生插件快照时，
+    // 只能保留已有状态并提示宿主同步，避免 ikuncodesys 项目曾出现的错绑工程问题。
+    current
+}
+
+fn emit_event(app: &AppHandle, event: AgentEvent) {
+    let _ = app.emit("agent-event", event);
+}
+
+impl AgentEvent {
+    fn new(
+        id: &str,
+        kind: &str,
+        title: &str,
+        detail: Option<String>,
+        status: &str,
+        tool: Option<String>,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            detail,
+            status: status.to_string(),
+            tool,
+        }
+    }
+}
+
+struct McpClient {
+    config: McpServerConfig,
+}
+
+impl McpClient {
+    fn new(config: McpServerConfig) -> Self {
+        Self { config }
+    }
+
+    async fn list_tools(&self) -> Result<Vec<McpTool>, AppError> {
+        let response = self.request("tools/list", json!({})).await?;
+        let tools = response
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(tools
+            .into_iter()
+            .filter_map(|tool| {
+                Some(McpTool {
+                    server_id: self.config.id.clone(),
+                    name: tool.get("name").and_then(Value::as_str)?.to_string(),
+                    description: tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    input_schema: tool
+                        .get("inputSchema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type":"object"})),
+                })
+            })
+            .collect())
+    }
+
+    async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCallResult, AppError> {
+        let response = self
+            .request("tools/call", json!({"name": name, "arguments": arguments}))
+            .await?;
+        Ok(ToolCallResult {
+            content: response
+                .get("content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            is_error: response
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value, AppError> {
+        if mcp_transport(&self.config) == "http" {
+            return self.request_http(method, params).await;
+        }
+        let mut child = spawn_mcp(&self.config).await?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::Mcp("MCP stdout 不可用".to_string()))?;
+        let mut reader = BufReader::new(stdout);
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "plc-pilot", "version": APP_VERSION}
+            }
+        });
+        write_json(&mut child, initialize).await?;
+        let _ = read_json_response(&mut reader).await?;
+        write_json(
+            &mut child,
+            json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        )
+        .await?;
+        write_json(
+            &mut child,
+            json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}),
+        )
+        .await?;
+        let response = read_json_response(&mut reader).await?;
+        let _ = child.kill().await;
+        if let Some(error) = response.get("error") {
+            return Err(AppError::Mcp(error.to_string()));
+        }
+        Ok(response.get("result").cloned().unwrap_or(response))
+    }
+
+    async fn request_http(&self, method: &str, params: Value) -> Result<Value, AppError> {
+        let url = self
+            .config
+            .url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| AppError::Mcp("HTTP MCP 缺少 URL".to_string()))?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| AppError::Mcp(error.to_string()))?;
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "plc-pilot", "version": APP_VERSION}
+            }
+        });
+        let response = self
+            .http_request(&client, url, None)
+            .json(&initialize)
+            .send()
+            .await
+            .map_err(|error| AppError::Mcp(format!("HTTP MCP 初始化未完成：{error}")))?;
+        let session_id = response.headers().get("mcp-session-id").cloned();
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| AppError::Mcp(error.to_string()))?;
+        if !status.is_success() {
+            return Err(AppError::Mcp(format!(
+                "HTTP MCP 返回 {}：{}",
+                status,
+                truncate(&body, 400)
+            )));
+        }
+        let initialize_value = parse_http_json(&body)?;
+        if let Some(error) = initialize_value.get("error") {
+            return Err(AppError::Mcp(error.to_string()));
+        }
+        // Streamable HTTP MCP 用响应头保持会话；后续通知和工具调用必须复用它。
+        let notification = self
+            .http_request(&client, url, session_id.as_ref())
+            .json(&json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}))
+            .send()
+            .await;
+        match notification {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                return Err(AppError::Mcp(format!(
+                    "HTTP MCP 初始化通知返回 {}",
+                    response.status()
+                )));
+            }
+            Err(error) => {
+                return Err(AppError::Mcp(format!("HTTP MCP 初始化通知未完成：{error}")));
+            }
+        }
+        let response = self
+            .http_request(&client, url, session_id.as_ref())
+            .json(&json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}))
+            .send()
+            .await
+            .map_err(|error| AppError::Mcp(format!("HTTP MCP 调用未完成：{error}")))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| AppError::Mcp(error.to_string()))?;
+        if !status.is_success() {
+            return Err(AppError::Mcp(format!(
+                "HTTP MCP 返回 {}：{}",
+                status,
+                truncate(&body, 400)
+            )));
+        }
+        let value = parse_http_json(&body)?;
+        if let Some(error) = value.get("error") {
+            return Err(AppError::Mcp(error.to_string()));
+        }
+        Ok(value.get("result").cloned().unwrap_or(value))
+    }
+
+    fn http_request(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        session_id: Option<&HeaderValue>,
+    ) -> reqwest::RequestBuilder {
+        let mut request = client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(token) = self
+            .config
+            .env
+            .get("MCP_AUTH_TOKEN")
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.bearer_auth(token);
+        }
+        if let Some(session_id) = session_id {
+            request = request.header("Mcp-Session-Id", session_id.clone());
+        }
+        request
+    }
+}
+
+fn parse_http_json(body: &str) -> Result<Value, AppError> {
+    if let Ok(value) = serde_json::from_str::<Value>(body.trim()) {
+        return Ok(value);
+    }
+    for line in body.lines() {
+        let payload = line
+            .trim()
+            .strip_prefix("data:")
+            .map(str::trim)
+            .unwrap_or("");
+        if !payload.is_empty() {
+            if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                return Ok(value);
+            }
+        }
+    }
+    Err(AppError::Mcp(
+        "HTTP MCP 返回不是 JSON 或 SSE 数据".to_string(),
+    ))
+}
+
+async fn spawn_mcp(config: &McpServerConfig) -> Result<Child, AppError> {
+    let mut command = Command::new(&config.command);
+    command
+        .args(&config.args)
+        .envs(&config.env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command
+        .spawn()
+        .map_err(|error| AppError::Mcp(format!("启动 {} 未完成：{error}", config.command)))
+}
+
+async fn write_json(child: &mut Child, value: Value) -> Result<(), AppError> {
+    let stdin = child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| AppError::Mcp("MCP stdin 不可用".to_string()))?;
+    let mut text = serde_json::to_vec(&value).map_err(|error| AppError::Mcp(error.to_string()))?;
+    text.push(b'\n');
+    stdin
+        .write_all(&text)
+        .await
+        .map_err(|error| AppError::Mcp(error.to_string()))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| AppError::Mcp(error.to_string()))
+}
+
+async fn read_json_response<R>(reader: &mut R) -> Result<Value, AppError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    timeout(Duration::from_secs(120), async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let count = reader
+                .read_line(&mut line)
+                .await
+                .map_err(|error| AppError::Mcp(error.to_string()))?;
+            if count == 0 {
+                return Err(AppError::Mcp(
+                    "MCP 进程提前结束，没有返回 JSON-RPC 响应".to_string(),
+                ));
+            }
+            let first = line.trim_end_matches(['\r', '\n']).trim();
+            if first.is_empty() {
+                continue;
+            }
+
+            // MCP 主流 stdio 实现使用 JSONL；兼容部分通用 JSON-RPC 进程使用的
+            // Content-Length 头，避免把头部当作工具结果而一直等待。
+            if first.to_ascii_lowercase().starts_with("content-length:") {
+                let length = first
+                    .split_once(':')
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .ok_or_else(|| AppError::Mcp("MCP Content-Length 头格式不正确".to_string()))?;
+                let mut header = String::new();
+                loop {
+                    header.clear();
+                    let count = reader
+                        .read_line(&mut header)
+                        .await
+                        .map_err(|error| AppError::Mcp(error.to_string()))?;
+                    if count == 0 {
+                        return Err(AppError::Mcp(
+                            "MCP 在 Content-Length 消息结束前关闭了进程".to_string(),
+                        ));
+                    }
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0_u8; length];
+                reader
+                    .read_exact(&mut body)
+                    .await
+                    .map_err(|error| AppError::Mcp(format!("MCP 消息正文读取未完成：{error}")))?;
+                return serde_json::from_slice::<Value>(&body)
+                    .map_err(|error| AppError::Mcp(format!("MCP 返回不是 JSON：{error}")));
+            }
+
+            if let Ok(value) = serde_json::from_str::<Value>(first) {
+                return Ok(value);
+            }
+            // 允许服务把诊断文本误写到 stdout；找到下一条 JSON-RPC 消息后继续。
+        }
+    })
+    .await
+    .map_err(|_| AppError::Mcp("MCP 响应超过 30 秒仍未返回".to_string()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn scan_project_counts_source_objects() {
+        let directory = tempfile::tempdir().expect("创建临时工程目录");
+        fs::write(directory.path().join("MAIN.st"), "PROGRAM MAIN").expect("写入 ST");
+        fs::write(directory.path().join("Safety.gvl"), "VAR_GLOBAL END_VAR").expect("写入 GVL");
+        fs::write(directory.path().join("Machine.project"), "CODESYS 3.5.22").expect("写入工程");
+        let scanned = scan_project_context(ProjectContext {
+            path: Some(directory.path().to_string_lossy().to_string()),
+            exists: true,
+            ..ProjectContext::default()
+        });
+        assert_eq!(scanned.scan_status, "scanned");
+        assert_eq!(scanned.file_count, 3);
+        assert!(scanned.pou_count >= 2);
+        assert!(scanned
+            .source_files
+            .iter()
+            .any(|file| file.ends_with("MAIN.st")));
+    }
+
+    #[test]
+    fn http_parser_accepts_json_and_sse() {
+        assert_eq!(
+            parse_http_json(r#"{"result":{"ok":true}}"#).unwrap()["result"]["ok"],
+            true
+        );
+        assert_eq!(
+            parse_http_json("event: message\ndata: {\"ok\":true}\n\n").unwrap()["ok"],
+            true
+        );
+    }
+
+    #[test]
+    fn command_catalog_contains_safety_and_compaction() {
+        let commands = available_commands();
+        assert!(commands
+            .iter()
+            .any(|item| item.command == "/compact" && item.supports_args));
+        assert!(commands
+            .iter()
+            .any(|item| item.command == "/approve" && item.category == "safety"));
+    }
+
+    #[test]
+    fn dangerous_tool_names_are_blocked() {
+        assert!(is_forbidden_tool("plc_run"));
+        assert!(is_forbidden_tool("write_variable"));
+        assert!(!is_forbidden_tool("read_project_tree"));
+    }
+
+    #[test]
+    fn forbidden_tools_are_checked_before_mutation_rules() {
+        assert!(is_forbidden_tool("plc_stop"));
+        assert!(!is_mutating_tool("plc_stop"));
+    }
+
+    #[test]
+    fn request_options_are_normalized_for_agent_execution() {
+        let request = AgentRequest {
+            message: "检查 MAIN.st".to_string(),
+            model: Some("  local-st\n".to_string()),
+            reasoning_effort: Some("none".to_string()),
+            collaboration_mode: Some("PLAN".to_string()),
+            skills: vec!["builtin://plc-safety".to_string()],
+            ..AgentRequest::default()
+        };
+        let model = model_for_request(&ModelConfig::default(), &request).expect("合并本轮模型");
+        assert_eq!(model.model, "local-st");
+        assert!(request_is_plan_mode(&request));
+        assert_eq!(request_thinking_level(&request), "off");
+    }
+
+    #[test]
+    fn selected_skill_is_present_in_request_prompt() {
+        let request = AgentRequest {
+            message: "审查互锁".to_string(),
+            skills: vec!["builtin://plc-safety".to_string()],
+            ..AgentRequest::default()
+        };
+        let prompt = build_agent_system_prompt(&ProjectContext::default(), &request);
+        assert!(prompt.contains("本轮重点应用 Skills：plc-safety"));
+        assert!(prompt.contains("PLC 安全约束"));
+    }
+
+    #[test]
+    fn bridge_snapshot_accepts_status_and_error_fields() {
+        let snapshot: CodesysBridgeSnapshot = serde_json::from_value(json!({
+            "status": "error",
+            "updated_at": "2026-08-31T00:00:00Z",
+            "error": "没有打开工程"
+        }))
+        .expect("解析 Bridge 快照");
+        assert_eq!(snapshot.status.as_deref(), Some("error"));
+        assert_eq!(snapshot.error.as_deref(), Some("没有打开工程"));
+    }
+
+    #[test]
+    fn bridge_source_root_policy_rejects_untrusted_directory() {
+        let directory = tempfile::tempdir().expect("创建临时目录");
+        assert!(!is_allowed_bridge_source_root(directory.path()));
+    }
+
+    #[test]
+    fn session_parser_restores_messages_and_name() {
+        let directory = tempfile::tempdir().expect("创建临时会话目录");
+        let path = directory.path().join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"session-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/plc\"}\n",
+                "{\"type\":\"session_info\",\"id\":\"info-1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"name\":\"泵站诊断\"}\n",
+                "{\"type\":\"message\",\"id\":\"user-1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":\"检查 MAIN\"}}\n",
+                "{\"type\":\"message\",\"id\":\"assistant-1\",\"parentId\":\"user-1\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"已读取工程。\"}]}}\n",
+                "{\"type\":\"message\",\"id\":\"tool-1\",\"parentId\":\"assistant-1\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"message\":{\"role\":\"toolResult\",\"content\":\"内部结果\"}}\n"
+            ),
+        )
+        .expect("写入会话文件");
+        let record = parse_session_record(&path).expect("解析会话文件");
+        assert_eq!(record.session_id, "session-1");
+        assert_eq!(record.name.as_deref(), Some("泵站诊断"));
+        assert_eq!(record.message_count, 2);
+        assert_eq!(record.messages[0].content, "检查 MAIN");
+        assert_eq!(record.messages[1].content, "已读取工程。");
+    }
+
+    #[test]
+    fn builtin_tool_catalog_uses_plc_namespace_and_marks_edits() {
+        let tools = builtin_tools();
+        assert!(tools.iter().any(|tool| tool.name == "project_snapshot"));
+        assert_eq!(
+            qualify_tool(BUILTIN_SERVER_ID, "read_st_source"),
+            "plc__read_st_source"
+        );
+        assert!(is_mutating_tool("propose_edit"));
+    }
+
+    #[test]
+    fn static_diagnostics_detect_unclosed_structured_text_blocks() {
+        let directory = tempfile::tempdir().expect("创建临时工程目录");
+        fs::write(
+            directory.path().join("MAIN.st"),
+            "PROGRAM MAIN\nIF Enable THEN\n  Output := TRUE;\nEND_PROGRAM\n",
+        )
+        .expect("写入异常 ST");
+        let project = ProjectContext {
+            path: Some(directory.path().to_string_lossy().to_string()),
+            exists: true,
+            ..ProjectContext::default()
+        };
+        let (diagnostics, source_count) =
+            static_project_diagnostics(&project).expect("执行静态诊断");
+        assert_eq!(source_count, 1);
+        assert!(diagnostics
+            .iter()
+            .any(|item| item.code.as_deref() == Some("PLC004")));
+    }
+
+    #[test]
+    fn approved_builtin_edit_can_be_undone_without_overwriting_external_changes() {
+        let directory = tempfile::tempdir().expect("创建临时工程目录");
+        let source = directory.path().join("MAIN.st");
+        fs::write(&source, "PROGRAM MAIN\nEND_PROGRAM\n").expect("写入 ST");
+        let state = AppState {
+            inner: Arc::new(Mutex::new(RuntimeState {
+                project: ProjectContext {
+                    path: Some(directory.path().to_string_lossy().to_string()),
+                    exists: true,
+                    ..ProjectContext::default()
+                },
+                ..RuntimeState::default()
+            })),
+            agent_runs: Arc::new(Mutex::new(())),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("创建测试运行时");
+        let summary = runtime
+            .block_on(propose_builtin_edit(
+                &state,
+                json!({
+                    "path": "MAIN.st",
+                    "find": "END_PROGRAM",
+                    "replace": "  Value := TRUE;\nEND_PROGRAM",
+                    "reason": "补充默认输出"
+                }),
+            ))
+            .expect("生成待审批 Diff");
+        let pending = runtime.block_on(async {
+            state
+                .inner
+                .lock()
+                .await
+                .pending
+                .get(&summary.id)
+                .cloned()
+                .expect("读取待审批动作")
+        });
+        let approved = runtime
+            .block_on(apply_builtin_pending_change(&state, &pending))
+            .expect("批准并写入工程");
+        assert!(!approved.is_error);
+        assert!(fs::read_to_string(&source)
+            .expect("读取已写入 ST")
+            .contains("Value := TRUE"));
+        let undone = runtime
+            .block_on(update_thread_file_changes_inner(
+                FileChangesRequest {
+                    thread_id: "".to_string(),
+                    turn_id: "".to_string(),
+                    cwd: directory.path().to_string_lossy().to_string(),
+                    action: "undo".to_string(),
+                    patch_ids: vec![summary.id.clone()],
+                    scope: Some("single_turn".to_string()),
+                },
+                &state,
+            ))
+            .expect("撤回工程补丁");
+        assert_eq!(undone.changed, 1);
+        assert_eq!(
+            fs::read_to_string(&source).expect("读取撤回后的 ST"),
+            "PROGRAM MAIN\nEND_PROGRAM\n"
+        );
+    }
+
+    #[test]
+    fn ambiguous_rollback_refuses_to_touch_multiple_patches() {
+        let directory = tempfile::tempdir().expect("创建临时工程目录");
+        let first = directory.path().join("MAIN.st");
+        let second = directory.path().join("GVL.gvl");
+        fs::write(&first, "PROGRAM MAIN\nValue := TRUE;\nEND_PROGRAM\n").expect("写入第一个文件");
+        fs::write(&second, "VAR_GLOBAL\n  Ready : BOOL := TRUE;\nEND_VAR\n")
+            .expect("写入第二个文件");
+        let first_path = fs::canonicalize(&first).expect("解析第一个文件路径");
+        let second_path = fs::canonicalize(&second).expect("解析第二个文件路径");
+
+        let mut patches = HashMap::new();
+        patches.insert(
+            "patch-one".to_string(),
+            AppliedFilePatch {
+                id: "patch-one".to_string(),
+                thread_id: "thread-one".to_string(),
+                turn_id: "turn-one".to_string(),
+                path: first_path.to_string_lossy().to_string(),
+                before: "PROGRAM MAIN\nEND_PROGRAM\n".to_string(),
+                after: "PROGRAM MAIN\nValue := TRUE;\nEND_PROGRAM\n".to_string(),
+                active: true,
+            },
+        );
+        patches.insert(
+            "patch-two".to_string(),
+            AppliedFilePatch {
+                id: "patch-two".to_string(),
+                thread_id: "thread-two".to_string(),
+                turn_id: "turn-two".to_string(),
+                path: second_path.to_string_lossy().to_string(),
+                before: "VAR_GLOBAL\nEND_VAR\n".to_string(),
+                after: "VAR_GLOBAL\n  Ready : BOOL := TRUE;\nEND_VAR\n".to_string(),
+                active: true,
+            },
+        );
+
+        let state = AppState {
+            inner: Arc::new(Mutex::new(RuntimeState {
+                project: ProjectContext {
+                    path: Some(directory.path().to_string_lossy().to_string()),
+                    exists: true,
+                    ..ProjectContext::default()
+                },
+                patches,
+                ..RuntimeState::default()
+            })),
+            agent_runs: Arc::new(Mutex::new(())),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("创建测试运行时");
+        let result = runtime.block_on(update_thread_file_changes_inner(
+            FileChangesRequest {
+                thread_id: "missing-thread".to_string(),
+                turn_id: "missing-turn".to_string(),
+                cwd: directory.path().to_string_lossy().to_string(),
+                action: "undo".to_string(),
+                patch_ids: Vec::new(),
+                scope: Some("single_turn".to_string()),
+            },
+            &state,
+        ));
+
+        assert!(matches!(result, Err(AppError::Configuration(_))));
+        assert_eq!(
+            fs::read_to_string(&first).expect("读取第一个文件"),
+            "PROGRAM MAIN\nValue := TRUE;\nEND_PROGRAM\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&second).expect("读取第二个文件"),
+            "VAR_GLOBAL\n  Ready : BOOL := TRUE;\nEND_VAR\n"
+        );
+    }
+}

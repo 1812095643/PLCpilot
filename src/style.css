@@ -1,0 +1,793 @@
+@import "tailwindcss";
+@import "highlight.js/styles/github-dark.css";
+
+/* 全局只保留桌面壳层需要的基础规则；功能组件的样式放在各自的 scoped SFC 中。 */
+:root {
+  color-scheme: light;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f7f6f2;
+  color: #24211e;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+:root.dark {
+  color-scheme: dark;
+  background: #181716;
+  color: #f4f1eb;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+html,
+body {
+  overflow: hidden;
+}
+
+body {
+  min-width: 320px;
+  background: #f7f6f2;
+}
+
+:root.dark body {
+  background: #181716;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+@media (max-width: 768px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+}
+
+/*
+ * 主题兜底层
+ *
+ * 部分历史 SFC 使用了 `:global(:root.dark) .class`。在当前 Tailwind/Vue
+ * 编译链中，这种写法会被展开成只命中 :root.dark 的规则，导致组件本身
+ * 仍停留在浅色背景。这里集中使用普通全局选择器，并提高选择器优先级，
+ * 让桌面壳层和浮层在黑白主题之间真正成套切换，同时不改变组件行为。
+ */
+
+:root {
+  --plc-light-bg: #f7f6f2;
+  --plc-light-surface: #fffdf9;
+  --plc-light-text: #24211e;
+  --plc-light-muted: #77716a;
+  --plc-dark-bg: #181716;
+  --plc-dark-sidebar: #20201e;
+  --plc-dark-surface: #242321;
+  --plc-dark-surface-raised: #2a2825;
+  --plc-dark-input: #1f1e1c;
+  --plc-dark-border: rgba(235, 230, 220, 0.14);
+  --plc-dark-divider: rgba(235, 230, 220, 0.09);
+  --plc-dark-text: #f2eee7;
+  --plc-dark-muted: #a8a198;
+  --plc-dark-subtle: #77716a;
+  --plc-dark-accent: #d7a257;
+}
+
+html:root.dark,
+html:root.dark body,
+html:root.dark #app {
+  background-color: var(--plc-dark-bg) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+/* 桌面壳层、侧栏和主内容 */
+html:root.dark .desktop-layout,
+html:root.dark .desktop-main,
+html:root.dark .plc-content {
+  background-color: var(--plc-dark-bg) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .desktop-sidebar,
+html:root.dark .plc-sidebar,
+html:root.dark .mobile-drawer {
+  background-color: var(--plc-dark-sidebar) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .desktop-resize-handle {
+  background-color: #3b3935 !important;
+}
+
+html:root.dark .content-header {
+  background-color: var(--plc-dark-bg) !important;
+  border-color: var(--plc-dark-divider) !important;
+}
+
+html:root.dark .content-title,
+html:root.dark .content-title.is-accent,
+html:root.dark .plc-header-action,
+html:root.dark .plc-sidebar,
+html:root.dark .plc-sidebar button {
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-header-action,
+html:root.dark .plc-sidebar-icon-button {
+  border-color: transparent !important;
+  background-color: transparent !important;
+  color: var(--plc-dark-muted) !important;
+}
+
+html:root.dark .plc-header-action:hover,
+html:root.dark .plc-sidebar-icon-button:hover {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface-raised) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-sidebar-rule {
+  background-color: var(--plc-dark-divider) !important;
+}
+
+html:root.dark .plc-sidebar-label,
+html:root.dark .plc-brand-copy small,
+html:root.dark .plc-project-copy small,
+html:root.dark .plc-session-copy small,
+html:root.dark .plc-sidebar-link small,
+html:root.dark .plc-empty-side {
+  color: var(--plc-dark-subtle) !important;
+}
+
+html:root.dark .plc-brand-mark {
+  background-color: #eee8df !important;
+  color: #24211e !important;
+}
+
+html:root.dark .plc-brand-row:hover,
+html:root.dark .plc-project-row:hover,
+html:root.dark .plc-session-row:hover,
+html:root.dark .plc-sidebar-link:hover,
+html:root.dark .plc-sidebar-link.is-active,
+html:root.dark .plc-session-row.is-active {
+  background-color: var(--plc-dark-surface-raised) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-sidebar-link {
+  color: #c9c2b8 !important;
+}
+
+/* 工程概览、Skills、诊断和工具列表 */
+html:root.dark .plc-detail-layout {
+  background-color: var(--plc-dark-bg) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-detail-section {
+  background-color: var(--plc-dark-surface) !important;
+  border: 1px solid var(--plc-dark-border) !important;
+  color: var(--plc-dark-text) !important;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.22) !important;
+}
+
+html:root.dark .plc-section-heading h2,
+html:root.dark .plc-modal-heading h2,
+html:root.dark .plc-fact-grid strong,
+html:root.dark .plc-skill-card strong,
+html:root.dark .plc-command-row strong,
+html:root.dark .plc-settings-group-title,
+html:root.dark .plc-diagnostic-list strong,
+html:root.dark .plc-safety-note h2 {
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-section-meta,
+html:root.dark .plc-fact-grid span,
+html:root.dark .plc-file-list li,
+html:root.dark .plc-tool-list small,
+html:root.dark .plc-skill-card small,
+html:root.dark .plc-diagnostic-list small,
+html:root.dark .plc-safety-note p:last-child {
+  color: var(--plc-dark-muted) !important;
+}
+
+html:root.dark .plc-project-picker input,
+html:root.dark .plc-settings-group input,
+html:root.dark .plc-settings-group select {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-input) !important;
+  color: var(--plc-dark-text) !important;
+  caret-color: var(--plc-dark-accent);
+}
+
+html:root.dark .plc-project-picker input::placeholder,
+html:root.dark .plc-settings-group input::placeholder {
+  color: var(--plc-dark-subtle) !important;
+}
+
+html:root.dark .plc-project-picker input:focus,
+html:root.dark .plc-settings-group input:focus,
+html:root.dark .plc-settings-group select:focus {
+  border-color: rgba(215, 162, 87, 0.72) !important;
+  background-color: var(--plc-dark-surface-raised) !important;
+  box-shadow: 0 0 0 3px rgba(215, 162, 87, 0.14) !important;
+}
+
+html:root.dark .plc-fact-grid {
+  background-color: #3a3732 !important;
+}
+
+html:root.dark .plc-fact-grid > div {
+  background-color: var(--plc-dark-surface) !important;
+}
+
+html:root.dark .plc-file-list,
+html:root.dark .plc-tool-list,
+html:root.dark .plc-diagnostic-list {
+  border-color: var(--plc-dark-divider) !important;
+  background-color: var(--plc-dark-surface) !important;
+}
+
+html:root.dark .plc-file-list li,
+html:root.dark .plc-tool-list li,
+html:root.dark .plc-diagnostic-list li,
+html:root.dark .plc-command-row,
+html:root.dark .plc-settings-group {
+  border-color: var(--plc-dark-divider) !important;
+}
+
+html:root.dark .plc-file-list code,
+html:root.dark .plc-tool-list code {
+  color: #ded7cd !important;
+}
+
+html:root.dark .plc-inline-note {
+  background-color: rgba(122, 78, 17, 0.28) !important;
+  color: #e7bd78 !important;
+}
+
+html:root.dark .plc-skill-card {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface-raised) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-skill-card:hover {
+  border-color: rgba(215, 162, 87, 0.58) !important;
+  background-color: #332e27 !important;
+}
+
+html:root.dark .plc-skill-arrow {
+  color: #756e65 !important;
+}
+
+html:root.dark .plc-tool-list li > span[data-mutating='true'] {
+  background-color: rgba(122, 78, 17, 0.36) !important;
+  color: #efc982 !important;
+}
+
+html:root.dark .plc-tool-list li > span:not([data-mutating='true']) {
+  background-color: rgba(27, 103, 70, 0.32) !important;
+  color: #9ad7b1 !important;
+}
+
+html:root.dark .plc-diagnostic-list li[data-severity='error'] > span {
+  background-color: rgba(127, 29, 29, 0.42) !important;
+  color: #ffb4ae !important;
+}
+
+html:root.dark .plc-diagnostic-list li[data-severity='warning'] > span {
+  background-color: rgba(122, 78, 17, 0.42) !important;
+  color: #f2ca7c !important;
+}
+
+html:root.dark .plc-diagnostic-list li[data-severity='info'] > span {
+  background-color: #35322e !important;
+  color: #c8c0b6 !important;
+}
+
+/* 审批条、按钮和浮层 */
+html:root.dark .plc-approval-strip {
+  border-color: rgba(215, 162, 87, 0.38) !important;
+  background-color: rgba(122, 78, 17, 0.24) !important;
+}
+
+html:root.dark .plc-approval-heading {
+  color: #edc47d !important;
+}
+
+html:root.dark .plc-approval-heading span:last-child {
+  background-color: rgba(215, 162, 87, 0.32) !important;
+  color: #f0c984 !important;
+}
+
+html:root.dark .plc-approval-card {
+  background-color: var(--plc-dark-surface) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-approval-copy strong {
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-approval-copy small,
+html:root.dark .plc-approval-copy code,
+html:root.dark .plc-approval-diff {
+  color: var(--plc-dark-muted) !important;
+}
+
+html:root.dark .plc-button-primary {
+  background-color: #eee8df !important;
+  color: #24211e !important;
+}
+
+html:root.dark .plc-button-primary:hover:not(:disabled) {
+  background-color: var(--plc-dark-accent) !important;
+  color: #24211e !important;
+}
+
+html:root.dark .plc-button-quiet,
+html:root.dark .plc-theme-choice {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface-raised) !important;
+  color: #ded7cd !important;
+}
+
+html:root.dark .plc-button-quiet:hover:not(:disabled),
+html:root.dark .plc-theme-choice:hover {
+  border-color: rgba(215, 162, 87, 0.54) !important;
+  background-color: #332e27 !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-theme-choice.is-active {
+  border-color: #eee8df !important;
+  background-color: #eee8df !important;
+  color: #24211e !important;
+}
+
+html:root.dark .plc-link-button {
+  color: #e3ae62 !important;
+}
+
+html:root.dark .plc-link-button:hover {
+  color: #f0c984 !important;
+}
+
+html:root.dark .plc-overlay {
+  background-color: rgba(0, 0, 0, 0.66) !important;
+}
+
+html:root.dark .plc-command-palette,
+html:root.dark .plc-settings-modal,
+html:root.dark .plc-skill-modal {
+  border: 1px solid var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface) !important;
+  color: var(--plc-dark-text) !important;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.46) !important;
+}
+
+html:root.dark .plc-close-button {
+  color: var(--plc-dark-muted) !important;
+}
+
+html:root.dark .plc-close-button:hover {
+  background-color: var(--plc-dark-surface-raised) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-command-row {
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-command-row:hover {
+  background-color: #332e27 !important;
+}
+
+html:root.dark .plc-command-row code {
+  color: #e3ae62 !important;
+}
+
+html:root.dark .plc-command-row small,
+html:root.dark .plc-command-row kbd,
+html:root.dark .plc-settings-group label,
+html:root.dark .plc-settings-theme > span {
+  color: var(--plc-dark-muted) !important;
+}
+
+html:root.dark .plc-skill-content {
+  background-color: #111110 !important;
+  color: #e9e3da !important;
+}
+
+html:root.dark .plc-toast {
+  background-color: #eee8df !important;
+  color: #24211e !important;
+}
+
+/* 对话流、命令记录、Diff 和消息 Markdown */
+html:root.dark .conversation-root,
+html:root.dark .conversation-list {
+  background-color: var(--plc-dark-bg) !important;
+}
+
+html:root.dark .conversation-loading,
+html:root.dark .conversation-empty,
+html:root.dark .live-overlay-label,
+html:root.dark .live-overlay-reasoning,
+html:root.dark .message-text,
+html:root.dark .message-heading,
+html:root.dark .message-list,
+html:root.dark .message-list-item,
+html:root.dark .message-blockquote,
+html:root.dark .worked-separator-text {
+  color: #e9e3da !important;
+}
+
+html:root.dark .live-overlay-error,
+html:root.dark .live-overlay-guidance,
+html:root.dark .turn-error-guidance {
+  color: #ffaaa3 !important;
+}
+
+html:root.dark .message-card[data-role='user'] {
+  background-color: #35312c !important;
+  color: #f2eee7 !important;
+}
+
+html:root.dark .message-copy-button,
+html:root.dark .file-change-action-button,
+html:root.dark .plan-card-implement-button {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface-raised) !important;
+  color: #d8d0c6 !important;
+}
+
+html:root.dark .message-copy-button:hover,
+html:root.dark .file-change-action-button:hover,
+html:root.dark .plan-card-implement-button:hover {
+  border-color: rgba(215, 162, 87, 0.54) !important;
+  background-color: #332e27 !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .message-copy-button[data-copied='true'] {
+  border-color: rgba(74, 151, 112, 0.55) !important;
+  background-color: rgba(27, 103, 70, 0.34) !important;
+  color: #a5dcb9 !important;
+}
+
+html:root.dark .message-skill-chip {
+  border-color: rgba(74, 151, 112, 0.55) !important;
+  background-color: rgba(27, 103, 70, 0.32) !important;
+  color: #b5e4c5 !important;
+}
+
+html:root.dark .message-skill-chip-prefix {
+  color: #9ad7b1 !important;
+}
+
+html:root.dark .worked-separator-line,
+html:root.dark .message-divider {
+  background-color: var(--plc-dark-divider) !important;
+}
+
+html:root.dark .cmd-row {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface) !important;
+  color: #ded7cd !important;
+}
+
+html:root.dark .cmd-row:hover {
+  background-color: var(--plc-dark-surface-raised) !important;
+}
+
+html:root.dark .cmd-row.cmd-row-group {
+  border-color: rgba(215, 162, 87, 0.42) !important;
+  background-color: rgba(122, 78, 17, 0.22) !important;
+  color: #e8bd78 !important;
+}
+
+html:root.dark .cmd-label,
+html:root.dark .cmd-group-label {
+  color: #ded7cd !important;
+}
+
+html:root.dark .cmd-chevron,
+html:root.dark .worked-chevron,
+html:root.dark .file-change-arrow {
+  color: #81796f !important;
+}
+
+html:root.dark .cmd-status-running .cmd-status {
+  color: #efc477 !important;
+}
+
+html:root.dark .cmd-status-ok .cmd-status {
+  color: #91d0a9 !important;
+}
+
+html:root.dark .cmd-status-error .cmd-status {
+  color: #ffaaa3 !important;
+}
+
+html:root.dark .cmd-output-wrap,
+html:root.dark .cmd-output {
+  background-color: #111110 !important;
+}
+
+html:root.dark .cmd-output {
+  color: #ded7cd !important;
+}
+
+html:root.dark .file-change-list {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface) !important;
+}
+
+html:root.dark .file-change-item,
+html:root.dark .file-change-summary-label {
+  color: #ded7cd !important;
+}
+
+html:root.dark .file-change-path-button,
+html:root.dark .message-file-link {
+  color: #e3ae62 !important;
+}
+
+html:root.dark .file-change-path-button:hover,
+html:root.dark .message-file-link:hover {
+  color: #f0c984 !important;
+}
+
+html:root.dark .file-change-delta {
+  background-color: #35322e !important;
+  color: #c8c0b6 !important;
+}
+
+html:root.dark .file-change-action-error {
+  color: #ffaaa3 !important;
+}
+
+html:root.dark .plan-card {
+  border-color: rgba(84, 135, 164, 0.58) !important;
+  background-color: #1d2a33 !important;
+  color: #e5edf2 !important;
+}
+
+html:root.dark .plan-card-title,
+html:root.dark .plan-card-markdown :is(.message-heading, .message-bold-text) {
+  color: #d8edf8 !important;
+}
+
+html:root.dark .plan-card-explanation,
+html:root.dark .plan-card-markdown :is(.message-text, .message-list, .message-blockquote),
+html:root.dark .plan-step-item,
+html:root.dark .plan-step-text {
+  color: #c8d8e1 !important;
+}
+
+html:root.dark .plan-card-badge {
+  background-color: rgba(84, 135, 164, 0.38) !important;
+  color: #c4e7fa !important;
+}
+
+html:root.dark .plan-step-item {
+  border-color: rgba(235, 230, 220, 0.13) !important;
+  background-color: rgba(42, 40, 37, 0.82) !important;
+}
+
+html:root.dark .plan-step-item[data-status='completed'] {
+  border-color: rgba(74, 151, 112, 0.46) !important;
+  background-color: rgba(27, 103, 70, 0.25) !important;
+}
+
+html:root.dark .plan-step-item[data-status='inProgress'] {
+  border-color: rgba(215, 162, 87, 0.46) !important;
+  background-color: rgba(122, 78, 17, 0.24) !important;
+}
+
+html:root.dark .message-table {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface) !important;
+  color: #ded7cd !important;
+}
+
+html:root.dark .message-table-head-cell {
+  border-color: var(--plc-dark-divider) !important;
+  background-color: var(--plc-dark-surface-raised) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .message-table-cell {
+  border-color: var(--plc-dark-divider) !important;
+  color: #ded7cd !important;
+}
+
+html:root.dark .message-blockquote {
+  border-left-color: rgba(215, 162, 87, 0.56) !important;
+  background-color: rgba(42, 40, 37, 0.72) !important;
+}
+
+/* Diff 查看器 */
+html:root.dark .diff-viewer-shell,
+html:root.dark .diff-viewer-main {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface) !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .diff-viewer-sidebar,
+html:root.dark .diff-viewer-meta {
+  border-color: var(--plc-dark-divider) !important;
+  background-color: var(--plc-dark-input) !important;
+}
+
+html:root.dark .diff-viewer-sidebar-header,
+html:root.dark .diff-viewer-toolbar,
+html:root.dark .diff-viewer-mobile-sheet-header {
+  border-color: var(--plc-dark-divider) !important;
+}
+
+html:root.dark .diff-viewer-sidebar-title,
+html:root.dark .diff-viewer-title,
+html:root.dark .diff-viewer-empty-title,
+html:root.dark .diff-viewer-file-label {
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .diff-viewer-sidebar-count,
+html:root.dark .diff-viewer-subtitle,
+html:root.dark .diff-viewer-empty-text {
+  color: var(--plc-dark-muted) !important;
+}
+
+html:root.dark .diff-viewer-file-button:hover,
+html:root.dark .diff-viewer-file-button[data-active='true'] {
+  border-color: rgba(215, 162, 87, 0.44) !important;
+  background-color: var(--plc-dark-surface-raised) !important;
+}
+
+html:root.dark .diff-viewer-file-delta,
+html:root.dark .diff-viewer-language,
+html:root.dark .diff-viewer-mobile-files-button {
+  border-color: var(--plc-dark-border) !important;
+  background-color: #35322e !important;
+  color: #c8c0b6 !important;
+}
+
+html:root.dark .diff-viewer-close {
+  background-color: #35322e !important;
+  color: #ded7cd !important;
+}
+
+html:root.dark .diff-viewer-mobile-sheet {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface) !important;
+}
+
+/* Composer 和文件/Skill 下拉 */
+html:root.dark .plc-composer-shell {
+  --composer-bg: var(--plc-dark-input) !important;
+  --composer-border: var(--plc-dark-border) !important;
+  --composer-text: var(--plc-dark-text) !important;
+  --composer-muted: var(--plc-dark-muted) !important;
+  --composer-soft: var(--plc-dark-divider) !important;
+  background-color: var(--plc-dark-input) !important;
+  border-color: var(--plc-dark-border) !important;
+  color: var(--plc-dark-text) !important;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.24), 0 14px 34px rgba(0, 0, 0, 0.28) !important;
+}
+
+html:root.dark .plc-composer-shell:focus-within {
+  border-color: rgba(215, 162, 87, 0.68) !important;
+  box-shadow: 0 0 0 3px rgba(215, 162, 87, 0.14), 0 14px 34px rgba(0, 0, 0, 0.28) !important;
+}
+
+html:root.dark .plc-composer-input {
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-composer-input::placeholder,
+html:root.dark .plc-composer-hint,
+html:root.dark .plc-context-indicator,
+html:root.dark .plc-composer-options :is(.composer-dropdown-trigger, .search-dropdown-trigger) {
+  color: var(--plc-dark-muted) !important;
+}
+
+html:root.dark .plc-composer-options :is(.composer-dropdown-trigger:hover, .search-dropdown-trigger:hover) {
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .plc-composer-submit {
+  background-color: #eee8df !important;
+  color: #24211e !important;
+}
+
+html:root.dark .plc-composer-stop {
+  background-color: #35322e !important;
+  color: #c8c0b6 !important;
+}
+
+html:root.dark .plc-composer-submit:hover:not(:disabled),
+html:root.dark .plc-composer-stop:hover {
+  background-color: var(--plc-dark-accent) !important;
+  color: #24211e !important;
+}
+
+html:root.dark .plc-composer-chip {
+  background-color: rgba(196, 140, 57, 0.22) !important;
+  color: #e9ba72 !important;
+}
+
+html:root.dark .plc-file-mention-menu,
+html:root.dark .composer-dropdown-menu,
+html:root.dark .search-dropdown-menu-wrap-up,
+html:root.dark .search-dropdown-menu-wrap-down {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface) !important;
+  color: var(--plc-dark-text) !important;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.44) !important;
+}
+
+html:root.dark .plc-file-mention-row,
+html:root.dark .search-dropdown-option,
+html:root.dark .composer-dropdown-option {
+  color: #ded7cd !important;
+}
+
+html:root.dark .plc-file-mention-row:hover,
+html:root.dark .plc-file-mention-row.is-highlighted,
+html:root.dark .search-dropdown-option.is-highlighted,
+html:root.dark .search-dropdown-option-main:hover,
+html:root.dark .composer-dropdown-option:hover,
+html:root.dark .composer-dropdown-option.is-selected {
+  background-color: var(--plc-dark-surface-raised) !important;
+}
+
+html:root.dark .plc-file-mention-empty,
+html:root.dark .search-dropdown-empty,
+html:root.dark .composer-dropdown-empty,
+html:root.dark .search-dropdown-option-desc,
+html:root.dark .search-dropdown-option-type {
+  color: var(--plc-dark-muted) !important;
+}
+
+html:root.dark .search-dropdown-search-wrap {
+  border-color: var(--plc-dark-divider) !important;
+}
+
+html:root.dark .search-dropdown-search,
+html:root.dark .composer-dropdown-search-input {
+  border-color: var(--plc-dark-border) !important;
+  background-color: #111110 !important;
+  color: var(--plc-dark-text) !important;
+}
+
+html:root.dark .search-dropdown-search::placeholder,
+html:root.dark .composer-dropdown-search-input::placeholder {
+  color: var(--plc-dark-subtle) !important;
+}

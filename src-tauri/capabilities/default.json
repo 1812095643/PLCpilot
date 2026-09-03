@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "PLC Pilot 默认桌面权限",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
