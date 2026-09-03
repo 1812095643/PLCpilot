@@ -831,9 +831,9 @@ onUnmounted(() => {
 :global(:root.dark) .plc-diagnostic-list strong { @apply text-zinc-100; }
 :global(:root.dark) .plc-diagnostic-list small { @apply text-zinc-500; }
 :global(:root.dark) .plc-diagnostic-list li[data-severity='error'] > span { @apply bg-rose-950 text-rose-200; }
-:global(:root.dark) .plc-diagnostic-list li[data-severity='warning'] > span { @apply bg-amber-950 text-amber-200; }
+:global(:root.dark) .plc-diagnostic-list li[data-severity='warning'] > span { background-color: var(--plc-dark-warning-bg); color: var(--plc-dark-warning); }
 :global(:root.dark) .plc-diagnostic-list li[data-severity='info'] > span { @apply bg-zinc-800 text-zinc-400; }
-:global(:root.dark) .plc-skill-card { @apply border-zinc-700 bg-zinc-800 hover:border-amber-700 hover:bg-zinc-800; }
+:global(:root.dark) .plc-skill-card { border-color: var(--plc-dark-border); background-color: var(--plc-dark-surface-raised); }
 :global(:root.dark) .plc-button-quiet, :global(:root.dark) .plc-theme-choice { @apply border-zinc-700 bg-zinc-800 text-zinc-200; }
 :global(:root.dark) .plc-toast { @apply bg-zinc-100 text-zinc-900; }
 

@@ -451,15 +451,15 @@ onBeforeUnmount(() => {
 }
 
 :global(:root.dark) .search-dropdown-option-badge.is-plugin {
-  @apply border-amber-900/70 bg-amber-950 text-amber-300;
+  @apply border-sky-900/70 bg-sky-950 text-sky-300;
 }
 
 :global(:root.dark) .search-dropdown-option-badge.is-user {
-  @apply border-emerald-900/70 bg-emerald-950 text-emerald-300;
+  @apply border-zinc-600 bg-zinc-800 text-zinc-300;
 }
 
 :global(:root.dark) .search-dropdown-option-badge.is-prompt {
-  @apply border-violet-900/70 bg-violet-950 text-violet-300;
+  @apply border-zinc-600 bg-zinc-800 text-zinc-300;
 }
 
 :global(:root.dark) .search-dropdown-option-type {

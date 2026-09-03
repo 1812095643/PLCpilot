@@ -659,21 +659,21 @@ defineExpose<ThreadComposerExposed>({
 }
 
 :global(:root.dark) .plc-composer-shell {
-  --composer-bg: #1f1e1c;
-  --composer-border: rgba(235, 230, 220, 0.16);
-  --composer-text: #f2eee7;
-  --composer-muted: #9d978e;
-  --composer-soft: rgba(235, 230, 220, 0.1);
+  --composer-bg: var(--plc-dark-input);
+  --composer-border: var(--plc-dark-border);
+  --composer-text: var(--plc-dark-text);
+  --composer-muted: var(--plc-dark-muted);
+  --composer-soft: var(--plc-dark-divider);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.22), 0 14px 34px rgba(0, 0, 0, 0.24);
 }
 
-:global(:root.dark) .plc-composer-chip { background: rgba(196, 140, 57, 0.18); color: #e9ba72; }
-:global(:root.dark) .plc-composer-submit { background: #eee8df; color: #24211e; }
-:global(:root.dark) .plc-composer-submit:hover:not(:disabled), :global(:root.dark) .plc-composer-stop:hover { background: #d7a257; color: #24211e; }
-:global(:root.dark) .plc-composer-stop { background: #35322e; color: #c5bdb1; }
-:global(:root.dark) .plc-file-mention-menu { border-color: rgba(235, 230, 220, 0.16); background: #272522; box-shadow: 0 18px 46px rgba(0, 0, 0, 0.42); }
-:global(:root.dark) .plc-file-mention-row { color: #e9e3da; }
-:global(:root.dark) .plc-file-mention-row:hover, :global(:root.dark) .plc-file-mention-row.is-highlighted { background: #35312c; }
-:global(:root.dark) .plc-file-mention-empty { color: #9d978e; }
-:global(:root.dark) .plc-plan-note { color: #d6ab6a; }
+:global(:root.dark) .plc-composer-chip { background: rgba(0, 122, 204, 0.18); color: #9cdcfe; }
+:global(:root.dark) .plc-composer-submit { background: #0e639c; color: #ffffff; }
+:global(:root.dark) .plc-composer-submit:hover:not(:disabled), :global(:root.dark) .plc-composer-stop:hover { background: var(--plc-dark-accent-hover); color: #ffffff; }
+:global(:root.dark) .plc-composer-stop { background: var(--plc-dark-control); color: var(--plc-dark-text); }
+:global(:root.dark) .plc-file-mention-menu { border-color: var(--plc-dark-border); background: var(--plc-dark-surface); box-shadow: 0 18px 46px rgba(0, 0, 0, 0.42); }
+:global(:root.dark) .plc-file-mention-row { color: var(--plc-dark-text); }
+:global(:root.dark) .plc-file-mention-row:hover, :global(:root.dark) .plc-file-mention-row.is-highlighted { background: #2a2d2e; }
+:global(:root.dark) .plc-file-mention-empty { color: var(--plc-dark-muted); }
+:global(:root.dark) .plc-plan-note { color: var(--plc-dark-link); }
 </style>
