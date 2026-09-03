@@ -756,6 +756,7 @@ html:root.dark .plc-composer-chip {
 }
 
 html:root.dark .plc-file-mention-menu,
+html:root.dark .plc-slash-command-menu,
 html:root.dark .composer-dropdown-menu,
 html:root.dark .search-dropdown-menu-wrap-up,
 html:root.dark .search-dropdown-menu-wrap-down {
@@ -766,6 +767,7 @@ html:root.dark .search-dropdown-menu-wrap-down {
 }
 
 html:root.dark .plc-file-mention-row,
+html:root.dark .plc-slash-command-row,
 html:root.dark .search-dropdown-option,
 html:root.dark .composer-dropdown-option {
   color: var(--plc-dark-text) !important;
@@ -773,6 +775,8 @@ html:root.dark .composer-dropdown-option {
 
 html:root.dark .plc-file-mention-row:hover,
 html:root.dark .plc-file-mention-row.is-highlighted,
+html:root.dark .plc-slash-command-row:hover,
+html:root.dark .plc-slash-command-row.is-highlighted,
 html:root.dark .search-dropdown-option.is-highlighted,
 html:root.dark .search-dropdown-option-main:hover,
 html:root.dark .composer-dropdown-option:hover,
@@ -781,10 +785,30 @@ html:root.dark .composer-dropdown-option.is-selected {
 }
 
 html:root.dark .plc-file-mention-empty,
+html:root.dark .plc-slash-command-empty,
 html:root.dark .search-dropdown-empty,
 html:root.dark .composer-dropdown-empty,
 html:root.dark .search-dropdown-option-desc,
 html:root.dark .search-dropdown-option-type {
+  color: var(--plc-dark-muted) !important;
+}
+
+html:root.dark .plc-slash-command-menu {
+  border-color: var(--plc-dark-border) !important;
+  background-color: var(--plc-dark-surface) !important;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.24), 0 16px 34px rgba(0, 0, 0, 0.42) !important;
+}
+
+html:root.dark .plc-slash-command-row:hover,
+html:root.dark .plc-slash-command-row.is-highlighted {
+  background-color: var(--plc-dark-selection) !important;
+}
+
+html:root.dark .plc-slash-command-name {
+  color: #9cdcfe !important;
+}
+
+html:root.dark .plc-slash-command-description {
   color: var(--plc-dark-muted) !important;
 }
 

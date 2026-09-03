@@ -31,6 +31,7 @@ import {
   type AgentEvent,
   type AgentResult,
   type AgentRunOptions,
+  type CommandSummary,
   type ModelDiscoveryResult,
   type McpForm,
   type ModelForm,
@@ -90,18 +91,24 @@ const mcpForm = shallowRef<McpForm>({
   authToken: '',
 })
 
-const fallbackCommands = [
-  { command: '/help', label: '帮助', detail: '查看命令和安全边界', supports_args: false },
-  { command: '/status', label: '运行状态', detail: '工程、模型和会话状态', supports_args: false },
-  { command: '/scan', label: '扫描工程', detail: '读取工程树和源对象', supports_args: false },
-  { command: '/skills', label: 'Skills', detail: '查看内置 PLC Skills', supports_args: true },
-  { command: '/mcp', label: 'MCP', detail: '查看 MCP 服务和工具', supports_args: true },
-  { command: '/tools', label: '工具目录', detail: '列出可调用工具', supports_args: false },
-  { command: '/model', label: '获取模型', detail: '从当前接口读取 /models 或 /model 列表', supports_args: false },
-  { command: '/compact', label: '压缩上下文', detail: '保留关键结论并释放上下文', supports_args: true },
-  { command: '/compile', label: '编译诊断', detail: '调用 CODESYS 编译/诊断闭环', supports_args: false },
-  { command: '/new', label: '新会话', detail: '清空当前对话，不改工程', supports_args: false },
-  { command: '/stop', label: '停止任务', detail: '停止当前工具轮次', supports_args: false },
+const fallbackCommands: CommandSummary[] = [
+  { command: '/help', label: '帮助', detail: '查看命令和安全边界', category: 'session', supports_args: false },
+  { command: '/status', label: '运行状态', detail: '工程、模型和会话状态', category: 'session', supports_args: false },
+  { command: '/sessions', label: '会话历史', detail: '列出本机保存的工作会话', category: 'session', supports_args: false },
+  { command: '/rename', label: '重命名会话', detail: '给当前会话设置一个易识别的名称', category: 'session', supports_args: true },
+  { command: '/clear', label: '清空会话', detail: '移除当前对话记录，不改工程文件', category: 'session', supports_args: false },
+  { command: '/scan', label: '扫描工程', detail: '读取工程树和源对象', category: 'project', supports_args: false },
+  { command: '/skills', label: 'Skills', detail: '查看内置 PLC Skills', category: 'tools', supports_args: true },
+  { command: '/mcp', label: 'MCP', detail: '查看 MCP 服务和工具', category: 'tools', supports_args: true },
+  { command: '/tools', label: '工具目录', detail: '列出可调用工具', category: 'tools', supports_args: false },
+  { command: '/model', label: '获取模型', detail: '从当前接口读取 /models 或 /model 列表', category: 'tools', supports_args: false },
+  { command: '/compact', label: '压缩上下文', detail: '保留关键结论并释放上下文', category: 'session', supports_args: true },
+  { command: '/compile', label: '编译诊断', detail: '调用 CODESYS 编译/诊断闭环', category: 'project', supports_args: false },
+  { command: '/diagnostics', label: '静态诊断', detail: '查看 IEC 61131-3 结构诊断和编译器执行边界', category: 'project', supports_args: false },
+  { command: '/approve', label: '批准修改', detail: '执行审批卡片中的工程写入', category: 'safety', supports_args: true },
+  { command: '/reject', label: '拒绝修改', detail: '丢弃审批卡片中的工程写入', category: 'safety', supports_args: true },
+  { command: '/new', label: '新会话', detail: '清空当前对话，不改工程', category: 'session', supports_args: false },
+  { command: '/stop', label: '停止任务', detail: '停止当前工具轮次', category: 'session', supports_args: false },
 ]
 
 const commands = computed(() => snapshot.value.commands.length > 0 ? snapshot.value.commands : fallbackCommands)
@@ -661,6 +668,7 @@ onUnmounted(() => {
             :models="modelOptions"
             :selected-model="selectedModel"
             :selected-reasoning-effort="reasoningEffort"
+            :commands="commands"
             :skills="skills"
             :thread-token-usage="tokenUsage"
             :is-turn-in-progress="isBusy"

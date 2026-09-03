@@ -6,7 +6,16 @@ import type {
   ReasoningEffort,
   UiThreadTokenUsage,
 } from '../../types/codex'
+import type { CommandSummary } from '../../api/plcBridge'
 import { searchComposerFiles, type ComposerFileSuggestion } from '../../api/codexGateway'
+import {
+  completeSlashCommand,
+  completeSlashCommandPreservingDraftTail,
+  filterSlashCommands,
+  getSlashCommandPopupState,
+  getSlashCommandToken,
+} from '../../utils/slashCommands'
+import ComposerCommandPopup from './ComposerCommandPopup.vue'
 import ComposerDropdown from './ComposerDropdown.vue'
 import ComposerSearchDropdown from './ComposerSearchDropdown.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
@@ -48,6 +57,7 @@ const props = withDefaults(defineProps<{
   models: string[]
   selectedModel: string
   selectedReasoningEffort: ReasoningEffort | ''
+  commands?: CommandSummary[]
   skills?: SkillItem[]
   threadTokenUsage?: UiThreadTokenUsage | null
   isTurnInProgress?: boolean
@@ -66,6 +76,7 @@ const props = withDefaults(defineProps<{
   disabled: false,
   sendWithEnter: true,
   inProgressSubmitMode: 'steer',
+  commands: () => [],
 })
 
 const emit = defineEmits<{
@@ -85,6 +96,11 @@ const mentionQuery = shallowRef('')
 const mentionStartIndex = shallowRef<number | null>(null)
 const mentionHighlightedIndex = shallowRef(0)
 const fileMentionSuggestions = shallowRef<ComposerFileSuggestion[]>([])
+const isSlashCommandOpen = shallowRef(false)
+const slashCommandQuery = shallowRef('')
+const slashCommandToken = shallowRef('')
+const slashHighlightedIndex = shallowRef(0)
+const dismissedSlashCommandToken = shallowRef<string | null>(null)
 
 let lastActiveThreadId = ''
 let mentionSearchTimer: ReturnType<typeof setTimeout> | null = null
@@ -152,6 +168,11 @@ const contextTitle = computed(() => {
 })
 
 const mentionVisible = computed(() => isFileMentionOpen.value && fileMentionSuggestions.value.length > 0)
+const filteredSlashCommands = computed(() => filterSlashCommands(props.commands, slashCommandQuery.value))
+const activeSlashCommandId = computed(() => {
+  const command = filteredSlashCommands.value[slashHighlightedIndex.value]
+  return command ? `plc-slash-command-${command.command.replace(/[^a-zA-Z0-9_-]/gu, '-')}` : undefined
+})
 
 function getDraftStorageKey(threadId: string): string {
   return `${DRAFT_STORAGE_PREFIX}${threadId.trim()}`
@@ -201,6 +222,8 @@ function replaceDraft(payload: ComposerDraftPayload): void {
   selectedSkills.value = payload.skills.map((item) => props.skills.find((skill) => skill.path === item.path)
     ?? { name: item.name, path: item.path, description: '' })
   closeFileMention()
+  resetSlashCommandPopup()
+  void nextTick(syncComposerPopups)
 }
 
 function clearDraft(): void {
@@ -216,7 +239,10 @@ function appendTextToDraft(text: string): void {
   const value = text.trim()
   if (!value) return
   draft.value = draft.value.trim() ? `${draft.value.trimEnd()}\n${value}` : value
-  void nextTick(() => inputRef.value?.focus())
+  void nextTick(() => {
+    inputRef.value?.focus()
+    syncComposerPopups()
+  })
 }
 
 function submitCurrent(mode: 'steer' | 'queue' = props.isTurnInProgress ? activeInProgressMode.value : 'steer'): void {
@@ -256,6 +282,7 @@ function onKeydown(event: KeyboardEvent): void {
       return
     }
   }
+  if (handleSlashCommandKeydown(event)) return
   if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey
     && props.sendWithEnter !== false) {
     event.preventDefault()
@@ -264,7 +291,172 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 function onInput(): void {
+  syncComposerPopups()
+}
+
+function onCursorChange(): void {
+  // textarea 的光标位置会在键盘或鼠标默认行为后更新，延后同步才能按真实位置判断 token。
+  void nextTick(syncComposerPopups)
+}
+
+function syncComposerPopups(): void {
   updateFileMention()
+  // 与 Codex 一致：命令参数中的 @ 引用优先于斜杠命令菜单。
+  if (isFileMentionOpen.value) {
+    closeSlashCommandPopup()
+    return
+  }
+  syncSlashCommandPopup()
+}
+
+function syncSlashCommandPopup(): void {
+  const completeToken = getSlashCommandToken(draft.value)
+  if (completeToken && dismissedSlashCommandToken.value === completeToken) {
+    closeSlashCommandPopup()
+    return
+  }
+  if (!completeToken) dismissedSlashCommandToken.value = null
+
+  const cursor = inputRef.value?.selectionStart ?? draft.value.length
+  const state = getSlashCommandPopupState(draft.value, cursor, props.commands)
+  if (!state) {
+    closeSlashCommandPopup()
+    return
+  }
+
+  dismissedSlashCommandToken.value = null
+  if (!isSlashCommandOpen.value || slashCommandQuery.value !== state.query) {
+    slashHighlightedIndex.value = 0
+  }
+  isSlashCommandOpen.value = true
+  slashCommandQuery.value = state.query
+  slashCommandToken.value = state.token
+}
+
+function closeSlashCommandPopup(): void {
+  isSlashCommandOpen.value = false
+  slashCommandQuery.value = ''
+  slashCommandToken.value = ''
+  slashHighlightedIndex.value = 0
+}
+
+function dismissSlashCommandPopup(): void {
+  dismissedSlashCommandToken.value = slashCommandToken.value || getSlashCommandToken(draft.value)
+  closeSlashCommandPopup()
+}
+
+function resetSlashCommandPopup(): void {
+  dismissedSlashCommandToken.value = null
+  closeSlashCommandPopup()
+}
+
+function moveSlashCommandHighlight(delta: number): void {
+  const length = filteredSlashCommands.value.length
+  if (length === 0) return
+  slashHighlightedIndex.value = (slashHighlightedIndex.value + delta + length) % length
+}
+
+function selectedSlashCommand(): CommandSummary | null {
+  const items = filteredSlashCommands.value
+  if (items.length === 0) return null
+  const index = ((slashHighlightedIndex.value % items.length) + items.length) % items.length
+  slashHighlightedIndex.value = index
+  return items[index] ?? null
+}
+
+function focusCommandCompletion(cursor: number): void {
+  void nextTick(() => {
+    inputRef.value?.focus()
+    inputRef.value?.setSelectionRange(cursor, cursor)
+    syncComposerPopups()
+  })
+}
+
+function completeSelectedSlashCommand(command: CommandSummary): boolean {
+  const cursor = inputRef.value?.selectionStart ?? draft.value.length
+  const preservedTail = completeSlashCommandPreservingDraftTail(draft.value, cursor, command)
+  if (preservedTail !== null) {
+    draft.value = preservedTail
+    closeSlashCommandPopup()
+    focusCommandCompletion(preservedTail.length)
+    return true
+  }
+
+  const firstLine = draft.value.split('\n', 1)[0] ?? ''
+  const completion = completeSlashCommand(firstLine, command)
+  if (completion === null) return false
+  draft.value = completion
+  closeSlashCommandPopup()
+  focusCommandCompletion(completion.length)
+  return true
+}
+
+function executeSelectedSlashCommand(command: CommandSummary): void {
+  const cursor = inputRef.value?.selectionStart ?? draft.value.length
+  const preservedTail = completeSlashCommandPreservingDraftTail(draft.value, cursor, command)
+  draft.value = preservedTail ?? (command.command.startsWith('/') ? command.command : `/${command.command}`)
+  closeSlashCommandPopup()
+  submitCurrent()
+}
+
+function onSlashCommandSelect(command: CommandSummary): void {
+  executeSelectedSlashCommand(command)
+}
+
+function handleSlashCommandKeydown(event: KeyboardEvent): boolean {
+  if (!isSlashCommandOpen.value || isFileMentionOpen.value) return false
+
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    dismissSlashCommandPopup()
+    return true
+  }
+  if (event.key === 'ArrowUp' || (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'p')) {
+    event.preventDefault()
+    event.stopPropagation()
+    moveSlashCommandHighlight(-1)
+    return true
+  }
+  if (event.key === 'ArrowDown' || (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'n')) {
+    event.preventDefault()
+    event.stopPropagation()
+    moveSlashCommandHighlight(1)
+    return true
+  }
+
+  const command = selectedSlashCommand()
+  if (event.key === 'Tab') {
+    event.preventDefault()
+    event.stopPropagation()
+    if (!command) return true
+    // Codex 对 /skills 的 Tab 有立即调度语义。
+    if (command.command === '/skills') {
+      draft.value = command.command
+      closeSlashCommandPopup()
+      submitCurrent()
+      return true
+    }
+    completeSelectedSlashCommand(command)
+    return true
+  }
+  if (event.key === '/' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+    event.preventDefault()
+    event.stopPropagation()
+    if (command) completeSelectedSlashCommand(command)
+    return true
+  }
+  if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+    if (!command) {
+      closeSlashCommandPopup()
+      return false
+    }
+    event.preventDefault()
+    event.stopPropagation()
+    executeSelectedSlashCommand(command)
+    return true
+  }
+  return false
 }
 
 function updateFileMention(): void {
@@ -318,6 +510,7 @@ function applyFileMention(item: ComposerFileSuggestion): void {
     const nextCursor = start + replacement.length
     inputRef.value?.focus()
     inputRef.value?.setSelectionRange(nextCursor, nextCursor)
+    syncComposerPopups()
   })
 }
 
@@ -347,11 +540,12 @@ function removeSkill(path: string): void {
 }
 
 function onDocumentPointerDown(event: PointerEvent): void {
-  if (!isFileMentionOpen.value) return
+  if (!isFileMentionOpen.value && !isSlashCommandOpen.value) return
   const root = composerRootRef.value
   const target = event.target
   if (!root || !(target instanceof Node) || root.contains(target)) return
   closeFileMention()
+  closeSlashCommandPopup()
 }
 
 watch(() => props.inProgressSubmitMode, (value) => {
@@ -367,6 +561,10 @@ watch(() => props.activeThreadId, (threadId) => {
 
 watch([draft, selectedSkillPaths], () => {
   if (lastActiveThreadId) persistDraft(lastActiveThreadId)
+})
+
+watch(() => props.commands, () => {
+  void nextTick(syncComposerPopups)
 })
 
 onMounted(() => {
@@ -397,6 +595,14 @@ defineExpose<ThreadComposerExposed>({
       </div>
 
       <div class="plc-composer-editor">
+        <ComposerCommandPopup
+          v-if="isSlashCommandOpen && !isFileMentionOpen"
+          :commands="commands"
+          :query="slashCommandQuery"
+          :highlighted-index="slashHighlightedIndex"
+          @select="onSlashCommandSelect"
+          @update:highlighted-index="slashHighlightedIndex = $event"
+        />
         <div v-if="isFileMentionOpen" class="plc-file-mention-menu" role="listbox" aria-label="工程文件引用">
           <button
             v-for="(item, index) in fileMentionSuggestions"
@@ -418,9 +624,16 @@ defineExpose<ThreadComposerExposed>({
           class="plc-composer-input"
           :placeholder="placeholder"
           :disabled="isInteractionDisabled"
+          :aria-expanded="isSlashCommandOpen ? 'true' : 'false'"
+          :aria-controls="isSlashCommandOpen ? 'plc-slash-command-menu' : undefined"
+          :aria-activedescendant="activeSlashCommandId"
+          aria-autocomplete="list"
           rows="3"
           @input="onInput"
           @keydown="onKeydown"
+          @keyup="onCursorChange"
+          @select="onCursorChange"
+          @click="onCursorChange"
         />
         <div class="plc-composer-hint">
           <span>Enter 发送 · Shift+Enter 换行</span>
