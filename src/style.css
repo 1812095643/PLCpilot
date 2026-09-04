@@ -117,6 +117,9 @@ html:root.dark #app {
 /* 桌面壳层、侧栏和主内容 */
 html:root.dark .desktop-layout,
 html:root.dark .desktop-main,
+html:root.dark .desktop-header,
+html:root.dark .desktop-content,
+html:root.dark .desktop-composer,
 html:root.dark .plc-content {
   background-color: var(--plc-dark-bg) !important;
   color: var(--plc-dark-text) !important;

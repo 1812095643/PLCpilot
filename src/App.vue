@@ -1189,18 +1189,20 @@ onUnmounted(() => {
       </aside>
     </template>
 
+    <template #header>
+      <ContentHeader :title="currentTitle" :accent="activeView !== 'chat'">
+        <template #leading>
+          <span class="plc-header-status" :data-state="isBusy ? 'busy' : currentProject.exists ? 'ok' : 'idle'" />
+        </template>
+        <template #actions>
+          <button class="plc-header-action" type="button" title="命令面板" aria-label="命令面板" @click="showCommandPalette = true">⌘K</button>
+          <button class="plc-header-action" type="button" title="切换主题" aria-label="切换主题" @click="theme = theme === 'dark' ? 'light' : 'dark'">{{ theme === 'dark' ? '○' : '●' }}</button>
+        </template>
+      </ContentHeader>
+    </template>
+
     <template #content>
       <section class="content-root plc-content">
-        <ContentHeader :title="currentTitle" :accent="activeView !== 'chat'">
-          <template #leading>
-            <span class="plc-header-status" :data-state="isBusy ? 'busy' : currentProject.exists ? 'ok' : 'idle'" />
-          </template>
-          <template #actions>
-            <button class="plc-header-action" type="button" title="命令面板" aria-label="命令面板" @click="showCommandPalette = true">⌘K</button>
-            <button class="plc-header-action" type="button" title="切换主题" aria-label="切换主题" @click="theme = theme === 'dark' ? 'light' : 'dark'">{{ theme === 'dark' ? '○' : '●' }}</button>
-          </template>
-        </ContentHeader>
-
         <div v-if="activeView === 'chat'" class="plc-chat-layout">
           <ThreadConversation
             ref="conversationRef"
@@ -1228,33 +1230,6 @@ onUnmounted(() => {
             </article>
           </section>
 
-          <ThreadComposer
-            ref="composerRef"
-            class="plc-composer"
-            :active-thread-id="activeThreadId"
-            :cwd="currentCwd"
-            :collaboration-modes="[{ value: 'default', label: '执行' }, { value: 'plan', label: '计划' }]"
-            :selected-collaboration-mode="collaborationMode"
-            :models="modelOptions"
-            :selected-model="selectedModel"
-            :selected-reasoning-effort="reasoningEffort"
-            :commands="commands"
-            :skills="skills"
-            :thread-token-usage="tokenUsage"
-            :is-turn-in-progress="isBusy"
-            :disabled="false"
-            :send-with-enter="true"
-            :in-progress-submit-mode="'steer'"
-            :response-annotations="pendingResponseAnnotations"
-            @submit="onSubmit"
-            @interrupt="onInterrupt"
-            @update:selected-collaboration-mode="collaborationMode = $event"
-            @update:selected-model="selectedModel = $event"
-            @update:selected-reasoning-effort="reasoningEffort = $event"
-            @update:response-annotations="pendingResponseAnnotations = $event"
-            @edit-response-annotation="onEditResponseAnnotation"
-            @remove-response-annotation="removeResponseAnnotation"
-          />
         </div>
 
         <div v-else-if="activeView === 'overview'" class="plc-detail-layout">
@@ -1275,80 +1250,111 @@ onUnmounted(() => {
         </div>
       </section>
     </template>
+
+    <template #composer>
+      <ThreadComposer
+        v-if="activeView === 'chat'"
+        ref="composerRef"
+        class="plc-composer"
+        :active-thread-id="activeThreadId"
+        :cwd="currentCwd"
+        :collaboration-modes="[{ value: 'default', label: '执行' }, { value: 'plan', label: '计划' }]"
+        :selected-collaboration-mode="collaborationMode"
+        :models="modelOptions"
+        :selected-model="selectedModel"
+        :selected-reasoning-effort="reasoningEffort"
+        :commands="commands"
+        :skills="skills"
+        :thread-token-usage="tokenUsage"
+        :is-turn-in-progress="isBusy"
+        :disabled="false"
+        :send-with-enter="true"
+        :in-progress-submit-mode="'steer'"
+        :response-annotations="pendingResponseAnnotations"
+        @submit="onSubmit"
+        @interrupt="onInterrupt"
+        @update:selected-collaboration-mode="collaborationMode = $event"
+        @update:selected-model="selectedModel = $event"
+        @update:selected-reasoning-effort="reasoningEffort = $event"
+        @update:response-annotations="pendingResponseAnnotations = $event"
+        @edit-response-annotation="onEditResponseAnnotation"
+        @remove-response-annotation="removeResponseAnnotation"
+      />
+    </template>
+    <template #overlays>
+      <div v-if="isWindowDropActive" class="plc-window-drop-overlay" role="status" aria-live="polite">
+        <IconTablerFolder />
+        <strong>松开以打开工程</strong>
+        <span>支持工程目录或 .project 文件</span>
+      </div>
+
+      <Transition name="plc-fade"><div v-if="notice" class="plc-toast" role="status">{{ notice }}</div></Transition>
+
+      <div v-if="showCommandPalette" class="plc-overlay" @click.self="showCommandPalette = false">
+        <section class="plc-command-palette" role="dialog" aria-modal="true" aria-label="命令面板">
+          <div class="plc-modal-heading"><div><p class="plc-eyebrow">快捷入口</p><h2>命令面板</h2></div><button class="plc-close-button" type="button" @click="showCommandPalette = false"><IconTablerX /></button></div>
+          <button v-for="item in commands" :key="item.command" class="plc-command-row" type="button" @click="chooseCommand(item.command, item.supports_args)"><code>{{ item.command }}</code><span><strong>{{ item.label }}</strong><small>{{ item.detail }}</small></span><kbd>↵</kbd></button>
+        </section>
+      </div>
+      <div v-if="showSettings" class="plc-overlay" @click.self="showSettings = false">
+        <section class="plc-settings-modal" role="dialog" aria-modal="true" aria-label="PLC Pilot 设置">
+          <div class="plc-modal-heading"><div><p class="plc-eyebrow">工作台设置</p><h2>连接与外观</h2></div><button class="plc-close-button" type="button" @click="showSettings = false"><IconTablerX /></button></div>
+          <div class="plc-settings-storage">
+            <span>配置目录</span>
+            <code>{{ snapshot.config_directory || '桌面运行时启动后显示' }}</code>
+            <small>config.json · auth.json · skills · sessions</small>
+          </div>
+          <div class="plc-settings-group">
+            <label>模型接口
+              <select v-model="modelForm.provider">
+                <option value="responses">Responses</option>
+                <option value="messages">Messages</option>
+                <option value="chatcompletions">Chat Completions</option>
+                <option value="ollama">Ollama</option>
+              </select>
+            </label>
+            <label>接口地址<input v-model="modelForm.baseUrl" type="url" /></label>
+            <div class="plc-model-row">
+              <label>模型<input v-model="modelForm.model" type="text" list="plc-discovered-models" /></label>
+              <button class="plc-button plc-button-quiet plc-model-discover-button" type="button" :disabled="isDiscoveringModels" @click="onDiscoverModels">
+                <IconTablerSearch />
+                {{ isDiscoveringModels ? '获取中' : '获取模型' }}
+              </button>
+            </div>
+            <datalist id="plc-discovered-models">
+              <option v-for="model in modelDiscovery?.models || []" :key="model.id" :value="model.id">{{ model.name }}</option>
+            </datalist>
+            <div v-if="modelDiscoveryError" class="plc-model-discovery-error" role="alert">{{ modelDiscoveryError }}</div>
+            <div v-else-if="modelDiscovery" class="plc-model-discovery" aria-live="polite">
+              <div class="plc-model-discovery-meta">
+                <span>HTTP {{ modelDiscovery.status }} · {{ modelDiscovery.models.length }} 个模型</span>
+                <code>{{ modelDiscovery.endpoint }}</code>
+              </div>
+              <div v-if="modelDiscovery.models.length > 0" class="plc-model-discovery-list">
+                <button v-for="model in modelDiscovery.models" :key="model.id" class="plc-model-option" type="button" @click="selectDiscoveredModel(model.id)">
+                  <span>{{ model.name }}</span>
+                  <code>{{ model.id }}</code>
+                </button>
+              </div>
+              <p v-else class="plc-model-discovery-empty">接口已响应，但没有返回可用模型。</p>
+            </div>
+            <label>API Key
+              <small v-if="snapshot.model.api_key_configured">已保存至 auth.json；留空则继续使用现有 Key</small>
+              <small v-else>保存至当前配置目录的 auth.json</small>
+              <input v-model="modelForm.apiKey" type="password" autocomplete="off" />
+            </label>
+            <button class="plc-button plc-button-primary" type="button" @click="onSaveModel">保存模型</button>
+          </div>
+          <div class="plc-settings-group"><div class="plc-settings-group-title">MCP / Bridge</div><label>服务名称<input v-model="mcpForm.name" type="text" /></label><label>stdio 命令<input v-model="mcpForm.command" type="text" placeholder="python -m codesys_mcp" /></label><label>HTTP URL<input v-model="mcpForm.url" type="url" placeholder="https://..." /></label><button class="plc-button plc-button-quiet" type="button" @click="onSaveMcp">保存 MCP</button></div>
+          <div class="plc-settings-group plc-settings-theme"><span>主题</span><button class="plc-theme-choice" :class="{ 'is-active': theme === 'dark' }" type="button" @click="theme = 'dark'">深色</button><button class="plc-theme-choice" :class="{ 'is-active': theme === 'light' }" type="button" @click="theme = 'light'">浅色</button></div>
+        </section>
+        </div>
+
+      <div v-if="showSkillDetail" class="plc-overlay" @click.self="showSkillDetail = false">
+        <section class="plc-skill-modal" role="dialog" aria-modal="true" aria-label="Skill 内容"><div class="plc-modal-heading"><div><p class="plc-eyebrow">SKILL.md</p><h2>{{ snapshot.skills.find((skill) => skill.id === selectedSkillId)?.name }}</h2></div><button class="plc-close-button" type="button" @click="showSkillDetail = false"><IconTablerX /></button></div><pre class="plc-skill-content">{{ selectedSkillContent }}</pre></section>
+      </div>
+    </template>
   </DesktopLayout>
-
-  <div v-if="isWindowDropActive" class="plc-window-drop-overlay" role="status" aria-live="polite">
-    <IconTablerFolder />
-    <strong>松开以打开工程</strong>
-    <span>支持工程目录或 .project 文件</span>
-  </div>
-
-  <Transition name="plc-fade"><div v-if="notice" class="plc-toast" role="status">{{ notice }}</div></Transition>
-
-  <div v-if="showCommandPalette" class="plc-overlay" @click.self="showCommandPalette = false">
-    <section class="plc-command-palette" role="dialog" aria-modal="true" aria-label="命令面板">
-      <div class="plc-modal-heading"><div><p class="plc-eyebrow">快捷入口</p><h2>命令面板</h2></div><button class="plc-close-button" type="button" @click="showCommandPalette = false"><IconTablerX /></button></div>
-      <button v-for="item in commands" :key="item.command" class="plc-command-row" type="button" @click="chooseCommand(item.command, item.supports_args)"><code>{{ item.command }}</code><span><strong>{{ item.label }}</strong><small>{{ item.detail }}</small></span><kbd>↵</kbd></button>
-    </section>
-  </div>
-
-  <div v-if="showSettings" class="plc-overlay" @click.self="showSettings = false">
-    <section class="plc-settings-modal" role="dialog" aria-modal="true" aria-label="PLC Pilot 设置">
-      <div class="plc-modal-heading"><div><p class="plc-eyebrow">工作台设置</p><h2>连接与外观</h2></div><button class="plc-close-button" type="button" @click="showSettings = false"><IconTablerX /></button></div>
-      <div class="plc-settings-storage">
-        <span>配置目录</span>
-        <code>{{ snapshot.config_directory || '桌面运行时启动后显示' }}</code>
-        <small>config.json · auth.json · skills · sessions</small>
-      </div>
-      <div class="plc-settings-group">
-        <label>模型接口
-          <select v-model="modelForm.provider">
-            <option value="responses">Responses</option>
-            <option value="messages">Messages</option>
-            <option value="chatcompletions">Chat Completions</option>
-            <option value="ollama">Ollama</option>
-          </select>
-        </label>
-        <label>接口地址<input v-model="modelForm.baseUrl" type="url" /></label>
-        <div class="plc-model-row">
-          <label>模型<input v-model="modelForm.model" type="text" list="plc-discovered-models" /></label>
-          <button class="plc-button plc-button-quiet plc-model-discover-button" type="button" :disabled="isDiscoveringModels" @click="onDiscoverModels">
-            <IconTablerSearch />
-            {{ isDiscoveringModels ? '获取中' : '获取模型' }}
-          </button>
-        </div>
-        <datalist id="plc-discovered-models">
-          <option v-for="model in modelDiscovery?.models || []" :key="model.id" :value="model.id">{{ model.name }}</option>
-        </datalist>
-        <div v-if="modelDiscoveryError" class="plc-model-discovery-error" role="alert">{{ modelDiscoveryError }}</div>
-        <div v-else-if="modelDiscovery" class="plc-model-discovery" aria-live="polite">
-          <div class="plc-model-discovery-meta">
-            <span>HTTP {{ modelDiscovery.status }} · {{ modelDiscovery.models.length }} 个模型</span>
-            <code>{{ modelDiscovery.endpoint }}</code>
-          </div>
-          <div v-if="modelDiscovery.models.length > 0" class="plc-model-discovery-list">
-            <button v-for="model in modelDiscovery.models" :key="model.id" class="plc-model-option" type="button" @click="selectDiscoveredModel(model.id)">
-              <span>{{ model.name }}</span>
-              <code>{{ model.id }}</code>
-            </button>
-          </div>
-          <p v-else class="plc-model-discovery-empty">接口已响应，但没有返回可用模型。</p>
-        </div>
-        <label>API Key
-          <small v-if="snapshot.model.api_key_configured">已保存至 auth.json；留空则继续使用现有 Key</small>
-          <small v-else>保存至当前配置目录的 auth.json</small>
-          <input v-model="modelForm.apiKey" type="password" autocomplete="off" />
-        </label>
-        <button class="plc-button plc-button-primary" type="button" @click="onSaveModel">保存模型</button>
-      </div>
-      <div class="plc-settings-group"><div class="plc-settings-group-title">MCP / Bridge</div><label>服务名称<input v-model="mcpForm.name" type="text" /></label><label>stdio 命令<input v-model="mcpForm.command" type="text" placeholder="python -m codesys_mcp" /></label><label>HTTP URL<input v-model="mcpForm.url" type="url" placeholder="https://..." /></label><button class="plc-button plc-button-quiet" type="button" @click="onSaveMcp">保存 MCP</button></div>
-      <div class="plc-settings-group plc-settings-theme"><span>主题</span><button class="plc-theme-choice" :class="{ 'is-active': theme === 'dark' }" type="button" @click="theme = 'dark'">深色</button><button class="plc-theme-choice" :class="{ 'is-active': theme === 'light' }" type="button" @click="theme = 'light'">浅色</button></div>
-    </section>
-  </div>
-
-  <div v-if="showSkillDetail" class="plc-overlay" @click.self="showSkillDetail = false">
-    <section class="plc-skill-modal" role="dialog" aria-modal="true" aria-label="Skill 内容"><div class="plc-modal-heading"><div><p class="plc-eyebrow">SKILL.md</p><h2>{{ snapshot.skills.find((skill) => skill.id === selectedSkillId)?.name }}</h2></div><button class="plc-close-button" type="button" @click="showSkillDetail = false"><IconTablerX /></button></div><pre class="plc-skill-content">{{ selectedSkillContent }}</pre></section>
-  </div>
 </template>
 
 <style scoped>

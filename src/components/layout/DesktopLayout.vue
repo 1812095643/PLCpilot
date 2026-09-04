@@ -24,8 +24,20 @@
     </template>
 
     <section class="desktop-main">
-      <slot name="content" />
+      <header v-if="$slots.header" class="desktop-header">
+        <slot name="header" />
+      </header>
+
+      <main class="desktop-content">
+        <slot name="content" />
+      </main>
+
+      <footer v-if="$slots.composer" class="desktop-composer">
+        <slot name="composer" />
+      </footer>
     </section>
+
+    <slot name="overlays" />
   </div>
 </template>
 
@@ -47,6 +59,14 @@ defineEmits<{
   dragover: [event: DragEvent]
   dragleave: [event: DragEvent]
   drop: [event: DragEvent]
+}>()
+
+defineSlots<{
+  sidebar?: () => unknown
+  header?: () => unknown
+  content?: () => unknown
+  composer?: () => unknown
+  overlays?: () => unknown
 }>()
 
 const { isMobile } = useMobile()
@@ -133,7 +153,19 @@ function onResizeHandleMouseDown(event: MouseEvent): void {
 }
 
 .desktop-main {
-  @apply relative z-[100] bg-white min-h-0 overflow-y-hidden overflow-x-visible;
+  @apply relative z-[100] flex min-h-0 min-w-0 flex-col bg-white overflow-y-hidden overflow-x-visible;
+}
+
+.desktop-header {
+  @apply min-w-0 shrink-0;
+}
+
+.desktop-content {
+  @apply min-h-0 min-w-0 flex-1 overflow-y-hidden overflow-x-visible;
+}
+
+.desktop-composer {
+  @apply min-w-0 shrink-0;
 }
 
 .mobile-drawer-backdrop {
