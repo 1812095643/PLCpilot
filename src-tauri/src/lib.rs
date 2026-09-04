@@ -312,6 +312,51 @@ pub struct ChatMessage {
     pub images: Vec<CodexImageInput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<MentionReference>,
+    #[serde(
+        default,
+        alias = "responseAnnotations",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub response_annotations: Vec<ResponseTextAnnotation>,
+}
+
+/// Codex Composer 的回复选区批注数据。
+///
+/// 这类内容是用户主动附加到下一轮消息的上下文，不是消息下方的本地评论。
+/// 所有字段都允许从旧会话缺省恢复，再由请求归一化逻辑执行长度和数量校验。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResponseTextAnnotation {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, alias = "sourceMessageId")]
+    pub source_message_id: String,
+    #[serde(default, alias = "sourceMessageKey")]
+    pub source_message_key: Option<String>,
+    #[serde(default, alias = "sourceTurnIndex")]
+    pub source_turn_index: Option<usize>,
+    #[serde(default, alias = "selectedText")]
+    pub selected_text: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, alias = "createdAt")]
+    pub created_at: Option<String>,
+}
+
+/// 描述从已有会话创建分支的边界。
+///
+/// `turn_index` 只按持久化会话中的 user 消息计数，而不是按前端时间线
+/// 的行数计数。这样一个包含工具调用的 Agent 轮次仍会被完整保留，
+/// 不会因为中间的 assistant/toolResult 记录而截断到半个轮次。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkSessionRequest {
+    #[serde(alias = "session_file")]
+    pub path: String,
+    #[serde(alias = "turnIndex")]
+    pub turn_index: usize,
+    /// `before_turn` 用于编辑/重发，`through_turn` 用于从回复 Fork。
+    pub mode: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -339,6 +384,9 @@ pub struct AgentRequest {
     /// 本轮由 @ 菜单绑定的工程文件、文件夹或历史会话。
     #[serde(default)]
     pub references: Vec<MentionReference>,
+    /// 本轮随 Composer 发送的回复选区批注。
+    #[serde(default)]
+    pub response_annotations: Vec<ResponseTextAnnotation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1189,6 +1237,18 @@ async fn dispatch_local_rpc(
                 skills,
                 attachments,
                 references,
+                response_annotations: args
+                    .get("response_annotations")
+                    .or_else(|| args.get("responseAnnotations"))
+                    .cloned()
+                    .map(|value| serde_json::from_value::<Vec<ResponseTextAnnotation>>(value))
+                    .transpose()
+                    .map_err(|error| {
+                        AppError::Configuration(format!(
+                            "turn/start response_annotations 无法解析：{error}"
+                        ))
+                    })?
+                    .unwrap_or_default(),
                 ..AgentRequest::default()
             };
             serde_json::to_value(run_agent_inner(app.clone(), request, &state).await?)
@@ -1293,6 +1353,11 @@ async fn dispatch_local_rpc(
             let path = required_string_arg(&args, "path")?;
             serde_json::to_value(resume_session_inner(path, &state).await?)
                 .map_err(|error| AppError::Internal(format!("编码会话未完成：{error}")))?
+        }
+        "fork_session" | "thread/fork" => {
+            let request = nested_arg_or_self::<ForkSessionRequest>(&args, "request")?;
+            serde_json::to_value(fork_session_inner(request, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码会话分支结果未完成：{error}")))?
         }
         "scan_project" => serde_json::to_value(scan_project_inner(&state).await?)
             .map_err(|error| AppError::Internal(format!("编码工程扫描未完成：{error}")))?,
@@ -1713,6 +1778,7 @@ pub fn run() {
             get_skill_content,
             list_sessions,
             resume_session,
+            fork_session,
             list_projects,
             pick_project_folder,
             remove_project,
@@ -2230,6 +2296,225 @@ async fn resume_session_inner(path: String, state: &AppState) -> Result<SessionR
         ..AgentSessionSummary::default()
     };
     Ok(record)
+}
+
+/// 根据 user turn 边界复制一份新的 JSONL 会话。
+///
+/// Pi 的会话文件还包含工具结果、思考和模型元数据；按前端消息行截断会
+/// 把一个工具轮次拆开。这里仅以 user 消息作为轮次锚点，并在 `through_turn`
+/// 模式下保留该轮到下一条 user 消息之前的全部记录。
+fn fork_session_content(
+    source_content: &str,
+    source_path: &Path,
+    request: &ForkSessionRequest,
+    new_session_id: &str,
+    timestamp: &str,
+) -> Result<(String, usize), AppError> {
+    if !matches!(request.mode.as_str(), "before_turn" | "through_turn") {
+        return Err(AppError::Configuration(
+            "会话分支模式只能是 before_turn 或 through_turn".to_string(),
+        ));
+    }
+
+    let source_header = source_content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|entry| entry.get("type").and_then(Value::as_str) == Some("session"))
+        .ok_or_else(|| AppError::Configuration("会话文件缺少有效的 session 头部".to_string()))?;
+    let mut header = source_header;
+    header["id"] = Value::String(new_session_id.to_string());
+    header["timestamp"] = Value::String(timestamp.to_string());
+    header["parentSession"] = Value::String(source_path.to_string_lossy().into_owned());
+
+    let mut output = vec![serde_json::to_string(&header)
+        .map_err(|error| AppError::Internal(format!("编码分支会话头部未完成：{error}")))?];
+    let mut user_turn_index = 0usize;
+    let mut target_started = false;
+    let mut boundary_found = false;
+    let mut copied_message_count = 0usize;
+
+    for raw_line in source_content.lines() {
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        let parsed = serde_json::from_str::<Value>(raw_line).ok();
+        if parsed
+            .as_ref()
+            .and_then(|entry| entry.get("type"))
+            .and_then(Value::as_str)
+            == Some("session")
+        {
+            continue;
+        }
+
+        if let Some(entry) = parsed.as_ref() {
+            if entry.get("type").and_then(Value::as_str) == Some("message") {
+                let role = entry
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if role == "user" {
+                    if request.mode == "before_turn" && user_turn_index == request.turn_index {
+                        boundary_found = true;
+                        break;
+                    }
+                    if request.mode == "through_turn"
+                        && target_started
+                        && user_turn_index > request.turn_index
+                    {
+                        boundary_found = true;
+                        break;
+                    }
+                    if user_turn_index == request.turn_index {
+                        target_started = true;
+                    }
+                    user_turn_index = user_turn_index.saturating_add(1);
+                }
+                if role == "user" || role == "assistant" {
+                    copied_message_count = copied_message_count.saturating_add(1);
+                }
+            }
+        }
+
+        // 无法解析的行也保留，避免分支时悄悄丢失 Pi 扩展写入的记录。
+        output.push(raw_line.to_string());
+    }
+
+    if request.mode == "before_turn" {
+        if !boundary_found {
+            return Err(AppError::Configuration(format!(
+                "找不到第 {} 个用户轮次，无法从该消息前创建分支",
+                request.turn_index.saturating_add(1)
+            )));
+        }
+    } else if !target_started {
+        return Err(AppError::Configuration(format!(
+            "找不到第 {} 个用户轮次，无法创建回复分支",
+            request.turn_index.saturating_add(1)
+        )));
+    }
+
+    if let Some(name) = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        output.push(
+            serde_json::to_string(&json!({
+                "type": "session_info",
+                "name": name,
+                "timestamp": now_iso(),
+            }))
+            .map_err(|error| AppError::Internal(format!("编码分支会话名称未完成：{error}")))?,
+        );
+    }
+
+    Ok((format!("{}\n", output.join("\n")), copied_message_count))
+}
+
+async fn fork_session_inner(
+    request: ForkSessionRequest,
+    state: &AppState,
+) -> Result<SessionRecord, AppError> {
+    if state.agent_runs.try_lock().is_err() {
+        return Err(AppError::Internal(
+            "当前任务仍在运行，请先停止或等待它完成后再创建会话分支".to_string(),
+        ));
+    }
+    let requested = request.path.trim();
+    if requested.is_empty() {
+        return Err(AppError::Configuration(
+            "请选择一个要分支的会话".to_string(),
+        ));
+    }
+    let record = list_session_records()
+        .into_iter()
+        .find(|item| session_paths_equal(&item.path, requested))
+        .ok_or_else(|| AppError::Configuration("会话文件不在 PLC Pilot 会话目录中".to_string()))?;
+    let root = fs::canonicalize(agent_session_dir())
+        .map_err(|error| AppError::Configuration(format!("会话目录不可用：{error}")))?;
+    let source_path = fs::canonicalize(&record.path)
+        .map_err(|error| AppError::Configuration(format!("会话文件不可用：{error}")))?;
+    if !source_path.starts_with(&root)
+        || source_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| !value.eq_ignore_ascii_case("jsonl"))
+            .unwrap_or(true)
+    {
+        return Err(AppError::Configuration(
+            "只能从 PLC Pilot 自己创建的会话文件建立分支".to_string(),
+        ));
+    }
+    if request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|name| name.chars().count() > 120)
+    {
+        return Err(AppError::Configuration(
+            "分支会话名称不能超过 120 个字符".to_string(),
+        ));
+    }
+
+    let source_content = fs::read_to_string(&source_path)
+        .map_err(|error| AppError::Configuration(format!("读取会话文件未完成：{error}")))?;
+    let new_session_id = Uuid::new_v4().to_string();
+    let timestamp = now_iso();
+    let (forked_content, _) = fork_session_content(
+        &source_content,
+        &source_path,
+        &request,
+        &new_session_id,
+        &timestamp,
+    )?;
+
+    fs::create_dir_all(&root)
+        .map_err(|error| AppError::Configuration(format!("创建会话目录未完成：{error}")))?;
+    let filename = format!(
+        "{}_{}.jsonl",
+        timestamp.replace(':', "-").replace('.', "-"),
+        new_session_id
+    );
+    let target_path = root.join(filename);
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target_path)
+            .map_err(|error| AppError::Configuration(format!("创建会话分支未完成：{error}")))?;
+        if let Err(error) = file.write_all(forked_content.as_bytes()) {
+            let _ = fs::remove_file(&target_path);
+            return Err(AppError::Configuration(format!(
+                "写入会话分支未完成：{error}"
+            )));
+        }
+    }
+
+    let forked_record = parse_session_record(&target_path).ok_or_else(|| {
+        let _ = fs::remove_file(&target_path);
+        AppError::Internal("新会话分支写入后无法重新读取".to_string())
+    })?;
+    let mut guard = state.inner.lock().await;
+    guard.session = AgentSessionSummary {
+        session_id: Some(forked_record.session_id.clone()),
+        session_file: Some(forked_record.path.clone()),
+        name: forked_record.name.clone(),
+        message_count: forked_record.message_count,
+        ..AgentSessionSummary::default()
+    };
+    Ok(forked_record)
+}
+
+#[tauri::command]
+async fn fork_session(
+    request: ForkSessionRequest,
+    state: State<'_, AppState>,
+) -> Result<SessionRecord, AppError> {
+    fork_session_inner(request, &state).await
 }
 
 #[tauri::command]
@@ -3003,6 +3288,7 @@ async fn run_agent_legacy(
     prepare_attachments(&mut request.attachments);
     if request.message.trim().is_empty()
         && request.references.is_empty()
+        && request.response_annotations.is_empty()
         && request.attachments.iter().all(|item| {
             item.error.is_some() || (item.kind != "image" && item.text_content.is_none())
         })
@@ -3043,6 +3329,7 @@ async fn run_agent_legacy(
         content: prompt_text,
         images: attachments::attachment_images(&request.attachments),
         references: request.references.clone(),
+        response_annotations: request.response_annotations.clone(),
     });
     push_event(
         &app,
@@ -3185,6 +3472,7 @@ async fn run_agent_inner(
     prepare_attachments(&mut request.attachments);
     if request.message.trim().is_empty()
         && request.references.is_empty()
+        && request.response_annotations.is_empty()
         && request.attachments.iter().all(|item| {
             item.error.is_some() || (item.kind != "image" && item.text_content.is_none())
         })
@@ -3205,6 +3493,7 @@ async fn run_agent_inner(
         &request.references,
         current_session_id.as_deref(),
     )?;
+    request.response_annotations = normalize_response_annotations(&request.response_annotations)?;
 
     // 同一工程会话只允许一个 Agent 运行，避免两个模型请求同时写入同一份 JSONL 会话。
     let _run_guard = state.agent_runs.lock().await;
@@ -3865,6 +4154,7 @@ async fn run_pi_host(
         // 图片沿用 Codex 的 image_url 数据 URI；文本/工作簿正文由宿主拼接到本轮提示。
         "attachments": request.attachments,
         "references": request.references,
+        "response_annotations": request.response_annotations,
         "instructions": request
             .message
             .strip_prefix("/compact")
@@ -4369,6 +4659,7 @@ fn tool_feedback(tool: &str, content: &str) -> ChatMessage {
         content: format!("[PLC Pilot 工具结果: {tool}]\n{content}"),
         images: Vec::new(),
         references: Vec::new(),
+        response_annotations: Vec::new(),
     }
 }
 
@@ -4784,6 +5075,83 @@ fn reference_context(project: &ProjectContext, references: &[MentionReference]) 
         let item = format!("- 文件 [{}]：\n{}{}\n", relative, content, selection);
         total_chars += item.chars().count();
         output.push_str(&item);
+    }
+    output
+}
+
+/// 校验并限制 Composer 传入的回复选区批注，避免过大的用户上下文污染模型请求。
+fn normalize_response_annotations(
+    annotations: &[ResponseTextAnnotation],
+) -> Result<Vec<ResponseTextAnnotation>, AppError> {
+    if annotations.len() > 32 {
+        return Err(AppError::Configuration(
+            "一轮最多绑定 32 条回复批注".to_string(),
+        ));
+    }
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for annotation in annotations {
+        let id = annotation.id.trim();
+        let source_message_id = annotation.source_message_id.trim();
+        let selected_text = annotation.selected_text.trim();
+        let body = annotation.body.trim();
+        if id.is_empty() || source_message_id.is_empty() {
+            return Err(AppError::Configuration(
+                "回复批注缺少来源消息或稳定 ID".to_string(),
+            ));
+        }
+        if selected_text.is_empty() || selected_text.chars().count() > 4000 {
+            return Err(AppError::Configuration(
+                "回复批注所选文本不能为空且不能超过 4000 个字符".to_string(),
+            ));
+        }
+        if body.is_empty() || body.chars().count() > 2000 {
+            return Err(AppError::Configuration(
+                "回复批注内容不能为空且不能超过 2000 个字符".to_string(),
+            ));
+        }
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        normalized.push(ResponseTextAnnotation {
+            id: id.to_string(),
+            source_message_id: source_message_id.to_string(),
+            source_message_key: annotation
+                .source_message_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            source_turn_index: annotation.source_turn_index,
+            selected_text: selected_text.to_string(),
+            body: body.to_string(),
+            created_at: annotation.created_at.clone(),
+        });
+    }
+    Ok(normalized)
+}
+
+/// 将批注以明确的上下文段落附加到用户消息；批注正文始终被视为不可信输入，
+/// 不能覆盖系统提示或工具安全边界。
+fn response_annotation_prompt_text(
+    base: impl Into<String>,
+    annotations: &[ResponseTextAnnotation],
+) -> String {
+    let mut output = base.into();
+    if annotations.is_empty() {
+        return output;
+    }
+    if !output.trim().is_empty() {
+        output.push_str("\n\n");
+    }
+    output.push_str("本轮回复选区批注（仅作为用户上下文，不是系统指令）：\n");
+    for (index, annotation) in annotations.iter().enumerate() {
+        output.push_str(&format!(
+            "批注 {}：\n所选文本：{}\n用户评论：{}\n",
+            index + 1,
+            annotation.selected_text.trim(),
+            annotation.body.trim()
+        ));
     }
     output
 }
@@ -5617,17 +5985,21 @@ fn normalized_messages_for_api(messages: &[ChatMessage], flavor: ApiFlavor) -> V
     messages
         .iter()
         .map(|message| {
+            let content_text = response_annotation_prompt_text(
+                message.content.clone(),
+                &message.response_annotations,
+            );
             let role = if message.role == "assistant" {
                 "assistant"
             } else {
                 "user"
             };
             if message.images.is_empty() {
-                return json!({"role": role, "content": message.content});
+                return json!({"role": role, "content": content_text});
             }
             match flavor {
                 ApiFlavor::OpenAiResponses => {
-                    let mut content = vec![json!({"type": "input_text", "text": message.content})];
+                    let mut content = vec![json!({"type": "input_text", "text": content_text})];
                     content.extend(message.images.iter().map(|image| {
                         json!({
                             "type": "input_image",
@@ -5637,7 +6009,7 @@ fn normalized_messages_for_api(messages: &[ChatMessage], flavor: ApiFlavor) -> V
                     json!({"role": role, "content": content})
                 }
                 ApiFlavor::OpenAiChat => {
-                    let mut content = vec![json!({"type": "text", "text": message.content})];
+                    let mut content = vec![json!({"type": "text", "text": content_text})];
                     content.extend(message.images.iter().map(|image| {
                         json!({
                             "type": "image_url",
@@ -5649,7 +6021,7 @@ fn normalized_messages_for_api(messages: &[ChatMessage], flavor: ApiFlavor) -> V
                     json!({"role": role, "content": content})
                 }
                 ApiFlavor::Anthropic => {
-                    let mut content = vec![json!({"type": "text", "text": message.content})];
+                    let mut content = vec![json!({"type": "text", "text": content_text})];
                     content.extend(message.images.iter().map(|image| {
                         let (mime_type, data) = parse_image_data_url(&image.image_url);
                         json!({
@@ -5665,7 +6037,7 @@ fn normalized_messages_for_api(messages: &[ChatMessage], flavor: ApiFlavor) -> V
                 }
                 ApiFlavor::Ollama => json!({
                     "role": role,
-                    "content": message.content,
+                    "content": content_text,
                     "images": message.images.iter().map(|image| parse_image_data_url(&image.image_url).1).collect::<Vec<_>>(),
                 }),
             }
@@ -6643,6 +7015,7 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
     let mut name = None;
     let mut cwd = None;
     let mut messages = Vec::new();
+    const RESPONSE_ANNOTATION_ENTRY: &str = "plc-pilot.response-text-annotations";
     for line in content.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -6674,7 +7047,14 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
                 }
                 let text = extract_session_message_text(message);
                 let images = extract_session_message_images(message);
-                if text.trim().is_empty() && images.is_empty() {
+                let response_annotations = message
+                    .get("response_annotations")
+                    .cloned()
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<ResponseTextAnnotation>>(value).ok()
+                    })
+                    .unwrap_or_default();
+                if text.trim().is_empty() && images.is_empty() && response_annotations.is_empty() {
                     continue;
                 }
                 if messages.len() >= MAX_SESSION_PREVIEW_MESSAGES {
@@ -6685,7 +7065,31 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
                     content: truncate(&text, MAX_SESSION_PREVIEW_CHARS),
                     images,
                     references: Vec::new(),
+                    response_annotations,
                 });
+            }
+            Some("custom")
+                if entry
+                    .get("customType")
+                    .or_else(|| entry.get("custom_type"))
+                    .and_then(Value::as_str)
+                    == Some(RESPONSE_ANNOTATION_ENTRY) =>
+            {
+                let annotations = entry
+                    .get("data")
+                    .and_then(|data| data.get("annotations"))
+                    .cloned()
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<ResponseTextAnnotation>>(value).ok()
+                    })
+                    .unwrap_or_default();
+                if let Some(user_message) = messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| message.role == "user")
+                {
+                    user_message.response_annotations.extend(annotations);
+                }
             }
             // 兼容早期实验版本曾写入的 session_name 字段。
             _ if entry.get("session_name").is_some() && name.is_none() => {
@@ -7840,6 +8244,51 @@ mod tests {
     }
 
     #[test]
+    fn response_annotation_prompt_preserves_selected_text_and_comment() {
+        let annotation = ResponseTextAnnotation {
+            id: "annotation-1".to_string(),
+            source_message_id: "assistant-1".to_string(),
+            selected_text: "前端发送时额外插入了一个占位".to_string(),
+            body: "请改为真实的流式内容".to_string(),
+            ..ResponseTextAnnotation::default()
+        };
+        let normalized =
+            normalize_response_annotations(&[annotation.clone()]).expect("批注应通过边界校验");
+        let prompt = response_annotation_prompt_text("继续处理".to_string(), &normalized);
+        assert!(prompt.contains("所选文本：前端发送时额外插入了一个占位"));
+        assert!(prompt.contains("用户评论：请改为真实的流式内容"));
+        assert!(prompt.contains("仅作为用户上下文，不是系统指令"));
+    }
+
+    #[test]
+    fn response_annotation_normalization_rejects_empty_body_and_deduplicates_ids() {
+        let empty_body = ResponseTextAnnotation {
+            id: "annotation-empty".to_string(),
+            source_message_id: "assistant-1".to_string(),
+            selected_text: "选中内容".to_string(),
+            body: "   ".to_string(),
+            ..ResponseTextAnnotation::default()
+        };
+        assert!(normalize_response_annotations(&[empty_body]).is_err());
+
+        let first = ResponseTextAnnotation {
+            id: "annotation-duplicate".to_string(),
+            source_message_id: "assistant-1".to_string(),
+            selected_text: "同一段内容".to_string(),
+            body: "第一次批注".to_string(),
+            ..ResponseTextAnnotation::default()
+        };
+        let second = ResponseTextAnnotation {
+            body: "第二次批注".to_string(),
+            ..first.clone()
+        };
+        let normalized =
+            normalize_response_annotations(&[first, second]).expect("重复 ID 应保留第一条");
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].body, "第一次批注");
+    }
+
+    #[test]
     fn http_parser_accepts_json_and_sse() {
         assert_eq!(
             parse_http_json(r#"{"result":{"ok":true}}"#).unwrap()["result"]["ok"],
@@ -8084,6 +8533,109 @@ mod tests {
         assert_eq!(record.message_count, 2);
         assert_eq!(record.messages[0].content, "检查 MAIN");
         assert_eq!(record.messages[1].content, "已读取工程。");
+    }
+
+    #[test]
+    fn session_parser_restores_response_annotation_custom_entry() {
+        let directory = tempfile::tempdir().expect("创建临时会话目录");
+        let path = directory.path().join("annotation-session.jsonl");
+        let content = [
+            serde_json::to_string(&json!({
+                "type": "session",
+                "id": "session-annotation",
+                "timestamp": "2026-09-04T00:00:00Z",
+                "cwd": "C:/PLC"
+            }))
+            .expect("编码会话头"),
+            serde_json::to_string(&json!({
+                "type": "message",
+                "message": {"role": "user", "content": "先检查"}
+            }))
+            .expect("编码用户消息"),
+            serde_json::to_string(&json!({
+                "type": "message",
+                "message": {"role": "assistant", "content": "已检查"}
+            }))
+            .expect("编码助手消息"),
+            serde_json::to_string(&json!({
+                "type": "custom",
+                "customType": "plc-pilot.response-text-annotations",
+                "data": {"annotations": [{
+                    "id": "annotation-1",
+                    "source_message_id": "assistant-ui-id",
+                    "selected_text": "已检查",
+                    "body": "请补充证据"
+                }]}
+            }))
+            .expect("编码批注元数据"),
+        ]
+        .join("\n");
+        fs::write(&path, content).expect("写入会话文件");
+        let record = parse_session_record(&path).expect("解析会话记录");
+        assert_eq!(record.messages.len(), 2);
+        assert_eq!(record.messages[0].response_annotations.len(), 1);
+        assert_eq!(
+            record.messages[0].response_annotations[0].body,
+            "请补充证据"
+        );
+    }
+
+    #[test]
+    fn fork_session_content_cuts_before_selected_user_turn() {
+        let request = ForkSessionRequest {
+            path: "C:/Users/test/AppData/Local/PLC Pilot/sessions/source.jsonl".to_string(),
+            turn_index: 1,
+            mode: "before_turn".to_string(),
+            name: Some("编辑消息".to_string()),
+        };
+        let source = concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"source\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/PLC\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"第一轮\"}}\n",
+            "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"第一轮回复\"}]}}\n",
+            "{\"type\":\"message\",\"id\":\"u2\",\"parentId\":\"a1\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"message\":{\"role\":\"user\",\"content\":\"第二轮\"}}\n",
+        );
+        let (forked, count) = fork_session_content(
+            source,
+            Path::new(&request.path),
+            &request,
+            "forked",
+            "2026-01-01T01:00:00Z",
+        )
+        .expect("创建用户消息前的分支");
+        assert_eq!(count, 2);
+        assert!(forked.contains("第一轮回复"));
+        assert!(!forked.contains("第二轮"));
+        assert!(forked.contains("\"id\":\"forked\""));
+        assert!(forked.contains("编辑消息"));
+    }
+
+    #[test]
+    fn fork_session_content_keeps_tool_records_through_selected_turn() {
+        let request = ForkSessionRequest {
+            path: "C:/Users/test/AppData/Local/PLC Pilot/sessions/source.jsonl".to_string(),
+            turn_index: 0,
+            mode: "through_turn".to_string(),
+            name: None,
+        };
+        let source = concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"source\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/PLC\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"检查工程\"}}\n",
+            "{\"type\":\"message\",\"id\":\"tool1\",\"parentId\":\"u1\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{\"role\":\"toolResult\",\"content\":\"工具输出\"}}\n",
+            "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"tool1\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"检查完成\"}]}}\n",
+            "{\"type\":\"message\",\"id\":\"u2\",\"parentId\":\"a1\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"message\":{\"role\":\"user\",\"content\":\"继续修改\"}}\n",
+        );
+        let (forked, count) = fork_session_content(
+            source,
+            Path::new(&request.path),
+            &request,
+            "forked",
+            "2026-01-01T01:00:00Z",
+        )
+        .expect("创建回复分支");
+        assert_eq!(count, 2);
+        assert!(forked.contains("工具输出"));
+        assert!(forked.contains("检查完成"));
+        assert!(!forked.contains("继续修改"));
     }
 
     #[test]

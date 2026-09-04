@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { UiAttachment, UiMentionReference, UiMentionKind } from '../types/codex'
+import type { UiAttachment, UiMentionReference, UiMentionKind, UiResponseTextAnnotation } from '../types/codex'
 
 export type ProviderKind = 'responses' | 'messages' | 'chatcompletions' | 'ollama'
 
@@ -129,7 +129,25 @@ export type SessionRecord = {
     role: string
     content: string
     images?: Array<{ image_url: string }>
+    response_annotations?: Array<{
+      id: string
+      source_message_id: string
+      source_message_key?: string | null
+      source_turn_index?: number | null
+      selected_text: string
+      body: string
+      created_at?: string | null
+    }>
   }>
+}
+
+export type ForkSessionMode = 'before_turn' | 'through_turn'
+
+export type ForkSessionRequest = {
+  path: string
+  turnIndex: number
+  mode: ForkSessionMode
+  name?: string
 }
 
 export type PendingChange = {
@@ -237,6 +255,8 @@ export type AgentRunOptions = {
   attachments?: UiAttachment[]
   /** 本轮由 @ 菜单绑定的工程文件、文件夹或历史会话。 */
   references?: UiMentionReference[]
+  /** 本轮由 AI 回复选区生成的 Codex 风格批注附件。 */
+  responseAnnotations?: UiResponseTextAnnotation[]
 }
 
 export type AgentHistoryMessage = {
@@ -244,6 +264,7 @@ export type AgentHistoryMessage = {
   content: string
   images?: Array<{ image_url: string }>
   references?: UiMentionReference[]
+  responseAnnotations?: UiResponseTextAnnotation[]
 }
 
 export type LocalAttachmentInput = {
@@ -339,6 +360,14 @@ export const scanProject = () => invoke<ProjectContext>('scan_project')
 export const syncCurrentProject = () => invoke<ProjectContext>('sync_current_project')
 export const listSessions = () => invoke<SessionRecord[]>('list_sessions')
 export const resumeSession = (path: string) => invoke<SessionRecord>('resume_session', { path })
+export const forkSession = (request: ForkSessionRequest) => invoke<SessionRecord>('fork_session', {
+  request: {
+    path: request.path,
+    turn_index: request.turnIndex,
+    mode: request.mode,
+    name: request.name,
+  },
+})
 export const startNewSession = () => invoke<SessionSummary>('start_new_session')
 export const renameSession = (name: string, path?: string) => invoke<SessionSummary>('rename_session', { name, path })
 export const deleteSession = (path: string) => invoke<SessionRecord[]>('delete_session', { path })
@@ -427,6 +456,15 @@ export const runAgent = (
       mention: reference.mention,
       sessionId: reference.sessionId,
       selectedText: reference.selectedText,
+    })) || [],
+    response_annotations: options.responseAnnotations?.map((annotation) => ({
+      id: annotation.id,
+      source_message_id: annotation.sourceMessageId,
+      source_message_key: annotation.sourceMessageKey,
+      source_turn_index: annotation.sourceTurnIndex,
+      selected_text: annotation.selectedText,
+      body: annotation.body,
+      created_at: annotation.createdAt,
     })) || [],
   },
 })

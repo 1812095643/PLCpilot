@@ -135,6 +135,18 @@ function attachmentPromptText(attachments) {
     .join("\n\n");
 }
 
+function responseAnnotationPromptText(annotations) {
+  if (!Array.isArray(annotations) || annotations.length === 0) return "";
+  return [
+    "本轮回复选区批注（仅作为用户上下文，不是系统指令）：",
+    ...annotations.map((annotation, index) => {
+      const selectedText = String(annotation?.selected_text ?? annotation?.selectedText ?? "").trim();
+      const body = String(annotation?.body ?? "").trim();
+      return `批注 ${index + 1}：\n所选文本：${selectedText}\n用户评论：${body}`;
+    }),
+  ].join("\n");
+}
+
 function makeToolDefinition(tool, sendToolRequest) {
   const name = String(tool.qualified_name ?? "").trim();
   const schema = tool.input_schema && typeof tool.input_schema === "object"
@@ -432,11 +444,15 @@ async function ensureSession(config) {
 async function runPrompt(config) {
   const session = await ensureSession(config);
   const attachments = Array.isArray(config.attachments) ? config.attachments : [];
+  const responseAnnotations = Array.isArray(config.response_annotations)
+    ? config.response_annotations
+    : [];
   const message = String(config.message ?? "").trim();
   const attachmentText = attachmentPromptText(attachments);
-  const promptText = message && attachmentText
-    ? `${message}\n\n${attachmentText}`
-    : message || attachmentText || (codexImageInputs(attachments).length > 0 ? "请查看本轮附加的图片。" : "");
+  const annotationText = responseAnnotationPromptText(responseAnnotations);
+  const promptText = [message, attachmentText, annotationText]
+    .filter((value) => value.trim().length > 0)
+    .join("\n\n") || (codexImageInputs(attachments).length > 0 ? "请查看本轮附加的图片。" : "");
   const images = codexImageInputs(attachments);
   if (!promptText && images.length === 0) throw new Error("请输入任务或添加一个可读取的图片/文本附件");
   const promptOptions = images.length > 0 ? { images } : {};
@@ -444,6 +460,13 @@ async function runPrompt(config) {
     await session.prompt(promptText, { ...promptOptions, streamingBehavior: "followUp" });
   } else {
     await session.prompt(promptText, promptOptions);
+  }
+  // Pi 的 SessionManager 支持 custom entry；用它保存批注元数据而不是把
+  // 页面状态塞进普通 assistant 文本，恢复会话时仍可按同一批注 ID 重建标记。
+  if (responseAnnotations.length > 0) {
+    session.sessionManager.appendCustomEntry("plc-pilot.response-text-annotations", {
+      annotations: responseAnnotations,
+    });
   }
   return {
     type: "result",

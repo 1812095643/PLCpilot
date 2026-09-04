@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, shallowRef, watch, type ComponentPublicInstance } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, shallowRef, watch, type ComponentPublicInstance } from 'vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import DesktopLayout from './components/layout/DesktopLayout.vue'
 import SidebarThreadControls from './components/sidebar/SidebarThreadControls.vue'
 import ContentHeader from './components/content/ContentHeader.vue'
 import ThreadConversation from './components/content/ThreadConversation.vue'
+import type { ThreadConversationExposed } from './components/content/ThreadConversation.vue'
 import ThreadComposer from './components/content/ThreadComposer.vue'
 import type { ComposerDraftPayload, ThreadComposerExposed, SubmitPayload } from './components/content/ThreadComposer.vue'
 import IconTablerBolt from './components/icons/IconTablerBolt.vue'
@@ -26,6 +27,7 @@ import {
   getSkillContent,
   getSnapshot,
   deleteSession,
+  forkSession,
   pickProjectFolder,
   removeProject,
   renameSession,
@@ -55,6 +57,7 @@ import type {
   UiLiveOverlay,
   UiMessage,
   UiMentionReference,
+  UiResponseTextAnnotation,
   UiThreadTokenUsage,
 } from './types/codex'
 import type { Diagnostic } from './api/plcBridge'
@@ -64,6 +67,8 @@ type View = 'chat' | 'overview' | 'skills'
 
 const snapshot = shallowRef<Snapshot>(EMPTY_SNAPSHOT)
 const messages = shallowRef<UiMessage[]>([])
+/** 当前 Composer 中等待随下一条用户消息发送的回复批注。 */
+const pendingResponseAnnotations = shallowRef<UiResponseTextAnnotation[]>([])
 const activeView = shallowRef<View>('chat')
 const activeThreadId = shallowRef('local-plc-thread')
 const isSidebarCollapsed = shallowRef(false)
@@ -84,6 +89,7 @@ const selectedSkillId = shallowRef('')
 const selectedSkillContent = shallowRef('')
 const projectPathDraft = shallowRef('')
 const composerRef = shallowRef<ComponentPublicInstance<ThreadComposerExposed> | null>(null)
+const conversationRef = shallowRef<ComponentPublicInstance<ThreadConversationExposed> | null>(null)
 const theme = shallowRef<Theme>(loadTheme())
 const collaborationMode = shallowRef<CollaborationModeKind>('default')
 const selectedModel = shallowRef('gpt-5')
@@ -223,6 +229,126 @@ function restoredImageAttachment(imageUrl: string, messageIndex: number, imageIn
   }
 }
 
+function restoreSessionMessages(record: SessionRecord): UiMessage[] {
+  let turnIndex = -1
+  const restored = record.messages.map((item, index) => {
+    if (item.role === 'user') turnIndex += 1
+    const normalizedTurnIndex = Math.max(0, turnIndex)
+    const responseAnnotations = (item.response_annotations ?? [])
+      .filter((annotation) => Boolean(annotation)
+        && typeof annotation.selected_text === 'string'
+        && typeof annotation.body === 'string'
+        && annotation.selected_text.trim().length > 0
+        && annotation.body.trim().length > 0)
+      .map((annotation, annotationIndex): UiResponseTextAnnotation => ({
+        id: annotation.id || `restored-response-annotation-${index}-${annotationIndex}`,
+        sourceMessageId: annotation.source_message_id || `restored-${index}`,
+        sourceMessageKey: annotation.source_message_key || undefined,
+        sourceTurnIndex: annotation.source_turn_index ?? normalizedTurnIndex,
+        selectedText: annotation.selected_text.trim(),
+        body: annotation.body.trim(),
+        createdAt: annotation.created_at || new Date().toISOString(),
+      }))
+    return {
+      id: newId(item.role),
+      role: item.role === 'assistant' ? 'assistant' : 'user',
+      text: item.content,
+      attachments: (item.images ?? []).map((image, imageIndex) => restoredImageAttachment(image.image_url, index, imageIndex)),
+      responseAnnotations: responseAnnotations.length > 0 ? responseAnnotations : undefined,
+      turnIndex: normalizedTurnIndex,
+      turnId: `restored-${normalizedTurnIndex}`,
+      sessionMessageIndex: index,
+    }
+  })
+  // 旧会话通常把批注写在发送它的 user 记录上；恢复时把标记重新挂到对应的
+  // 最近一条 assistant 回复，确保右侧编号仍能打开原批注编辑器。
+  for (const [index, message] of restored.entries()) {
+    if (message.role !== 'user' || !message.responseAnnotations?.length) continue
+    const source = [...restored.slice(0, index)].reverse().find((candidate) => candidate.role === 'assistant')
+    if (!source) continue
+    source.responseAnnotations = [
+      ...(source.responseAnnotations ?? []),
+      ...message.responseAnnotations
+        .filter((annotation) => !(source.responseAnnotations ?? []).some((current) => current.id === annotation.id))
+        .map((annotation) => ({
+          ...annotation,
+          sourceMessageId: source.id,
+          sourceTurnIndex: source.turnIndex,
+        })),
+    ]
+  }
+  return restored
+}
+
+function messageTurnIndex(message: UiMessage): number {
+  if (typeof message.turnIndex === 'number' && Number.isFinite(message.turnIndex)) {
+    return Math.max(0, Math.trunc(message.turnIndex))
+  }
+  let userTurns = 0
+  for (const candidate of messages.value) {
+    if (candidate.id === message.id) {
+      return message.role === 'user' ? userTurns : Math.max(0, userTurns - 1)
+    }
+    if (candidate.role === 'user') userTurns += 1
+  }
+  return Math.max(0, userTurns - (message.role === 'user' ? 0 : 1))
+}
+
+function messageDraftPayload(message: UiMessage): ComposerDraftPayload {
+  return {
+    text: message.text,
+    skills: message.skills?.map((skill) => ({ name: skill.name, path: skill.path })) ?? [],
+    attachments: message.attachments?.map(({ previewUrl: _previewUrl, ...attachment }) => ({
+      ...attachment,
+      status: attachment.status === 'reading' ? 'error' : attachment.status,
+    })),
+    references: message.references ?? [],
+    responseAnnotations: message.responseAnnotations ?? [],
+  }
+}
+
+function applyForkedSession(record: SessionRecord): void {
+  activeThreadId.value = record.session_id
+  pendingResponseAnnotations.value = []
+  messages.value = restoreSessionMessages(record)
+  snapshot.value = {
+    ...snapshot.value,
+    session: {
+      ...snapshot.value.session,
+      session_id: record.session_id,
+      session_file: record.path,
+      name: record.name,
+      message_count: record.message_count,
+    },
+  }
+}
+
+async function forkMessageSession(message: UiMessage, mode: 'before_turn' | 'through_turn', name?: string): Promise<SessionRecord | null> {
+  if (isBusy.value) {
+    showNotice('当前任务仍在运行，请先停止或等待它完成。')
+    return null
+  }
+  const sessionFile = snapshot.value.session.session_file
+  if (!sessionFile) {
+    showNotice('这条消息还没有持久化会话，暂时无法创建分支。')
+    return null
+  }
+  try {
+    const record = await forkSession({
+      path: sessionFile,
+      turnIndex: messageTurnIndex(message),
+      mode,
+      name,
+    })
+    applyForkedSession(record)
+    await refresh()
+    return record
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+    return null
+  }
+}
+
 function showNotice(message: string): void {
   notice.value = message
   window.setTimeout(() => {
@@ -289,8 +415,19 @@ function appendAgentResult(
   selectedSkills: Array<{ name: string; path: string }> = [],
   attachments: SubmitPayload['attachments'] = [],
   references: UiMentionReference[] = [],
+  responseAnnotations: UiResponseTextAnnotation[] = [],
 ): void {
   const turnIndex = messages.value.filter((item) => item.role === 'user').length
+  const annotatedBaseMessages = messages.value
+    .filter((item) => !item.id.startsWith('pending-assistant-'))
+    .map((item) => {
+      if (item.role !== 'assistant') return item
+      const additions = responseAnnotations.filter((annotation) => annotation.sourceMessageId === item.id)
+      if (additions.length === 0) return item
+      const existing = item.responseAnnotations ?? []
+      const merged = [...existing, ...additions.filter((annotation) => !existing.some((current) => current.id === annotation.id))]
+      return { ...item, responseAnnotations: merged }
+    })
   const userMessage: UiMessage = {
     id: newId('user'),
     role: 'user',
@@ -298,6 +435,7 @@ function appendAgentResult(
     skills: selectedSkills.length > 0 ? selectedSkills : undefined,
     attachments: attachments.length > 0 ? attachments : undefined,
     references: references.length > 0 ? references : undefined,
+    responseAnnotations: responseAnnotations.length > 0 ? responseAnnotations : undefined,
     turnId: `turn-${turnIndex}`,
     turnIndex,
   }
@@ -309,7 +447,10 @@ function appendAgentResult(
     turnId: `turn-${turnIndex}`,
     turnIndex,
   }
-  messages.value = [...messages.value.filter((item) => !item.id.startsWith('pending-assistant-')), userMessage, ...resultMessages, assistantMessage]
+  // 批注的显示标记属于被选中的旧 AI 回复；同时把同一份结构化数据放进
+  // 新用户消息，供 Pi/JSONL 会话作为下一轮上下文持久化。两处使用同一 ID，
+  // 不会在恢复或再次渲染时生成重复编号。
+  messages.value = [...annotatedBaseMessages, userMessage, ...resultMessages, assistantMessage]
   snapshot.value = {
     ...snapshot.value,
     pending_changes: result.pending_changes,
@@ -353,8 +494,9 @@ function insertFileMention(): void {
 async function onSubmit(payload: SubmitPayload): Promise<void> {
   const text = payload.text.trim()
   const attachments = (payload.attachments ?? []).filter((attachment) => attachment.status === 'ready')
+  const responseAnnotations = payload.responseAnnotations ?? []
   const visibleAttachments = messageAttachments(attachments)
-  if ((!text && attachments.length === 0) || isBusy.value) return
+  if ((!text && attachments.length === 0 && responseAnnotations.length === 0) || isBusy.value) return
   isBusy.value = true
   liveOverlay.value = {
     activityLabel: '正在处理 PLC 任务',
@@ -363,17 +505,20 @@ async function onSubmit(payload: SubmitPayload): Promise<void> {
     errorText: '',
   }
   const baseMessages = messages.value
-  messages.value = [
-    ...baseMessages,
-    {
-      id: newId('user'),
-      role: 'user',
-      text,
-      attachments: visibleAttachments.length > 0 ? visibleAttachments : undefined,
-      references: payload.references.length > 0 ? payload.references : undefined,
-    },
-    { id: `pending-assistant-${newId('turn')}`, role: 'assistant', text: '正在读取工程上下文…' },
-  ]
+  const pendingTurnIndex = baseMessages.filter((item) => item.role === 'user').length
+  const pendingUserMessage: UiMessage = {
+    id: newId('user'),
+    role: 'user',
+    text,
+    attachments: visibleAttachments.length > 0 ? visibleAttachments : undefined,
+    references: payload.references.length > 0 ? payload.references : undefined,
+    responseAnnotations: responseAnnotations.length > 0 ? responseAnnotations : undefined,
+    turnId: `turn-${pendingTurnIndex}`,
+    turnIndex: pendingTurnIndex,
+  }
+  // 读取上下文和模型阶段由 liveOverlay 展示；不要再插入一个 assistant 占位，
+  // 否则真实 agent-event 会与占位文案在同一轮重复出现。
+  messages.value = [...baseMessages, pendingUserMessage]
   try {
     const history = baseMessages
       .filter((item) => item.role === 'user' || item.role === 'assistant')
@@ -384,6 +529,7 @@ async function onSubmit(payload: SubmitPayload): Promise<void> {
           ?.filter((attachment) => attachment.kind === 'image' && attachment.dataBase64)
           .map((attachment) => ({ image_url: `data:${attachment.mimeType};base64,${attachment.dataBase64}` })),
         references: item.references,
+        responseAnnotations: item.responseAnnotations,
       }))
     const runOptions: AgentRunOptions = {
       model: selectedModel.value,
@@ -392,17 +538,39 @@ async function onSubmit(payload: SubmitPayload): Promise<void> {
       skills: payload.skills,
       attachments,
       references: payload.references,
+      responseAnnotations,
     }
     const result = await runAgent(text, history, agentContext.value, runOptions)
     // runAgent 返回的是本轮完整结果；以发送前的历史为基线，避免把本轮用户消息
     // 误当成历史再次拼接，或者在占位消息清理时误删上一轮消息。
     messages.value = baseMessages
-    appendAgentResult(result, text, payload.skills, visibleAttachments, payload.references)
+    appendAgentResult(result, text, payload.skills, visibleAttachments, payload.references, responseAnnotations)
+    pendingResponseAnnotations.value = []
     await refresh()
   } catch (error) {
-    messages.value = messages.value.map((item) => item.id.startsWith('pending-assistant-')
-      ? { ...item, text: `这次任务还没有完成：${error instanceof Error ? error.message : String(error)}` }
-      : item)
+    const errorText = error instanceof Error ? error.message : String(error)
+    messages.value = [
+      ...baseMessages,
+      pendingUserMessage,
+      {
+        id: newId('turn-error'),
+        role: 'assistant',
+        text: `这次任务还没有完成：${errorText}`,
+        messageType: 'turnError',
+        turnId: `turn-${pendingTurnIndex}`,
+        turnIndex: pendingTurnIndex,
+      },
+    ]
+    // 请求未完成时把批注和原始草稿放回 Composer，确保手动重试不会丢失
+    // 所选文本、用户评论及其来源消息绑定。
+    pendingResponseAnnotations.value = responseAnnotations
+    composerRef.value?.hydrateDraft({
+      text,
+      skills: payload.skills,
+      attachments,
+      references: payload.references,
+      responseAnnotations,
+    })
     liveOverlay.value = null
   } finally {
     isBusy.value = false
@@ -478,6 +646,7 @@ function isSamePath(left: string | null | undefined, right: string | null | unde
 function resetConversationForWorkspace(): void {
   activeThreadId.value = `local-${Date.now()}`
   messages.value = []
+  pendingResponseAnnotations.value = []
   diagnostics.value = []
   diagnosticNote.value = ''
   liveOverlay.value = null
@@ -548,14 +717,8 @@ async function onResumeSession(record: SessionRecord): Promise<void> {
     }
     const resumed = await resumeSession(record.path)
     activeThreadId.value = resumed.session_id
-    messages.value = resumed.messages.map((item, index) => ({
-      id: newId(item.role),
-      role: item.role === 'assistant' ? 'assistant' : 'user',
-      text: item.content,
-      attachments: (item.images ?? []).map((image, imageIndex) => restoredImageAttachment(image.image_url, index, imageIndex)),
-      turnIndex: index,
-      turnId: `restored-${index}`,
-    }))
+    pendingResponseAnnotations.value = []
+    messages.value = restoreSessionMessages(resumed)
     snapshot.value = {
       ...snapshot.value,
       session: { ...snapshot.value.session, session_id: resumed.session_id, session_file: resumed.path, name: resumed.name, message_count: resumed.message_count },
@@ -566,6 +729,111 @@ async function onResumeSession(record: SessionRecord): Promise<void> {
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
   }
+}
+
+async function onEditMessage(message: UiMessage): Promise<void> {
+  if (message.role !== 'user') return
+  const record = await forkMessageSession(message, 'before_turn')
+  if (!record) return
+  await nextTick()
+  composerRef.value?.hydrateDraft(messageDraftPayload(message))
+  showNotice('已从这条消息前创建编辑分支，请修改后发送。')
+}
+
+async function onResendMessage(message: UiMessage): Promise<void> {
+  if (message.role !== 'user') return
+  const record = await forkMessageSession(message, 'before_turn')
+  if (!record) return
+  await nextTick()
+  const attachments = (message.attachments ?? []).map((attachment) => ({
+    ...attachment,
+    status: attachment.status === 'reading' ? 'error' : attachment.status,
+  }))
+  await onSubmit({
+    text: message.text,
+    skills: message.skills ?? [],
+    attachments,
+    references: message.references ?? [],
+    responseAnnotations: message.responseAnnotations ?? [],
+    mode: 'steer',
+  })
+}
+
+async function onForkMessage(message: UiMessage): Promise<void> {
+  if (message.role !== 'assistant') return
+  const record = await forkMessageSession(message, 'through_turn', '从回复分支')
+  if (record) showNotice('已创建回复分支，会话历史已保留到这条回复。')
+}
+
+function onEditResponseAnnotation(annotation: UiResponseTextAnnotation): void {
+  conversationRef.value?.openResponseAnnotation({ ...annotation })
+}
+
+function addResponseAnnotation(annotation: UiResponseTextAnnotation): void {
+  const source = findMessageForAnnotation(annotation)
+  const normalized = source ? { ...annotation, sourceMessageId: source.id } : annotation
+  pendingResponseAnnotations.value = [
+    ...pendingResponseAnnotations.value.filter((item) => item.id !== normalized.id),
+    normalized,
+  ]
+  messages.value = messages.value.map((message) => message.id === normalized.sourceMessageId
+    ? {
+        ...message,
+        responseAnnotations: [
+          ...(message.responseAnnotations ?? []).filter((item) => item.id !== normalized.id),
+          normalized,
+        ],
+      }
+    : message)
+}
+
+function updateResponseAnnotation(annotation: UiResponseTextAnnotation): void {
+  const source = findMessageForAnnotation(annotation)
+  const normalized = source ? { ...annotation, sourceMessageId: source.id } : annotation
+  const isPending = pendingResponseAnnotations.value.some((item) => item.id === normalized.id)
+  pendingResponseAnnotations.value = isPending
+    ? pendingResponseAnnotations.value.map((item) => item.id === normalized.id ? normalized : item)
+    : [...pendingResponseAnnotations.value, normalized]
+  messages.value = messages.value.map((message) => message.id === normalized.sourceMessageId
+    ? {
+        ...message,
+        responseAnnotations: (message.responseAnnotations ?? []).map((item) => item.id === normalized.id ? normalized : item),
+      }
+    : message)
+}
+
+function findMessageForAnnotation(annotation: UiResponseTextAnnotation): UiMessage | undefined {
+  return messages.value.find((message) => message.id === annotation.sourceMessageId)
+    ?? (annotation.sourceMessageKey
+      ? messages.value.find((message) => message.role === 'assistant' && messageStableKeyForApp(message) === annotation.sourceMessageKey)
+      : undefined)
+    ?? (typeof annotation.sourceTurnIndex === 'number'
+      ? [...messages.value].reverse().find((message) => message.role === 'assistant' && message.turnIndex === annotation.sourceTurnIndex)
+      : undefined)
+    ?? messages.value.find((message) => message.responseAnnotations?.some((item) => item.id === annotation.id))
+}
+
+function messageStableKeyForApp(message: UiMessage): string {
+  const signature = `${message.role}|${message.turnIndex ?? ''}|${message.text.trim()}`
+  let hash = 2166136261
+  for (let index = 0; index < signature.length; index += 1) {
+    hash ^= signature.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  const occurrence = messages.value
+    .slice(0, Math.max(0, messages.value.indexOf(message)) + 1)
+    .filter((candidate) => `${candidate.role}|${candidate.turnIndex ?? ''}|${candidate.text.trim()}` === signature)
+    .length
+  return `${message.role}:${message.turnIndex ?? ''}:${(hash >>> 0).toString(16)}:${occurrence}`
+}
+
+function removeResponseAnnotation(id: string): void {
+  pendingResponseAnnotations.value = pendingResponseAnnotations.value.filter((item) => item.id !== id)
+  messages.value = messages.value.map((message) => {
+    if (!message.responseAnnotations?.some((item) => item.id === id)) return message
+    const responseAnnotations = message.responseAnnotations.filter((item) => item.id !== id)
+    return { ...message, responseAnnotations: responseAnnotations.length > 0 ? responseAnnotations : undefined }
+  })
 }
 
 async function onRenameSession(record: SessionRecord): Promise<void> {
@@ -673,9 +941,10 @@ function chooseCommand(command: string, supportsArgs: boolean): void {
   const payload: ComposerDraftPayload = {
     text: supportsArgs ? `${command} ` : command,
     skills: [],
+    responseAnnotations: [],
   }
   composerRef.value?.hydrateDraft(payload)
-  if (!supportsArgs) void onSubmit({ text: command, skills: [], attachments: [], references: [], mode: 'steer' })
+  if (!supportsArgs) void onSubmit({ text: command, skills: [], attachments: [], references: [], responseAnnotations: [], mode: 'steer' })
 }
 
 async function startNewThread(): Promise<void> {
@@ -924,12 +1193,20 @@ onUnmounted(() => {
 
         <div v-if="activeView === 'chat'" class="plc-chat-layout">
           <ThreadConversation
+            ref="conversationRef"
             class="plc-conversation"
             :messages="messages"
             :live-overlay="liveOverlay"
             :is-loading="isBusy && messages.length === 0"
+            :is-turn-in-progress="isBusy"
             :active-thread-id="activeThreadId"
             :cwd="currentCwd"
+            @edit-message="onEditMessage"
+            @resend-message="onResendMessage"
+            @fork-message="onForkMessage"
+            @add-response-annotation="addResponseAnnotation"
+            @update-response-annotation="updateResponseAnnotation"
+            @remove-response-annotation="removeResponseAnnotation"
           />
 
           <section v-if="pendingChanges.length > 0" class="plc-approval-strip" aria-live="polite">
@@ -958,11 +1235,15 @@ onUnmounted(() => {
             :disabled="false"
             :send-with-enter="true"
             :in-progress-submit-mode="'steer'"
+            :response-annotations="pendingResponseAnnotations"
             @submit="onSubmit"
             @interrupt="onInterrupt"
             @update:selected-collaboration-mode="collaborationMode = $event"
             @update:selected-model="selectedModel = $event"
             @update:selected-reasoning-effort="reasoningEffort = $event"
+            @update:response-annotations="pendingResponseAnnotations = $event"
+            @edit-response-annotation="onEditResponseAnnotation"
+            @remove-response-annotation="removeResponseAnnotation"
           />
         </div>
 

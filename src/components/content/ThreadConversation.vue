@@ -1,5 +1,5 @@
 <template>
-  <section class="conversation-root" @contextmenu.capture="onConversationContextMenu">
+  <section class="conversation-root" @contextmenu.capture="onConversationContextMenu" @mouseup="onConversationSelection">
     <p v-if="isLoading" class="conversation-loading">Loading messages...</p>
 
     <p
@@ -23,10 +23,11 @@
       <template v-for="message in visibleMessages" :key="message.id">
       <li
         v-if="!hiddenGroupedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
-        class="conversation-item"
-        :data-role="message.role"
-        :data-message-type="message.messageType || ''"
-      >
+         class="conversation-item"
+         :data-role="message.role"
+         :data-message-type="message.messageType || ''"
+         :data-message-id="message.id"
+       >
         <div v-if="isCommandMessage(message)" class="message-row" data-role="system">
           <div class="message-stack" data-role="system">
             <button
@@ -678,21 +679,72 @@
               </section>
 
               <div
-                v-if="showCopyResponseButton(message)"
-                class="message-toolbar"
-                :data-role="message.role"
+                v-if="message.role === 'assistant' && responseAnnotationsForMessage(message).length > 0"
+                class="response-annotation-markers"
+                aria-label="回复批注"
               >
                 <button
-                  v-if="showCopyResponseButton(message)"
+                  v-for="(annotation, annotationIndex) in responseAnnotationsForMessage(message)"
+                  :key="annotation.id"
                   type="button"
-                  class="message-copy-button"
-                  :data-copied="copiedResponseAnchorId === message.id"
-                  :aria-label="copiedResponseAnchorId === message.id ? 'Response copied' : 'Copy response'"
-                  :title="copiedResponseAnchorId === message.id ? 'Response copied' : 'Copy response'"
-                  @click="copyResponse(message.id)"
+                  class="response-annotation-marker"
+                  :data-annotation-id="annotation.id"
+                  :aria-label="`回复批注 ${annotationIndex + 1}`"
+                  :title="`回复批注 ${annotationIndex + 1}`"
+                  @click="openExistingAnnotationEditor(message, annotation, $event)"
                 >
-                  <IconTablerCopy class="icon-svg message-copy-icon" />
-                  <span class="message-copy-label">{{ copiedResponseAnchorId === message.id ? 'Copied' : 'Copy' }}</span>
+                  {{ annotationIndex + 1 }}
+                </button>
+              </div>
+
+              <div v-if="showMessageToolbar(message)" class="message-toolbar" :data-role="message.role">
+                <button
+                  v-if="showMessageCopyButton(message)"
+                  type="button"
+                  class="message-action-button"
+                  :data-copied="copiedResponseAnchorId === message.id || copiedMessageId === message.id"
+                  :aria-label="isMessageCopied(message) ? '已复制消息内容' : '复制消息内容'"
+                  :title="isMessageCopied(message) ? '已复制消息内容' : '复制消息内容'"
+                  @click="copyMessage(message)"
+                >
+                  <IconTablerCopy class="icon-svg" />
+                  <span>{{ isMessageCopied(message) ? '已复制' : '复制' }}</span>
+                </button>
+                <template v-if="message.role === 'user'">
+                  <button
+                    type="button"
+                    class="message-action-button"
+                    :disabled="props.isTurnInProgress"
+                    aria-label="编辑消息"
+                    title="编辑消息"
+                    @click="emit('edit-message', message)"
+                  >
+                    <IconTablerEdit class="icon-svg" />
+                    <span>编辑</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="message-action-button"
+                    :disabled="props.isTurnInProgress"
+                    aria-label="重新发送消息"
+                    title="重新发送消息"
+                    @click="emit('resend-message', message)"
+                  >
+                    <IconTablerRefresh class="icon-svg" />
+                    <span>重发</span>
+                  </button>
+                </template>
+                <button
+                  v-if="message.role === 'assistant'"
+                  type="button"
+                  class="message-action-button"
+                  :disabled="props.isTurnInProgress"
+                  aria-label="从这条回复 Fork 会话"
+                  title="从这条回复 Fork 会话"
+                  @click="emit('fork-message', message)"
+                >
+                  <IconTablerGitFork class="icon-svg" />
+                  <span>Fork</span>
                 </button>
               </div>
             </article>
@@ -732,6 +784,65 @@
     >
       <IconTablerArrowUp class="icon-svg jump-to-latest-icon" />
     </button>
+
+    <div
+      v-if="isSelectionCommentToolbarVisible"
+      class="message-selection-toolbar"
+      :style="selectionCommentToolbarStyle"
+      role="toolbar"
+      aria-label="选区操作"
+      @mousedown.prevent
+    >
+      <button type="button" class="message-selection-comment-button" @click="openCommentComposer">
+        <IconTablerMessageCircle class="icon-svg" />
+        <span>评论</span>
+      </button>
+    </div>
+
+    <section
+      v-if="isCommentDialogVisible"
+      ref="annotationEditorRef"
+      class="response-annotation-editor"
+      :style="annotationEditorStyle"
+      role="dialog"
+      aria-modal="false"
+      aria-label="编辑回复批注"
+      @pointerdown.stop
+    >
+      <div class="response-annotation-editor-selection" :title="pendingCommentSelection?.selectedText">
+        <span>所选文本：</span>
+        <p>{{ pendingCommentSelection?.selectedText }}</p>
+      </div>
+      <label class="response-annotation-input-label">
+        <span>用户评论：</span>
+        <textarea
+          ref="commentInputRef"
+          v-model="commentDraft"
+          rows="3"
+          maxlength="2000"
+          placeholder="添加可选评论…"
+          @keydown.ctrl.enter.prevent="saveComment"
+          @keydown.meta.enter.prevent="saveComment"
+          @keydown.esc.prevent="closeCommentComposer"
+        />
+      </label>
+      <p v-if="commentError" class="response-annotation-error" role="alert">{{ commentError }}</p>
+      <div class="response-annotation-editor-actions">
+        <button
+          v-if="pendingCommentSelection?.annotation"
+          type="button"
+          class="response-annotation-delete"
+          aria-label="删除批注"
+          title="删除批注"
+          @click="removeAnnotation(pendingCommentSelection.annotation)"
+        >
+          <IconTablerTrash class="icon-svg" />
+        </button>
+        <span class="response-annotation-editor-spacer" />
+        <button type="button" class="response-annotation-cancel" @click="closeCommentComposer">取消</button>
+        <button type="button" class="response-annotation-save" :disabled="!commentDraft.trim()" @click="saveComment">保存</button>
+      </div>
+    </section>
 
     <div
       v-if="isFileLinkContextMenuVisible"
@@ -877,7 +988,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiMentionReference, UiPlanStep } from '../../types/codex'
+import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiMentionReference, UiPlanStep, UiResponseTextAnnotation } from '../../types/codex'
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
@@ -886,9 +997,14 @@ import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
+import IconTablerEdit from '../icons/IconTablerEdit.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
 import IconTablerFolder from '../icons/IconTablerFolder.vue'
+import IconTablerGitFork from '../icons/IconTablerGitFork.vue'
+import IconTablerMessageCircle from '../icons/IconTablerMessageCircle.vue'
+import IconTablerRefresh from '../icons/IconTablerRefresh.vue'
 import IconTablerTerminal from '../icons/IconTablerTerminal.vue'
+import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 
 type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
@@ -1282,6 +1398,7 @@ const props = defineProps<{
   messages: UiMessage[]
   liveOverlay: UiLiveOverlay | null
   isLoading: boolean
+  isTurnInProgress?: boolean
   activeThreadId: string
   cwd: string
   hasMorePersistedAbove?: boolean
@@ -1289,9 +1406,37 @@ const props = defineProps<{
   loadEarlierMessages?: (threadId: string) => Promise<void>
 }>()
 
+const emit = defineEmits<{
+  'edit-message': [message: UiMessage]
+  'resend-message': [message: UiMessage]
+  'fork-message': [message: UiMessage]
+  'add-response-annotation': [annotation: UiResponseTextAnnotation]
+  'update-response-annotation': [annotation: UiResponseTextAnnotation]
+  'remove-response-annotation': [id: string]
+}>()
+
+export type ThreadConversationExposed = {
+  jumpToLatest: () => void
+  /** 从 Composer 批注芯片重新打开对应 AI 回复的编辑浮层。 */
+  openResponseAnnotation: (annotation: UiResponseTextAnnotation) => void
+}
+
 const conversationListRef = ref<HTMLElement | null>(null)
 const bottomAnchorRef = ref<HTMLElement | null>(null)
 const copiedResponseAnchorId = ref('')
+const copiedMessageId = ref('')
+const commentInputRef = ref<HTMLTextAreaElement | null>(null)
+const annotationEditorRef = ref<HTMLElement | null>(null)
+const pendingCommentSelection = ref<{
+  message: UiMessage
+  selectedText: string
+  x: number
+  y: number
+  annotation?: UiResponseTextAnnotation
+} | null>(null)
+const isCommentDialogVisible = ref(false)
+const commentDraft = ref('')
+const commentError = ref('')
 const fileChangeActionState = ref<Record<string, 'idle' | 'undoing' | 'redoing' | 'undone' | 'redone'>>({})
 const fileChangeActionError = ref<Record<string, string>>({})
 const fileChangeRedoPatchIds = ref<Record<string, string[]>>({})
@@ -1763,6 +1908,225 @@ const copyableResponseContentByAnchorId = computed<Record<string, string>>(() =>
 
 function showCopyResponseButton(message: UiMessage): boolean {
   return typeof copyableResponseContentByAnchorId.value[message.id] === 'string'
+}
+
+const isSelectionCommentToolbarVisible = computed(() => Boolean(
+  pendingCommentSelection.value && !isCommentDialogVisible.value,
+))
+const selectionCommentToolbarStyle = computed(() => {
+  const selection = pendingCommentSelection.value
+  if (!selection || typeof window === 'undefined') return {}
+  const left = Math.min(Math.max(selection.x, 8), Math.max(8, window.innerWidth - 112))
+  const top = Math.min(Math.max(selection.y, 8), Math.max(8, window.innerHeight - 52))
+  return { left: `${left}px`, top: `${top}px` }
+})
+
+const annotationEditorStyle = computed(() => {
+  const selection = pendingCommentSelection.value
+  if (!selection || typeof window === 'undefined') return {}
+  const width = Math.min(294, Math.max(220, window.innerWidth - 24))
+  const left = Math.min(Math.max(selection.x - 8, 12), Math.max(12, window.innerWidth - width - 12))
+  const top = Math.min(Math.max(selection.y, 12), Math.max(12, window.innerHeight - 236))
+  return { left: `${left}px`, top: `${top}px`, width: `${width}px` }
+})
+
+function messageSignature(message: UiMessage): string {
+  return `${message.role}|${message.turnIndex ?? ''}|${message.text.trim()}`
+}
+
+function hashMessageSignature(value: string): string {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(16)
+}
+
+function messageStableKey(message: UiMessage): string {
+  const signature = messageSignature(message)
+  const index = props.messages.indexOf(message)
+  let occurrence = 0
+  if (index >= 0) {
+    for (let cursor = 0; cursor <= index; cursor += 1) {
+      if (messageSignature(props.messages[cursor] as UiMessage) === signature) occurrence += 1
+    }
+  }
+  return `${message.role}:${message.turnIndex ?? ''}:${hashMessageSignature(signature)}:${occurrence}`
+}
+
+function responseAnnotationsForMessage(message: UiMessage): UiResponseTextAnnotation[] {
+  if (message.role !== 'assistant' || !Array.isArray(message.responseAnnotations)) return []
+  return message.responseAnnotations.filter((annotation) => (
+    Boolean(annotation)
+    && typeof annotation.id === 'string'
+    && typeof annotation.selectedText === 'string'
+    && typeof annotation.body === 'string'
+    && annotation.selectedText.trim().length > 0
+    && annotation.body.trim().length > 0
+  ))
+}
+
+function messageCopyContent(message: UiMessage): string {
+  return copyableResponseContentByAnchorId.value[message.id]
+    || buildCopyableMessageContent(message)
+    || message.text.trim()
+}
+
+function showMessageCopyButton(message: UiMessage): boolean {
+  return (message.role === 'user' || message.role === 'assistant') && Boolean(messageCopyContent(message))
+}
+
+function showMessageToolbar(message: UiMessage): boolean {
+  return message.role === 'user' || message.role === 'assistant'
+}
+
+function isMessageCopied(message: UiMessage): boolean {
+  return copiedResponseAnchorId.value === message.id || copiedMessageId.value === message.id
+}
+
+async function copyMessage(message: UiMessage): Promise<void> {
+  const content = messageCopyContent(message)
+  if (!content) return
+  if (message.role === 'assistant' && copyableResponseContentByAnchorId.value[message.id]) {
+    await copyResponse(message.id)
+    return
+  }
+
+  let copied = false
+  try {
+    await copyTextToClipboard(content)
+    copied = true
+  } catch {
+    copied = copyTextWithSelectionFallback(content)
+  }
+  if (!copied) return
+  copiedMessageId.value = message.id
+  if (copiedMessageResetTimer) clearTimeout(copiedMessageResetTimer)
+  copiedMessageResetTimer = setTimeout(() => {
+    if (copiedMessageId.value === message.id) copiedMessageId.value = ''
+    copiedMessageResetTimer = null
+  }, 1800)
+}
+
+function selectionMessageFromEvent(event: MouseEvent): UiMessage | null {
+  if (!(event.target instanceof Node)) return null
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null
+  const selectedText = selection.toString().trim()
+  if (!selectedText || selectedText.length > 4000) return null
+  const anchorNode = selection.anchorNode
+  const focusNode = selection.focusNode
+  const anchorElement = anchorNode instanceof Element ? anchorNode : anchorNode?.parentElement
+  const focusElement = focusNode instanceof Element ? focusNode : focusNode?.parentElement
+  const item = anchorElement?.closest<HTMLElement>('.conversation-item[data-message-id]')
+  const focusItem = focusElement?.closest<HTMLElement>('.conversation-item[data-message-id]')
+  if (!item || item !== focusItem) return null
+  const textRoot = anchorElement?.closest<HTMLElement>('.message-text-flow, .plan-card, .message-blockquote, .message-heading, .message-list, .message-code-block')
+  const focusTextRoot = focusElement?.closest<HTMLElement>('.message-text-flow, .plan-card, .message-blockquote, .message-heading, .message-list, .message-code-block')
+  if (!textRoot || textRoot !== focusTextRoot || !item.contains(textRoot)) return null
+  const messageId = item.dataset.messageId
+  const message = props.messages.find((candidate) => candidate.id === messageId)
+  // Codex 只允许对 AI 回复的文字发起选区评论；用户消息的操作栏不提供评论入口。
+  if (!message || message.role !== 'assistant' || !message.text.trim()) return null
+  const range = selection.getRangeAt(0)
+  const rects = Array.from(range.getClientRects())
+  const rect = rects[rects.length - 1] ?? range.getBoundingClientRect()
+  const x = Math.round(rect.right - Math.min(18, Math.max(0, rect.width / 2)))
+  const y = Math.round(rect.bottom + 8)
+  pendingCommentSelection.value = { message, selectedText, x, y }
+  return message
+}
+
+function onConversationSelection(event: MouseEvent): void {
+  if (isCommentDialogVisible.value) return
+  if (!selectionMessageFromEvent(event)) {
+    pendingCommentSelection.value = null
+  }
+}
+
+function openCommentComposer(): void {
+  if (!pendingCommentSelection.value) return
+  commentDraft.value = pendingCommentSelection.value.annotation?.body ?? ''
+  commentError.value = ''
+  isCommentDialogVisible.value = true
+  void nextTick(() => commentInputRef.value?.focus())
+}
+
+function openExistingAnnotationEditor(
+  message: UiMessage,
+  annotation: UiResponseTextAnnotation,
+  targetOrEvent: HTMLElement | MouseEvent | null,
+): void {
+  const target = targetOrEvent instanceof HTMLElement
+    ? targetOrEvent
+    : targetOrEvent?.currentTarget instanceof HTMLElement ? targetOrEvent.currentTarget : null
+  const rect = target?.getBoundingClientRect() ?? null
+  pendingCommentSelection.value = {
+    message,
+    selectedText: annotation.selectedText,
+    x: Math.round(rect?.left ?? 0),
+    y: Math.round((rect?.bottom ?? 0) + 8),
+    annotation,
+  }
+  commentDraft.value = annotation.body
+  commentError.value = ''
+  isCommentDialogVisible.value = true
+  void nextTick(() => commentInputRef.value?.focus())
+}
+
+function closeCommentComposer(): void {
+  isCommentDialogVisible.value = false
+  pendingCommentSelection.value = null
+  commentDraft.value = ''
+  commentError.value = ''
+  window.getSelection()?.removeAllRanges()
+}
+
+function saveComment(): void {
+  const selection = pendingCommentSelection.value
+  const body = commentDraft.value.trim()
+  if (!selection) return
+  if (!body) {
+    commentError.value = '请先写下评论内容。'
+    return
+  }
+  const annotation = selection.annotation
+    ? { ...selection.annotation, body }
+    : {
+        id: `response-annotation-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`,
+        sourceMessageId: selection.message.id,
+        sourceMessageKey: messageStableKey(selection.message),
+        sourceTurnIndex: selection.message.turnIndex,
+        selectedText: selection.selectedText,
+        body,
+        createdAt: new Date().toISOString(),
+      }
+  if (selection.annotation) {
+    emit('update-response-annotation', annotation)
+  } else {
+    emit('add-response-annotation', annotation)
+  }
+  closeCommentComposer()
+}
+
+function removeAnnotation(annotation: UiResponseTextAnnotation): void {
+  emit('remove-response-annotation', annotation.id)
+  closeCommentComposer()
+}
+
+function openResponseAnnotation(annotation: UiResponseTextAnnotation): void {
+  const message = props.messages.find((candidate) => candidate.id === annotation.sourceMessageId)
+    ?? (annotation.sourceMessageKey
+      ? props.messages.find((candidate) => messageStableKey(candidate) === annotation.sourceMessageKey)
+      : undefined)
+    ?? (typeof annotation.sourceTurnIndex === 'number'
+      ? [...props.messages].reverse().find((candidate) => candidate.role === 'assistant' && candidate.turnIndex === annotation.sourceTurnIndex)
+      : undefined)
+  if (!message || message.role !== 'assistant') return
+  const marker = Array.from(document.querySelectorAll<HTMLElement>('.response-annotation-marker'))
+    .find((candidate) => candidate.dataset.annotationId === annotation.id) ?? null
+  openExistingAnnotationEditor(message, annotation, marker)
 }
 
 function mergeFileChangeDiff(first: string, second: string): string {
@@ -3667,8 +4031,9 @@ async function loadMoreAbove(): Promise<void> {
   }
 }
 
-defineExpose({
+defineExpose<ThreadConversationExposed>({
   jumpToLatest,
+  openResponseAnnotation,
 })
 
 async function scheduleConversationScroll(): Promise<void> {
@@ -3780,6 +4145,8 @@ watch(
 watch(
   () => props.activeThreadId,
   async () => {
+    pendingCommentSelection.value = null
+    isCommentDialogVisible.value = false
     autoFollowOutput.value = true
     isLoadingMore.value = false
     fileChangeActionState.value = {}
@@ -3789,7 +4156,7 @@ watch(
     renderWindowStart.value = Math.max(0, props.messages.length - RENDER_WINDOW_SIZE)
     await scheduleConversationScroll()
   },
-  { flush: 'post' },
+  { flush: 'post', immediate: true },
 )
 
 function onConversationScroll(): void {
@@ -3801,8 +4168,18 @@ function onConversationScroll(): void {
   }
 }
 
+function onWindowPointerDownForAnnotation(event: PointerEvent): void {
+  if (!isCommentDialogVisible.value && !pendingCommentSelection.value) return
+  const target = event.target
+  if (!(target instanceof Node)) return
+  if (annotationEditorRef.value?.contains(target)) return
+  if (target instanceof Element && target.closest('.message-selection-toolbar, .response-annotation-marker')) return
+  closeCommentComposer()
+}
+
 onMounted(() => {
   window.addEventListener('pointerdown', onWindowPointerDownForFileLinkContextMenu)
+  window.addEventListener('pointerdown', onWindowPointerDownForAnnotation)
   window.addEventListener('blur', onWindowBlurForFileLinkContextMenu)
   window.addEventListener('keydown', onWindowKeydownForFileLinkContextMenu)
 })
@@ -3822,9 +4199,11 @@ onBeforeUnmount(() => {
     copiedMessageResetTimer = null
   }
   window.removeEventListener('pointerdown', onWindowPointerDownForFileLinkContextMenu)
+  window.removeEventListener('pointerdown', onWindowPointerDownForAnnotation)
   window.removeEventListener('blur', onWindowBlurForFileLinkContextMenu)
   window.removeEventListener('keydown', onWindowKeydownForFileLinkContextMenu)
 })
+
 </script>
 
 <style scoped>
@@ -3948,6 +4327,26 @@ onBeforeUnmount(() => {
   @apply opacity-100;
 }
 
+.message-action-button {
+  @apply inline-flex h-6 items-center gap-1 rounded-md border border-transparent bg-transparent px-1.5 text-[10px] font-medium leading-none text-slate-500 transition hover:border-slate-200 hover:bg-white hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40;
+}
+
+.message-action-button :deep(svg) {
+  @apply h-3.5 w-3.5 shrink-0;
+}
+
+.message-action-button[data-copied='true'] {
+  @apply border-emerald-200 bg-emerald-50 text-emerald-700;
+}
+
+:global(.dark) .message-action-button {
+  @apply text-slate-400 hover:border-slate-700 hover:bg-slate-800 hover:text-slate-100;
+}
+
+:global(.dark) .message-action-button[data-copied='true'] {
+  @apply border-emerald-800 bg-emerald-950/40 text-emerald-300;
+}
+
 .message-copy-button {
   @apply inline-flex items-center gap-0.5 rounded-full border border-slate-200 bg-white/90 px-1.25 py-0.5 text-[9px] font-medium leading-none text-slate-500 transition hover:border-slate-300 hover:bg-white hover:text-slate-900;
 }
@@ -3958,6 +4357,217 @@ onBeforeUnmount(() => {
 
 .message-copy-icon {
   @apply text-[10px];
+}
+
+.message-selection-toolbar {
+  @apply fixed z-[80] flex items-center rounded-md border border-slate-200 bg-white p-1 shadow-xl shadow-slate-900/15;
+}
+
+.message-selection-comment-button {
+  @apply inline-flex h-7 items-center gap-1.5 rounded px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-100 hover:text-slate-950;
+}
+
+.message-selection-comment-button :deep(svg) { @apply h-3.5 w-3.5; }
+
+.message-body[data-role='assistant'] {
+  position: relative;
+}
+
+.response-annotation-markers {
+  position: absolute;
+  top: 1px;
+  right: -34px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: center;
+}
+
+.response-annotation-marker {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  border-radius: 50%;
+  background: #1683ff;
+  color: #fff;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 2px 7px rgba(0, 0, 0, 0.28);
+  transition: transform 140ms ease, background-color 140ms ease;
+}
+
+.response-annotation-marker:hover,
+.response-annotation-marker:focus-visible {
+  background: #0b6ed9;
+  outline: none;
+  transform: scale(1.08);
+}
+
+.response-annotation-editor {
+  position: fixed;
+  z-index: 91;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(310px, calc(100vh - 24px));
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 12px;
+  background: #252a31;
+  padding: 10px;
+  color: #e5e7eb;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.42), 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+
+.response-annotation-editor-selection {
+  min-width: 0;
+  padding: 1px 2px 0;
+}
+
+.response-annotation-editor-selection span,
+.response-annotation-input-label > span {
+  display: block;
+  color: #9ca3af;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.response-annotation-editor-selection p {
+  display: -webkit-box;
+  margin: 3px 0 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: #d1d5db;
+  font-size: 11px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.response-annotation-input-label {
+  display: grid;
+  gap: 4px;
+}
+
+.response-annotation-input-label textarea {
+  width: 100%;
+  min-height: 66px;
+  resize: vertical;
+  border: 0;
+  border-radius: 7px;
+  background: #1b1f24;
+  padding: 7px 8px;
+  color: #f3f4f6;
+  font: 12px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  outline: none;
+}
+
+.response-annotation-input-label textarea:focus {
+  box-shadow: 0 0 0 2px rgba(22, 131, 255, 0.55);
+}
+
+.response-annotation-input-label textarea::placeholder {
+  color: #6b7280;
+}
+
+.response-annotation-error {
+  margin: 0;
+  color: #fca5a5;
+  font-size: 10px;
+}
+
+.response-annotation-editor-actions {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 6px;
+}
+
+.response-annotation-editor-spacer {
+  flex: 1 1 auto;
+}
+
+.response-annotation-delete,
+.response-annotation-cancel,
+.response-annotation-save {
+  display: inline-flex;
+  min-height: 27px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 999px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  transition: background-color 140ms ease, color 140ms ease, transform 140ms ease;
+}
+
+.response-annotation-delete {
+  width: 27px;
+  padding: 0;
+  background: transparent;
+  color: #9ca3af;
+}
+
+.response-annotation-delete:hover {
+  background: rgba(248, 113, 113, 0.14);
+  color: #fca5a5;
+}
+
+.response-annotation-delete :deep(svg) {
+  width: 14px;
+  height: 14px;
+}
+
+.response-annotation-cancel {
+  background: #30363f;
+  color: #d1d5db;
+}
+
+.response-annotation-cancel:hover {
+  background: #3a424d;
+  color: #fff;
+}
+
+.response-annotation-save {
+  background: #e5edf6;
+  color: #111827;
+}
+
+.response-annotation-save:hover:not(:disabled) {
+  background: #fff;
+  transform: translateY(-1px);
+}
+
+.response-annotation-save:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+@media (max-width: 767px) {
+  .response-annotation-markers {
+    position: static;
+    flex-direction: row;
+    justify-content: flex-end;
+    margin: 5px 0 0;
+  }
+}
+
+:global(.dark) .message-selection-toolbar {
+  @apply border-slate-700 bg-slate-900;
+}
+
+:global(.dark) .message-selection-comment-button { @apply text-slate-200 hover:bg-slate-800 hover:text-white; }
+
+@media (max-width: 767px) {
+  .message-toolbar { opacity: 1; }
 }
 
 .message-copy-label {

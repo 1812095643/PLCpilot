@@ -5,6 +5,7 @@ import type {
   CollaborationModeOption,
   ReasoningEffort,
   UiMentionReference,
+  UiResponseTextAnnotation,
   UiThreadTokenUsage,
 } from '../../types/codex'
 import type { ComposerAttachment, ComposerAttachmentDraft } from '../../composables/useComposerAttachments'
@@ -21,6 +22,7 @@ import ComposerCommandPopup from './ComposerCommandPopup.vue'
 import ComposerDropdown from './ComposerDropdown.vue'
 import ComposerSearchDropdown from './ComposerSearchDropdown.vue'
 import ComposerAttachmentStrip from './ComposerAttachmentStrip.vue'
+import ComposerResponseAnnotationStrip from './ComposerResponseAnnotationStrip.vue'
 import ComposerMentionPopup from './ComposerMentionPopup.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
@@ -41,6 +43,7 @@ export type ComposerDraftPayload = {
   skills: Array<{ name: string; path: string }>
   attachments?: ComposerAttachmentDraft[]
   references?: UiMentionReference[]
+  responseAnnotations?: UiResponseTextAnnotation[]
 }
 
 export type SubmitPayload = {
@@ -48,6 +51,7 @@ export type SubmitPayload = {
   skills: Array<{ name: string; path: string }>
   attachments: ComposerAttachment[]
   references: UiMentionReference[]
+  responseAnnotations: UiResponseTextAnnotation[]
   mode: 'steer' | 'queue'
 }
 
@@ -70,6 +74,7 @@ const props = withDefaults(defineProps<{
   threadTokenUsage?: UiThreadTokenUsage | null
   isTurnInProgress?: boolean
   disabled?: boolean
+  responseAnnotations?: UiResponseTextAnnotation[]
   sendWithEnter?: boolean
   inProgressSubmitMode?: 'steer' | 'queue'
 }>(), {
@@ -79,6 +84,7 @@ const props = withDefaults(defineProps<{
     { value: 'plan', label: '计划' },
   ],
   skills: () => [],
+  responseAnnotations: () => [],
   threadTokenUsage: null,
   isTurnInProgress: false,
   disabled: false,
@@ -93,11 +99,15 @@ const emit = defineEmits<{
   'update:selected-collaboration-mode': [mode: CollaborationModeKind]
   'update:selected-model': [modelId: string]
   'update:selected-reasoning-effort': [effort: ReasoningEffort | '']
+  'update:response-annotations': [annotations: UiResponseTextAnnotation[]]
+  'edit-response-annotation': [annotation: UiResponseTextAnnotation]
+  'remove-response-annotation': [id: string]
 }>()
 
 const DRAFT_STORAGE_PREFIX = 'plc-pilot.thread-draft.v2.'
 const draft = shallowRef('')
 const selectedSkills = shallowRef<SkillItem[]>([])
+const draftResponseAnnotations = shallowRef<UiResponseTextAnnotation[]>([])
 const activeInProgressMode = shallowRef<'steer' | 'queue'>(props.inProgressSubmitMode)
 const isFileMentionOpen = shallowRef(false)
 const mentionQuery = shallowRef('')
@@ -167,8 +177,8 @@ const isPlanMode = computed(() => props.selectedCollaborationMode === 'plan')
 const placeholder = computed(() => isInteractionDisabled.value
   ? '先选择一个本地 CODESYS 工程'
   : '描述要检查、修改或诊断的 PLC 任务…')
-const hasUnsavedDraft = computed(() => draft.value.trim().length > 0 || selectedSkills.value.length > 0 || attachments.value.length > 0 || mentionReferences.value.length > 0)
-const canSubmit = computed(() => !isInteractionDisabled.value && !isAttachmentReading.value && (draft.value.trim().length > 0 || hasReadyAttachment.value))
+const hasUnsavedDraft = computed(() => draft.value.trim().length > 0 || selectedSkills.value.length > 0 || attachments.value.length > 0 || mentionReferences.value.length > 0 || draftResponseAnnotations.value.length > 0)
+const canSubmit = computed(() => !isInteractionDisabled.value && !isAttachmentReading.value && (draft.value.trim().length > 0 || hasReadyAttachment.value || draftResponseAnnotations.value.length > 0))
 
 const contextView = computed(() => {
   const usage = props.threadTokenUsage
@@ -204,7 +214,22 @@ function getDraftStorageKey(threadId: string): string {
 }
 
 function emptyPayload(): ComposerDraftPayload {
-  return { text: '', skills: [], attachments: [], references: [] }
+  return { text: '', skills: [], attachments: [], references: [], responseAnnotations: [] }
+}
+
+function validResponseAnnotations(value: unknown): UiResponseTextAnnotation[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((annotation): annotation is UiResponseTextAnnotation => Boolean(annotation)
+      && typeof annotation === 'object'
+      && typeof (annotation as UiResponseTextAnnotation).id === 'string'
+      && typeof (annotation as UiResponseTextAnnotation).sourceMessageId === 'string'
+      && typeof (annotation as UiResponseTextAnnotation).selectedText === 'string'
+      && typeof (annotation as UiResponseTextAnnotation).body === 'string'
+      && typeof (annotation as UiResponseTextAnnotation).createdAt === 'string'
+      && (annotation as UiResponseTextAnnotation).selectedText.trim().length > 0
+      && (annotation as UiResponseTextAnnotation).body.trim().length > 0)
+    .slice(0, 32)
 }
 
 function validMentionReferences(value: unknown): UiMentionReference[] {
@@ -244,6 +269,7 @@ function readDraft(threadId: string): ComposerDraftPayload | null {
         ? value.attachments as ComposerAttachmentDraft[]
         : [],
       references: validMentionReferences(value.references),
+      responseAnnotations: validResponseAnnotations(value.responseAnnotations),
     }
   } catch {
     return null
@@ -257,9 +283,10 @@ function persistDraft(threadId: string): void {
     skills: selectedSkills.value.map((skill) => ({ name: skill.name, path: skill.path })),
     attachments: serializeAttachments(),
     references: mentionReferences.value,
+    responseAnnotations: draftResponseAnnotations.value,
   }
   try {
-    if (payload.text.trim() || payload.skills.length > 0 || payload.attachments.length > 0) {
+    if (payload.text.trim() || payload.skills.length > 0 || payload.attachments.length > 0 || payload.references.length > 0 || payload.responseAnnotations.length > 0) {
       try {
         window.localStorage.setItem(getDraftStorageKey(threadId), JSON.stringify(payload))
       } catch {
@@ -288,6 +315,8 @@ function replaceDraft(payload: ComposerDraftPayload): void {
     ?? { name: item.name, path: item.path, description: '' })
   restoreAttachments(payload.attachments)
   mentionReferences.value = validMentionReferences(payload.references)
+  draftResponseAnnotations.value = validResponseAnnotations(payload.responseAnnotations)
+  emit('update:response-annotations', draftResponseAnnotations.value)
   pruneMentionReferences()
   closeFileMention()
   resetSlashCommandPopup()
@@ -321,6 +350,7 @@ function submitCurrent(mode: 'steer' | 'queue' = props.isTurnInProgress ? active
     skills: selectedSkills.value.map((skill) => ({ name: skill.name, path: skill.path })),
     attachments: serializeAttachments().filter((attachment) => attachment.status === 'ready'),
     references: mentionReferences.value,
+    responseAnnotations: draftResponseAnnotations.value,
     mode,
   })
   clearDraft()
@@ -791,6 +821,15 @@ function removeSkill(path: string): void {
   selectedSkills.value = selectedSkills.value.filter((item) => item.path !== path)
 }
 
+function removeResponseAnnotation(id: string): void {
+  draftResponseAnnotations.value = draftResponseAnnotations.value.filter((annotation) => annotation.id !== id)
+  emit('update:response-annotations', draftResponseAnnotations.value)
+}
+
+function editResponseAnnotation(annotation: UiResponseTextAnnotation): void {
+  emit('edit-response-annotation', annotation)
+}
+
 function onDocumentPointerDown(event: PointerEvent): void {
   if (!isFileMentionOpen.value && !isSlashCommandOpen.value) return
   const root = composerRootRef.value
@@ -804,6 +843,13 @@ watch(() => props.inProgressSubmitMode, (value) => {
   activeInProgressMode.value = value
 })
 
+watch(() => props.responseAnnotations, (value) => {
+  const next = validResponseAnnotations(value)
+  if (JSON.stringify(next) !== JSON.stringify(draftResponseAnnotations.value)) {
+    draftResponseAnnotations.value = next
+  }
+}, { deep: true, immediate: true })
+
 watch(() => props.activeThreadId, (threadId) => {
   if (lastActiveThreadId) persistDraft(lastActiveThreadId)
   const restored = readDraft(threadId)
@@ -811,7 +857,7 @@ watch(() => props.activeThreadId, (threadId) => {
   lastActiveThreadId = threadId.trim()
 }, { immediate: true })
 
-watch([draft, selectedSkillPaths, attachments], () => {
+watch([draft, selectedSkillPaths, attachments, mentionReferences, draftResponseAnnotations], () => {
   if (lastActiveThreadId) persistDraft(lastActiveThreadId)
 })
 
@@ -864,7 +910,14 @@ defineExpose<ThreadComposerExposed>({
           @update:highlighted-index="mentionHighlightedIndex = $event"
         />
 
-        <ComposerAttachmentStrip :attachments="attachments" @remove="removeAttachment" />
+        <div v-if="draftResponseAnnotations.length > 0 || attachments.length > 0" class="plc-composer-context-row">
+          <ComposerResponseAnnotationStrip
+            :annotations="draftResponseAnnotations"
+            @edit="editResponseAnnotation"
+            @remove="removeResponseAnnotation"
+          />
+          <ComposerAttachmentStrip :attachments="attachments" @remove="removeAttachment" />
+        </div>
         <textarea
           ref="inputRef"
           v-model="draft"
@@ -1024,6 +1077,21 @@ defineExpose<ThreadComposerExposed>({
 .plc-composer-chip button { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 15px; line-height: 1; padding: 0 1px; }
 
 .plc-composer-editor { position: relative; padding: 12px 14px 8px; }
+
+.plc-composer-context-row {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.plc-composer-context-row :deep(.composer-attachment-strip) {
+  flex: 1 1 240px;
+  margin: 0;
+  padding: 0;
+}
 
 .plc-thread-composer.is-drag-active .plc-composer-shell { border-color: var(--plc-dark-accent, #007acc); box-shadow: 0 0 0 3px rgba(0, 122, 204, 0.14); }
 .plc-composer-file-input { display: none; }
