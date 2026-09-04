@@ -1,5 +1,5 @@
 <template>
-  <section class="conversation-root" @contextmenu.capture="onConversationContextMenu" @mouseup="onConversationSelection">
+  <section ref="conversationRootRef" class="conversation-root" @contextmenu.capture="onConversationContextMenu" @mouseup="onConversationSelection">
     <p v-if="isLoading" class="conversation-loading">Loading messages...</p>
 
     <p
@@ -1421,6 +1421,7 @@ export type ThreadConversationExposed = {
   openResponseAnnotation: (annotation: UiResponseTextAnnotation) => void
 }
 
+const conversationRootRef = ref<HTMLElement | null>(null)
 const conversationListRef = ref<HTMLElement | null>(null)
 const bottomAnchorRef = ref<HTMLElement | null>(null)
 const copiedResponseAnchorId = ref('')
@@ -1488,6 +1489,7 @@ type MessageBlock =
 
 let conversationScrollFrame = 0
 let bottomLockFrame = 0
+let selectionChangeFrame = 0
 let bottomLockFramesLeft = 0
 let copiedMessageResetTimer: ReturnType<typeof setTimeout> | null = null
 let conversationScrollPromise: Promise<void> | null = null
@@ -2009,8 +2011,18 @@ async function copyMessage(message: UiMessage): Promise<void> {
   }, 1800)
 }
 
-function selectionMessageFromEvent(event: MouseEvent): UiMessage | null {
-  if (!(event.target instanceof Node)) return null
+/**
+ * 根据浏览器当前选区定位可评论的 AI 回复。
+ *
+ * 之前这里同时依赖 mouseup 事件目标和“起点、终点属于同一个 Markdown
+ * block”的条件。鼠标松开在容器外、键盘扩选，或跨段落/列表选择时，事件
+ * 目标与 block 条件都会让合法选区被误判为空，导致评论按钮偶发不出现。
+ * 现在只要求选区两端位于同一条消息的 message-card 内容区，并由
+ * document.selectionchange + mouseup 统一刷新，因此跨 Markdown 块的选区
+ * 也能稳定显示评论入口，同时仍不会把用户消息或其他页面选区误当成回复。
+ */
+function selectionMessageFromCurrentSelection(): UiMessage | null {
+  if (typeof window === 'undefined') return null
   const selection = window.getSelection()
   if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null
   const selectedText = selection.toString().trim()
@@ -2021,10 +2033,18 @@ function selectionMessageFromEvent(event: MouseEvent): UiMessage | null {
   const focusElement = focusNode instanceof Element ? focusNode : focusNode?.parentElement
   const item = anchorElement?.closest<HTMLElement>('.conversation-item[data-message-id]')
   const focusItem = focusElement?.closest<HTMLElement>('.conversation-item[data-message-id]')
-  if (!item || item !== focusItem) return null
-  const textRoot = anchorElement?.closest<HTMLElement>('.message-text-flow, .plan-card, .message-blockquote, .message-heading, .message-list, .message-code-block')
-  const focusTextRoot = focusElement?.closest<HTMLElement>('.message-text-flow, .plan-card, .message-blockquote, .message-heading, .message-list, .message-code-block')
-  if (!textRoot || textRoot !== focusTextRoot || !item.contains(textRoot)) return null
+  if (!item || item !== focusItem || !conversationRootRef.value?.contains(item)) return null
+  const messageCard = anchorElement?.closest<HTMLElement>('.message-card')
+  const focusMessageCard = focusElement?.closest<HTMLElement>('.message-card')
+  const contentRoot = anchorElement?.closest<HTMLElement>('.message-text-flow, .plan-card')
+  const focusContentRoot = focusElement?.closest<HTMLElement>('.message-text-flow, .plan-card')
+  if (
+    !messageCard
+    || messageCard !== focusMessageCard
+    || !contentRoot
+    || contentRoot !== focusContentRoot
+    || !item.contains(messageCard)
+  ) return null
   const messageId = item.dataset.messageId
   const message = props.messages.find((candidate) => candidate.id === messageId)
   // Codex 只允许对 AI 回复的文字发起选区评论；用户消息的操作栏不提供评论入口。
@@ -2038,11 +2058,32 @@ function selectionMessageFromEvent(event: MouseEvent): UiMessage | null {
   return message
 }
 
-function onConversationSelection(event: MouseEvent): void {
+function refreshCommentSelection(): void {
   if (isCommentDialogVisible.value) return
-  if (!selectionMessageFromEvent(event)) {
+  if (!selectionMessageFromCurrentSelection()) {
     pendingCommentSelection.value = null
   }
+}
+
+function scheduleCommentSelectionRefresh(): void {
+  if (isCommentDialogVisible.value) return
+  if (selectionChangeFrame) cancelAnimationFrame(selectionChangeFrame)
+  selectionChangeFrame = requestAnimationFrame(() => {
+    selectionChangeFrame = 0
+    refreshCommentSelection()
+  })
+}
+
+function onConversationSelection(): void {
+  scheduleCommentSelectionRefresh()
+}
+
+function onDocumentSelectionChange(): void {
+  scheduleCommentSelectionRefresh()
+}
+
+function onDocumentSelectionEnd(): void {
+  scheduleCommentSelectionRefresh()
 }
 
 function openCommentComposer(): void {
@@ -4182,6 +4223,8 @@ onMounted(() => {
   window.addEventListener('pointerdown', onWindowPointerDownForAnnotation)
   window.addEventListener('blur', onWindowBlurForFileLinkContextMenu)
   window.addEventListener('keydown', onWindowKeydownForFileLinkContextMenu)
+  document.addEventListener('selectionchange', onDocumentSelectionChange)
+  document.addEventListener('mouseup', onDocumentSelectionEnd)
 })
 
 onBeforeUnmount(() => {
@@ -4194,6 +4237,10 @@ onBeforeUnmount(() => {
     cancelAnimationFrame(bottomLockFrame)
     bottomLockFrame = 0
   }
+  if (selectionChangeFrame) {
+    cancelAnimationFrame(selectionChangeFrame)
+    selectionChangeFrame = 0
+  }
   if (copiedMessageResetTimer) {
     clearTimeout(copiedMessageResetTimer)
     copiedMessageResetTimer = null
@@ -4202,6 +4249,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onWindowPointerDownForAnnotation)
   window.removeEventListener('blur', onWindowBlurForFileLinkContextMenu)
   window.removeEventListener('keydown', onWindowKeydownForFileLinkContextMenu)
+  document.removeEventListener('selectionchange', onDocumentSelectionChange)
+  document.removeEventListener('mouseup', onDocumentSelectionEnd)
 })
 
 </script>
@@ -4408,6 +4457,23 @@ onBeforeUnmount(() => {
 }
 
 .response-annotation-editor {
+  --annotation-editor-border: rgba(15, 23, 42, 0.14);
+  --annotation-editor-surface: #ffffff;
+  --annotation-editor-text: #1f2937;
+  --annotation-editor-muted: #64748b;
+  --annotation-editor-selection: #334155;
+  --annotation-editor-input: #f8fafc;
+  --annotation-editor-input-border: #cbd5e1;
+  --annotation-editor-placeholder: #94a3b8;
+  --annotation-editor-control: #e2e8f0;
+  --annotation-editor-control-text: #475569;
+  --annotation-editor-control-hover: #cbd5e1;
+  --annotation-editor-primary: #1f2937;
+  --annotation-editor-primary-text: #ffffff;
+  --annotation-editor-primary-hover: #111827;
+  --annotation-editor-danger: #b42318;
+  --annotation-editor-danger-hover: rgba(248, 113, 113, 0.14);
+  --annotation-editor-shadow: 0 0 0 1px rgba(15, 23, 42, 0.06), 0 18px 42px rgba(15, 23, 42, 0.18);
   position: fixed;
   z-index: 91;
   display: flex;
@@ -4415,12 +4481,13 @@ onBeforeUnmount(() => {
   gap: 8px;
   max-height: min(310px, calc(100vh - 24px));
   overflow: auto;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border: 1px solid var(--annotation-editor-border);
   border-radius: 12px;
-  background: #252a31;
+  background: var(--annotation-editor-surface);
   padding: 10px;
-  color: #e5e7eb;
-  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.42), 0 0 0 1px rgba(0, 0, 0, 0.12);
+  color: var(--annotation-editor-text);
+  color-scheme: light;
+  box-shadow: var(--annotation-editor-shadow);
 }
 
 .response-annotation-editor-selection {
@@ -4431,7 +4498,7 @@ onBeforeUnmount(() => {
 .response-annotation-editor-selection span,
 .response-annotation-input-label > span {
   display: block;
-  color: #9ca3af;
+  color: var(--annotation-editor-muted);
   font-size: 10px;
   font-weight: 600;
   line-height: 1.4;
@@ -4442,7 +4509,7 @@ onBeforeUnmount(() => {
   margin: 3px 0 0;
   overflow: hidden;
   overflow-wrap: anywhere;
-  color: #d1d5db;
+  color: var(--annotation-editor-selection);
   font-size: 11px;
   line-height: 1.45;
   -webkit-box-orient: vertical;
@@ -4458,26 +4525,28 @@ onBeforeUnmount(() => {
   width: 100%;
   min-height: 66px;
   resize: vertical;
-  border: 0;
+  border: 1px solid var(--annotation-editor-input-border);
   border-radius: 7px;
-  background: #1b1f24;
+  background: var(--annotation-editor-input);
   padding: 7px 8px;
-  color: #f3f4f6;
+  color: var(--annotation-editor-text);
+  caret-color: #007acc;
   font: 12px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   outline: none;
 }
 
 .response-annotation-input-label textarea:focus {
-  box-shadow: 0 0 0 2px rgba(22, 131, 255, 0.55);
+  border-color: rgba(0, 122, 204, 0.72);
+  box-shadow: 0 0 0 2px rgba(0, 122, 204, 0.2);
 }
 
 .response-annotation-input-label textarea::placeholder {
-  color: #6b7280;
+  color: var(--annotation-editor-placeholder);
 }
 
 .response-annotation-error {
   margin: 0;
-  color: #fca5a5;
+  color: var(--annotation-editor-danger);
   font-size: 10px;
 }
 
@@ -4513,12 +4582,12 @@ onBeforeUnmount(() => {
   width: 27px;
   padding: 0;
   background: transparent;
-  color: #9ca3af;
+  color: var(--annotation-editor-muted);
 }
 
 .response-annotation-delete:hover {
-  background: rgba(248, 113, 113, 0.14);
-  color: #fca5a5;
+  background: var(--annotation-editor-danger-hover);
+  color: var(--annotation-editor-danger);
 }
 
 .response-annotation-delete :deep(svg) {
@@ -4527,22 +4596,22 @@ onBeforeUnmount(() => {
 }
 
 .response-annotation-cancel {
-  background: #30363f;
-  color: #d1d5db;
+  background: var(--annotation-editor-control);
+  color: var(--annotation-editor-control-text);
 }
 
 .response-annotation-cancel:hover {
-  background: #3a424d;
-  color: #fff;
+  background: var(--annotation-editor-control-hover);
+  color: var(--annotation-editor-text);
 }
 
 .response-annotation-save {
-  background: #e5edf6;
-  color: #111827;
+  background: var(--annotation-editor-primary);
+  color: var(--annotation-editor-primary-text);
 }
 
 .response-annotation-save:hover:not(:disabled) {
-  background: #fff;
+  background: var(--annotation-editor-primary-hover);
   transform: translateY(-1px);
 }
 
@@ -4560,11 +4629,32 @@ onBeforeUnmount(() => {
   }
 }
 
-:global(.dark) .message-selection-toolbar {
+:global(:root.dark .message-selection-toolbar) {
   @apply border-slate-700 bg-slate-900;
 }
 
-:global(.dark) .message-selection-comment-button { @apply text-slate-200 hover:bg-slate-800 hover:text-white; }
+:global(:root.dark .message-selection-comment-button) { @apply text-slate-200 hover:bg-slate-800 hover:text-white; }
+
+:global(:root.dark .response-annotation-editor) {
+  --annotation-editor-border: var(--plc-dark-border);
+  --annotation-editor-surface: var(--plc-dark-surface);
+  --annotation-editor-text: var(--plc-dark-text);
+  --annotation-editor-muted: var(--plc-dark-subtle);
+  --annotation-editor-selection: #d1d5db;
+  --annotation-editor-input: var(--plc-dark-input);
+  --annotation-editor-input-border: var(--plc-dark-border);
+  --annotation-editor-placeholder: var(--plc-dark-subtle);
+  --annotation-editor-control: var(--plc-dark-control);
+  --annotation-editor-control-text: var(--plc-dark-text);
+  --annotation-editor-control-hover: var(--plc-dark-surface-raised);
+  --annotation-editor-primary: #e5edf6;
+  --annotation-editor-primary-text: #111827;
+  --annotation-editor-primary-hover: #ffffff;
+  --annotation-editor-danger: var(--plc-dark-error);
+  --annotation-editor-danger-hover: rgba(248, 113, 113, 0.14);
+  --annotation-editor-shadow: 0 0 0 1px rgba(0, 0, 0, 0.34), 0 18px 42px rgba(0, 0, 0, 0.42);
+  color-scheme: dark;
+}
 
 @media (max-width: 767px) {
   .message-toolbar { opacity: 1; }
