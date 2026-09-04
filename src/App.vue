@@ -17,6 +17,7 @@ import IconTablerFolder from './components/icons/IconTablerFolder.vue'
 import IconTablerFilePencil from './components/icons/IconTablerFilePencil.vue'
 import IconTablerTrash from './components/icons/IconTablerTrash.vue'
 import IconTablerX from './components/icons/IconTablerX.vue'
+import { normalizePathForUi } from './pathUtils'
 import {
   approveChange,
   abortAgent,
@@ -643,6 +644,15 @@ function isSamePath(left: string | null | undefined, right: string | null | unde
   return leftKey.length > 0 && leftKey === rightKey
 }
 
+/**
+ * Windows 的 canonicalize/长路径 API 可能返回 `\\?\` 设备路径前缀。
+ * 该前缀对文件系统操作有意义，但对用户不可读；这里只转换展示文本，
+ * 保留 state 中的原始路径，避免影响项目切换、扫描和长路径访问。
+ */
+function projectPathLabel(path: string | null | undefined): string {
+  return normalizePathForUi(path ?? '')
+}
+
 function resetConversationForWorkspace(): void {
   activeThreadId.value = `local-${Date.now()}`
   messages.value = []
@@ -1137,13 +1147,13 @@ onUnmounted(() => {
         </div>
         <button class="plc-project-row" type="button" @click="activeView = 'overview'">
           <span class="plc-project-status" :data-state="currentProject.exists ? 'ok' : 'idle'" />
-          <span class="plc-project-copy"><strong>{{ currentProject.name || '尚未选择工程' }}</strong><small>{{ currentProject.path || '选择一个 .project 或工程目录' }}</small></span>
+          <span class="plc-project-copy"><strong>{{ currentProject.name || '尚未选择工程' }}</strong><small>{{ projectPathLabel(currentProject.path) || '选择一个 .project 或工程目录' }}</small></span>
         </button>
         <div v-if="recentProjects.length > 0" class="plc-project-list">
           <div v-for="project in recentProjects" :key="project.id" class="plc-project-list-row">
-            <button class="plc-project-list-main" type="button" :title="project.path" @click="onOpenProject(project)">
+            <button class="plc-project-list-main" type="button" :title="projectPathLabel(project.path)" @click="onOpenProject(project)">
               <span class="plc-project-status" :data-state="project.exists ? 'ok' : 'idle'" />
-              <span class="plc-project-copy"><strong>{{ project.name }}</strong><small>{{ project.path }}</small></span>
+              <span class="plc-project-copy"><strong>{{ project.name }}</strong><small>{{ projectPathLabel(project.path) }}</small></span>
             </button>
             <button class="plc-project-remove" type="button" :aria-label="`从工作区移除 ${project.name}`" :title="`从工作区移除 ${project.name}`" @click="onRemoveProject(project)">
               <IconTablerTrash />
