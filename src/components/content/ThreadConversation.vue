@@ -250,6 +250,16 @@
                 </a>
               </div>
 
+              <div v-if="message.references && message.references.length > 0" class="message-mention-references" aria-label="消息引用">
+                <span v-for="reference in message.references" :key="`${message.id}:${reference.id}`" class="message-mention-reference" :data-kind="reference.kind" :title="`${reference.source} · ${reference.path}`">
+                  <IconTablerFolder v-if="reference.kind === 'directory'" aria-hidden="true" />
+                  <IconTablerBolt v-else-if="reference.kind === 'session'" aria-hidden="true" />
+                  <IconTablerFilePencil v-else aria-hidden="true" />
+                  <strong>{{ reference.label }}</strong>
+                  <small>{{ mentionKindLabel(reference) }}</small>
+                </span>
+              </div>
+
               <div v-if="message.attachments && message.attachments.length > 0" class="message-file-attachments" aria-label="消息附件">
                 <article v-for="attachment in message.attachments" :key="`${message.id}:${attachment.id}`" class="message-file-attachment" :data-status="attachment.status">
                   <img
@@ -867,7 +877,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiPlanStep } from '../../types/codex'
+import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiMentionReference, UiPlanStep } from '../../types/codex'
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
@@ -877,6 +887,7 @@ import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
+import IconTablerFolder from '../icons/IconTablerFolder.vue'
 import IconTablerTerminal from '../icons/IconTablerTerminal.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 
@@ -1141,6 +1152,13 @@ function attachmentPreviewUrl(attachment: UiAttachment): string {
     return `data:${attachment.mimeType};base64,${attachment.dataBase64}`
   }
   return ''
+}
+
+function mentionKindLabel(reference: UiMentionReference): string {
+  if (reference.kind === 'session') return '历史会话'
+  if (reference.kind === 'directory') return '文件夹'
+  if (reference.kind === 'active_file') return 'CODESYS'
+  return '文件'
 }
 
 /**
@@ -3950,6 +3968,22 @@ onBeforeUnmount(() => {
   @apply mb-2 flex flex-wrap justify-end gap-1.5;
 }
 
+.message-mention-references {
+  @apply mb-2 flex max-w-full flex-wrap justify-end gap-1.5;
+}
+
+.message-mention-reference {
+  @apply inline-flex min-w-0 max-w-[260px] items-center gap-1.5 rounded-md border border-sky-200 bg-sky-50 px-2 py-1 text-[10px] text-sky-800;
+}
+
+.message-mention-reference svg { @apply h-3.5 w-3.5 shrink-0; }
+.message-mention-reference strong { @apply min-w-0 truncate font-medium; }
+.message-mention-reference small { @apply shrink-0 text-[9px] text-sky-600; }
+.message-mention-reference[data-kind='session'] { @apply border-violet-200 bg-violet-50 text-violet-800; }
+.message-mention-reference[data-kind='session'] small { @apply text-violet-600; }
+.message-mention-reference[data-kind='directory'] { @apply border-amber-200 bg-amber-50 text-amber-800; }
+.message-mention-reference[data-kind='directory'] small { @apply text-amber-700; }
+
 .message-file-attachments {
   @apply mb-2 flex max-w-full flex-wrap justify-end gap-1.5;
 }
@@ -4357,6 +4391,13 @@ onBeforeUnmount(() => {
 :global(.dark) .message-skill-chip-prefix {
   @apply text-emerald-300;
 }
+
+:global(.dark) .message-mention-reference { @apply border-sky-800/70 bg-sky-950/40 text-sky-100; }
+:global(.dark) .message-mention-reference small { @apply text-sky-300; }
+:global(.dark) .message-mention-reference[data-kind='session'] { @apply border-violet-800/70 bg-violet-950/40 text-violet-100; }
+:global(.dark) .message-mention-reference[data-kind='session'] small { @apply text-violet-300; }
+:global(.dark) .message-mention-reference[data-kind='directory'] { @apply border-amber-800/70 bg-amber-950/40 text-amber-100; }
+:global(.dark) .message-mention-reference[data-kind='directory'] small { @apply text-amber-300; }
 
 .conversation-item[data-message-type='worked'] .message-stack,
 .conversation-item[data-message-type='worked'] .message-body,

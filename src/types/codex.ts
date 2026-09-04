@@ -58,12 +58,27 @@ export type UiAttachment = {
   previewUrl?: string
 }
 
+export type UiMentionKind = 'file' | 'directory' | 'active_file' | 'session'
+
+export type UiMentionReference = {
+  id: string
+  kind: UiMentionKind
+  path: string
+  label: string
+  source: string
+  readable: boolean
+  mention: string
+  sessionId?: string | null
+  selectedText?: string | null
+}
+
 export type UiMessage = {
   id: string
   role: 'user' | 'assistant' | 'system'
   text: string
   skills?: Array<{ name: string; path: string }>
   attachments?: UiAttachment[]
+  references?: UiMentionReference[]
   fileChanges?: UiFileChange[]
   fileChangeStatus?: UiFileChangeStatus
   messageType?: string

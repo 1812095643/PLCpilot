@@ -54,6 +54,7 @@ import type {
   UiAttachment,
   UiLiveOverlay,
   UiMessage,
+  UiMentionReference,
   UiThreadTokenUsage,
 } from './types/codex'
 import type { Diagnostic } from './api/plcBridge'
@@ -282,7 +283,13 @@ function eventToMessage(event: AgentEvent, turnIndex: number): UiMessage {
   }
 }
 
-function appendAgentResult(result: AgentResult, userText: string, selectedSkills: Array<{ name: string; path: string }> = [], attachments: SubmitPayload['attachments'] = []): void {
+function appendAgentResult(
+  result: AgentResult,
+  userText: string,
+  selectedSkills: Array<{ name: string; path: string }> = [],
+  attachments: SubmitPayload['attachments'] = [],
+  references: UiMentionReference[] = [],
+): void {
   const turnIndex = messages.value.filter((item) => item.role === 'user').length
   const userMessage: UiMessage = {
     id: newId('user'),
@@ -290,6 +297,7 @@ function appendAgentResult(result: AgentResult, userText: string, selectedSkills
     text: userText,
     skills: selectedSkills.length > 0 ? selectedSkills : undefined,
     attachments: attachments.length > 0 ? attachments : undefined,
+    references: references.length > 0 ? references : undefined,
     turnId: `turn-${turnIndex}`,
     turnIndex,
   }
@@ -357,7 +365,13 @@ async function onSubmit(payload: SubmitPayload): Promise<void> {
   const baseMessages = messages.value
   messages.value = [
     ...baseMessages,
-    { id: newId('user'), role: 'user', text, attachments: visibleAttachments.length > 0 ? visibleAttachments : undefined },
+    {
+      id: newId('user'),
+      role: 'user',
+      text,
+      attachments: visibleAttachments.length > 0 ? visibleAttachments : undefined,
+      references: payload.references.length > 0 ? payload.references : undefined,
+    },
     { id: `pending-assistant-${newId('turn')}`, role: 'assistant', text: '正在读取工程上下文…' },
   ]
   try {
@@ -369,6 +383,7 @@ async function onSubmit(payload: SubmitPayload): Promise<void> {
         images: item.attachments
           ?.filter((attachment) => attachment.kind === 'image' && attachment.dataBase64)
           .map((attachment) => ({ image_url: `data:${attachment.mimeType};base64,${attachment.dataBase64}` })),
+        references: item.references,
       }))
     const runOptions: AgentRunOptions = {
       model: selectedModel.value,
@@ -376,12 +391,13 @@ async function onSubmit(payload: SubmitPayload): Promise<void> {
       collaborationMode: collaborationMode.value,
       skills: payload.skills,
       attachments,
+      references: payload.references,
     }
     const result = await runAgent(text, history, agentContext.value, runOptions)
     // runAgent 返回的是本轮完整结果；以发送前的历史为基线，避免把本轮用户消息
     // 误当成历史再次拼接，或者在占位消息清理时误删上一轮消息。
     messages.value = baseMessages
-    appendAgentResult(result, text, payload.skills, visibleAttachments)
+    appendAgentResult(result, text, payload.skills, visibleAttachments, payload.references)
     await refresh()
   } catch (error) {
     messages.value = messages.value.map((item) => item.id.startsWith('pending-assistant-')
@@ -659,7 +675,7 @@ function chooseCommand(command: string, supportsArgs: boolean): void {
     skills: [],
   }
   composerRef.value?.hydrateDraft(payload)
-  if (!supportsArgs) void onSubmit({ text: command, skills: [], attachments: [], mode: 'steer' })
+  if (!supportsArgs) void onSubmit({ text: command, skills: [], attachments: [], references: [], mode: 'steer' })
 }
 
 async function startNewThread(): Promise<void> {

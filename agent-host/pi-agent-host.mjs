@@ -327,6 +327,7 @@ function configSignature(config) {
     reasoning_effort: config.reasoning_effort ?? "medium",
     collaboration_mode: config.collaboration_mode ?? "default",
     skills: config.skills ?? [],
+    references: config.references ?? [],
   });
 }
 

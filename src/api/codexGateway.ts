@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
+import type { ComposerMentionSuggestion } from './plcBridge'
+
 export type ComposerFileSuggestion = { path: string }
 
 type RollbackResult = {
@@ -27,6 +29,18 @@ async function call<T>(command: string, args: Record<string, unknown>): Promise<
 export async function searchComposerFiles(cwd: string, query: string, limit = 20): Promise<ComposerFileSuggestion[]> {
   try {
     return await call<ComposerFileSuggestion[]>('search_project_files', {
+      cwd,
+      query,
+      limit,
+    })
+  } catch {
+    return []
+  }
+}
+
+export async function searchComposerMentions(cwd: string, query: string, limit = 24): Promise<ComposerMentionSuggestion[]> {
+  try {
+    return await call<ComposerMentionSuggestion[]>('search_composer_mentions', {
       cwd,
       query,
       limit,

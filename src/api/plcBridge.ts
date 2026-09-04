@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import type { UiAttachment } from '../types/codex'
+import type { UiAttachment, UiMentionReference, UiMentionKind } from '../types/codex'
 
 export type ProviderKind = 'responses' | 'messages' | 'chatcompletions' | 'ollama'
 
@@ -235,12 +235,15 @@ export type AgentRunOptions = {
   skills?: Array<{ name: string; path: string }>
   /** 本轮真实发送给模型的图片和文本附件。 */
   attachments?: UiAttachment[]
+  /** 本轮由 @ 菜单绑定的工程文件、文件夹或历史会话。 */
+  references?: UiMentionReference[]
 }
 
 export type AgentHistoryMessage = {
   role: string
   content: string
   images?: Array<{ image_url: string }>
+  references?: UiMentionReference[]
 }
 
 export type LocalAttachmentInput = {
@@ -253,6 +256,18 @@ export type LocalAttachmentInput = {
   image_url?: string
   text_content?: string
   error?: string
+}
+
+export type ComposerMentionSuggestion = {
+  id: string
+  kind: UiMentionKind
+  path: string
+  label: string
+  description: string | null
+  source: string
+  readable: boolean
+  sessionId?: string | null
+  selectedText?: string | null
 }
 
 const EMPTY_TOKEN_SUMMARY: TokenSummary = { input: 0, output: 0, cache_read: 0, cache_write: 0, total: 0 }
@@ -334,6 +349,11 @@ export const rejectChange = (id: string) => invoke<void>('reject_change', { id }
 export const listMcpTools = () => invoke<ToolSummary[]>('list_mcp_tools')
 /** 读取资源管理器复制到剪贴板的本地文件；失败时由输入框恢复为普通文本粘贴。 */
 export const readLocalAttachmentFile = (path: string) => invoke<LocalAttachmentInput>('read_local_attachment_file', { path })
+export const searchComposerMentions = (cwd: string, query: string, limit = 24) => invoke<ComposerMentionSuggestion[]>('search_composer_mentions', {
+  cwd,
+  query,
+  limit,
+})
 
 export const saveModel = (form: ModelForm) => invoke<ModelSummary>('configure_model', {
   config: {
@@ -396,6 +416,17 @@ export const runAgent = (
         : undefined,
       text_content: attachment.textContent,
       error: attachment.error,
+    })) || [],
+    references: options.references?.map((reference) => ({
+      id: reference.id,
+      kind: reference.kind,
+      path: reference.path,
+      label: reference.label,
+      source: reference.source,
+      readable: reference.readable,
+      mention: reference.mention,
+      sessionId: reference.sessionId,
+      selectedText: reference.selectedText,
     })) || [],
   },
 })

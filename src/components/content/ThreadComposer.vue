@@ -4,12 +4,12 @@ import type {
   CollaborationModeKind,
   CollaborationModeOption,
   ReasoningEffort,
+  UiMentionReference,
   UiThreadTokenUsage,
 } from '../../types/codex'
 import type { ComposerAttachment, ComposerAttachmentDraft } from '../../composables/useComposerAttachments'
 import { useComposerAttachments } from '../../composables/useComposerAttachments'
-import { readLocalAttachmentFile, type CommandSummary } from '../../api/plcBridge'
-import { searchComposerFiles, type ComposerFileSuggestion } from '../../api/codexGateway'
+import { readLocalAttachmentFile, searchComposerMentions, type CommandSummary, type ComposerMentionSuggestion } from '../../api/plcBridge'
 import {
   completeSlashCommand,
   completeSlashCommandPreservingDraftTail,
@@ -21,9 +21,9 @@ import ComposerCommandPopup from './ComposerCommandPopup.vue'
 import ComposerDropdown from './ComposerDropdown.vue'
 import ComposerSearchDropdown from './ComposerSearchDropdown.vue'
 import ComposerAttachmentStrip from './ComposerAttachmentStrip.vue'
+import ComposerMentionPopup from './ComposerMentionPopup.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
-import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
 import IconTablerPaperclip from '../icons/IconTablerPaperclip.vue'
 import IconTablerPlayerStopFilled from '../icons/IconTablerPlayerStopFilled.vue'
 
@@ -40,12 +40,14 @@ export type ComposerDraftPayload = {
   text: string
   skills: Array<{ name: string; path: string }>
   attachments?: ComposerAttachmentDraft[]
+  references?: UiMentionReference[]
 }
 
 export type SubmitPayload = {
   text: string
   skills: Array<{ name: string; path: string }>
   attachments: ComposerAttachment[]
+  references: UiMentionReference[]
   mode: 'steer' | 'queue'
 }
 
@@ -101,7 +103,8 @@ const isFileMentionOpen = shallowRef(false)
 const mentionQuery = shallowRef('')
 const mentionStartIndex = shallowRef<number | null>(null)
 const mentionHighlightedIndex = shallowRef(0)
-const fileMentionSuggestions = shallowRef<ComposerFileSuggestion[]>([])
+const fileMentionSuggestions = shallowRef<ComposerMentionSuggestion[]>([])
+const mentionReferences = shallowRef<UiMentionReference[]>([])
 const isSlashCommandOpen = shallowRef(false)
 const slashCommandQuery = shallowRef('')
 const slashCommandToken = shallowRef('')
@@ -164,7 +167,7 @@ const isPlanMode = computed(() => props.selectedCollaborationMode === 'plan')
 const placeholder = computed(() => isInteractionDisabled.value
   ? '先选择一个本地 CODESYS 工程'
   : '描述要检查、修改或诊断的 PLC 任务…')
-const hasUnsavedDraft = computed(() => draft.value.trim().length > 0 || selectedSkills.value.length > 0 || attachments.value.length > 0)
+const hasUnsavedDraft = computed(() => draft.value.trim().length > 0 || selectedSkills.value.length > 0 || attachments.value.length > 0 || mentionReferences.value.length > 0)
 const canSubmit = computed(() => !isInteractionDisabled.value && !isAttachmentReading.value && (draft.value.trim().length > 0 || hasReadyAttachment.value))
 
 const contextView = computed(() => {
@@ -191,13 +194,38 @@ const activeSlashCommandId = computed(() => {
   const command = filteredSlashCommands.value[slashHighlightedIndex.value]
   return command ? `plc-slash-command-${command.command.replace(/[^a-zA-Z0-9_-]/gu, '-')}` : undefined
 })
+const activeMentionId = computed(() => {
+  const suggestion = fileMentionSuggestions.value[mentionHighlightedIndex.value]
+  return suggestion ? `plc-mention-${suggestion.id.replace(/[^a-zA-Z0-9_-]/gu, '-')}` : undefined
+})
 
 function getDraftStorageKey(threadId: string): string {
   return `${DRAFT_STORAGE_PREFIX}${threadId.trim()}`
 }
 
 function emptyPayload(): ComposerDraftPayload {
-  return { text: '', skills: [], attachments: [] }
+  return { text: '', skills: [], attachments: [], references: [] }
+}
+
+function validMentionReferences(value: unknown): UiMentionReference[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((reference): reference is UiMentionReference => Boolean(reference)
+    && typeof reference === 'object'
+    && typeof (reference as UiMentionReference).id === 'string'
+    && typeof (reference as UiMentionReference).kind === 'string'
+    && typeof (reference as UiMentionReference).path === 'string'
+    && typeof (reference as UiMentionReference).label === 'string'
+    && typeof (reference as UiMentionReference).source === 'string'
+    && typeof (reference as UiMentionReference).mention === 'string')
+    .slice(0, 16)
+}
+
+function pruneMentionReferences(): void {
+  const currentText = draft.value
+  mentionReferences.value = mentionReferences.value.filter((reference) => {
+    const marker = reference.mention.trim()
+    return marker.length > 0 && currentText.includes(marker)
+  })
 }
 
 function readDraft(threadId: string): ComposerDraftPayload | null {
@@ -215,6 +243,7 @@ function readDraft(threadId: string): ComposerDraftPayload | null {
       attachments: Array.isArray(value.attachments)
         ? value.attachments as ComposerAttachmentDraft[]
         : [],
+      references: validMentionReferences(value.references),
     }
   } catch {
     return null
@@ -227,6 +256,7 @@ function persistDraft(threadId: string): void {
     text: draft.value,
     skills: selectedSkills.value.map((skill) => ({ name: skill.name, path: skill.path })),
     attachments: serializeAttachments(),
+    references: mentionReferences.value,
   }
   try {
     if (payload.text.trim() || payload.skills.length > 0 || payload.attachments.length > 0) {
@@ -257,6 +287,8 @@ function replaceDraft(payload: ComposerDraftPayload): void {
   selectedSkills.value = payload.skills.map((item) => props.skills.find((skill) => skill.path === item.path)
     ?? { name: item.name, path: item.path, description: '' })
   restoreAttachments(payload.attachments)
+  mentionReferences.value = validMentionReferences(payload.references)
+  pruneMentionReferences()
   closeFileMention()
   resetSlashCommandPopup()
   void nextTick(syncComposerPopups)
@@ -283,10 +315,12 @@ function appendTextToDraft(text: string): void {
 
 function submitCurrent(mode: 'steer' | 'queue' = props.isTurnInProgress ? activeInProgressMode.value : 'steer'): void {
   if (!canSubmit.value) return
+  pruneMentionReferences()
   emit('submit', {
     text: draft.value.trim(),
     skills: selectedSkills.value.map((skill) => ({ name: skill.name, path: skill.path })),
     attachments: serializeAttachments().filter((attachment) => attachment.status === 'ready'),
+    references: mentionReferences.value,
     mode,
   })
   clearDraft()
@@ -328,6 +362,7 @@ function onKeydown(event: KeyboardEvent): void {
 }
 
 function onInput(): void {
+  pruneMentionReferences()
   syncComposerPopups()
 }
 
@@ -656,31 +691,34 @@ function handleSlashCommandKeydown(event: KeyboardEvent): boolean {
 
 function updateFileMention(): void {
   const input = inputRef.value
-  const cwd = props.cwd?.trim() ?? ''
-  if (!input || !cwd) {
+  if (!input) {
     closeFileMention()
     return
   }
   const cursor = input.selectionStart ?? draft.value.length
   const beforeCursor = draft.value.slice(0, cursor)
-  const match = beforeCursor.match(/(^|\s)@([^\s@]*)$/u)
+  const match = beforeCursor.match(/(^|\s)@(?:"([^"]*)|([^\s@]*))$/u)
   if (!match) {
     closeFileMention()
     return
   }
   const token = match[0]
   mentionStartIndex.value = cursor - token.length + token.lastIndexOf('@')
-  mentionQuery.value = match[2] ?? ''
+  const nextQuery = match[2] ?? match[3] ?? ''
+  const queryChanged = !isFileMentionOpen.value || mentionQuery.value !== nextQuery
+  if (queryChanged) {
+    mentionHighlightedIndex.value = 0
+  }
+  mentionQuery.value = nextQuery
   isFileMentionOpen.value = true
-  mentionHighlightedIndex.value = 0
-  scheduleMentionSearch(mentionQuery.value)
+  if (queryChanged) scheduleMentionSearch(mentionQuery.value)
 }
 
 function scheduleMentionSearch(query: string): void {
   if (mentionSearchTimer) clearTimeout(mentionSearchTimer)
   const token = ++mentionSearchToken
   mentionSearchTimer = setTimeout(async () => {
-    const rows = await searchComposerFiles(props.cwd?.trim() ?? '', query, 16)
+    const rows = await searchComposerMentions(props.cwd?.trim() ?? '', query, 24)
     if (token !== mentionSearchToken || !isFileMentionOpen.value) return
     fileMentionSuggestions.value = rows
     mentionHighlightedIndex.value = 0
@@ -693,13 +731,32 @@ function moveMentionHighlight(delta: number): void {
   mentionHighlightedIndex.value = (mentionHighlightedIndex.value + delta + length) % length
 }
 
-function applyFileMention(item: ComposerFileSuggestion): void {
+function applyFileMention(item: ComposerMentionSuggestion): void {
   const input = inputRef.value
   const start = mentionStartIndex.value
   if (!input || start === null) return
   const cursor = input.selectionStart ?? draft.value.length
-  const replacement = `@${item.path} `
+  const path = item.path.replace(/"/gu, '\\"')
+  const rawMention = item.kind === 'session'
+    ? `@${item.label.replace(/\s+/gu, ' ').trim()}`
+    : path.includes(' ') ? `@"${path}"` : `@${path}`
+  const replacement = `${rawMention} `
   draft.value = `${draft.value.slice(0, start)}${replacement}${draft.value.slice(cursor)}`
+  const reference: UiMentionReference = {
+    id: item.id,
+    kind: item.kind,
+    path: item.path,
+    label: item.label,
+    source: item.source,
+    readable: item.readable,
+    mention: rawMention,
+    sessionId: item.sessionId,
+    selectedText: item.selectedText,
+  }
+  mentionReferences.value = [
+    ...mentionReferences.value.filter((existing) => existing.id !== reference.id),
+    reference,
+  ].slice(-16)
   closeFileMention()
   void nextTick(() => {
     const nextCursor = start + replacement.length
@@ -799,20 +856,13 @@ defineExpose<ThreadComposerExposed>({
           @select="onSlashCommandSelect"
           @update:highlighted-index="slashHighlightedIndex = $event"
         />
-        <div v-if="isFileMentionOpen" class="plc-file-mention-menu" role="listbox" aria-label="工程文件引用">
-          <button
-            v-for="(item, index) in fileMentionSuggestions"
-            :key="item.path"
-            type="button"
-            class="plc-file-mention-row"
-            :class="{ 'is-highlighted': index === mentionHighlightedIndex }"
-            @mousedown.prevent="applyFileMention(item)"
-          >
-            <IconTablerFilePencil aria-hidden="true" />
-            <span>{{ item.path }}</span>
-          </button>
-          <p v-if="fileMentionSuggestions.length === 0" class="plc-file-mention-empty">正在查找工程文件…</p>
-        </div>
+        <ComposerMentionPopup
+          v-if="isFileMentionOpen"
+          :suggestions="fileMentionSuggestions"
+          :highlighted-index="mentionHighlightedIndex"
+          @select="applyFileMention"
+          @update:highlighted-index="mentionHighlightedIndex = $event"
+        />
 
         <ComposerAttachmentStrip :attachments="attachments" @remove="removeAttachment" />
         <textarea
@@ -821,9 +871,9 @@ defineExpose<ThreadComposerExposed>({
           class="plc-composer-input"
           :placeholder="placeholder"
           :disabled="isInteractionDisabled"
-          :aria-expanded="isSlashCommandOpen ? 'true' : 'false'"
-          :aria-controls="isSlashCommandOpen ? 'plc-slash-command-menu' : undefined"
-          :aria-activedescendant="activeSlashCommandId"
+          :aria-expanded="isSlashCommandOpen || isFileMentionOpen ? 'true' : 'false'"
+          :aria-controls="isSlashCommandOpen ? 'plc-slash-command-menu' : isFileMentionOpen ? 'plc-mention-popup' : undefined"
+          :aria-activedescendant="isFileMentionOpen ? activeMentionId : activeSlashCommandId"
           aria-autocomplete="list"
           rows="3"
           @input="onInput"
@@ -835,7 +885,7 @@ defineExpose<ThreadComposerExposed>({
         />
         <div class="plc-composer-hint">
           <span>Enter 发送 · Shift+Enter 换行</span>
-          <span><code>@</code> 引用工程文件</span>
+              <span><code>@</code> 引用文件、文件夹或历史会话</span>
         </div>
       </div>
 
@@ -1053,27 +1103,6 @@ defineExpose<ThreadComposerExposed>({
 
 .plc-plan-note { margin: 0 2px; color: #8a6a3c; font-size: 10px; }
 
-.plc-file-mention-menu {
-  position: absolute;
-  right: 12px;
-  bottom: calc(100% - 2px);
-  z-index: 30;
-  width: min(460px, calc(100% - 24px));
-  max-height: 250px;
-  overflow: auto;
-  padding: 5px;
-  border: 1px solid rgba(72, 66, 58, 0.16);
-  border-radius: 12px;
-  background: #fffdf9;
-  box-shadow: 0 16px 40px rgba(35, 29, 24, 0.18);
-}
-
-.plc-file-mention-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 9px; border: 0; border-radius: 8px; background: transparent; color: #3a3530; cursor: pointer; text-align: left; font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; }
-.plc-file-mention-row:hover, .plc-file-mention-row.is-highlighted { background: #f3ede4; }
-.plc-file-mention-row svg { width: 14px; height: 14px; flex: 0 0 auto; color: #a86f22; }
-.plc-file-mention-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.plc-file-mention-empty { margin: 0; padding: 12px; color: #8a837b; font-size: 12px; }
-
 @media (max-width: 720px) {
   .plc-composer-toolbar { align-items: flex-end; }
   .plc-composer-options { gap: 8px; }
@@ -1093,9 +1122,5 @@ defineExpose<ThreadComposerExposed>({
 :global(:root.dark) .plc-composer-submit { background: #0e639c; color: #ffffff; }
 :global(:root.dark) .plc-composer-submit:hover:not(:disabled), :global(:root.dark) .plc-composer-stop:hover { background: var(--plc-dark-accent-hover); color: #ffffff; }
 :global(:root.dark) .plc-composer-stop { background: var(--plc-dark-control); color: var(--plc-dark-text); }
-:global(:root.dark) .plc-file-mention-menu { border-color: var(--plc-dark-border); background: var(--plc-dark-surface); box-shadow: 0 18px 46px rgba(0, 0, 0, 0.42); }
-:global(:root.dark) .plc-file-mention-row { color: var(--plc-dark-text); }
-:global(:root.dark) .plc-file-mention-row:hover, :global(:root.dark) .plc-file-mention-row.is-highlighted { background: #2a2d2e; }
-:global(:root.dark) .plc-file-mention-empty { color: var(--plc-dark-muted); }
 :global(:root.dark) .plc-plan-note { color: var(--plc-dark-link); }
 </style>
