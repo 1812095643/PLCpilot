@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build:agent-host": "node scripts/build-agent-host.mjs",
-    "build": "npm run build:agent-host && vue-tsc --noEmit && vite build",
+    "build": "npm run build:agent-host && vue-tsc --noEmit -p tsconfig.app.json && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
@@ -17,13 +17,14 @@
     "@earendil-works/pi-agent-core": "^0.84.4",
     "@earendil-works/pi-ai": "^0.84.4",
     "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@tabler/icons-vue": "^3.46.0",
     "@tauri-apps/api": "^2.8.0",
     "highlight.js": "^11.11.1",
     "vue": "^3.5.13"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.8.1",
     "@tailwindcss/vite": "^4.1.18",
+    "@tauri-apps/cli": "^2.8.1",
     "@vitejs/plugin-vue": "^6.0.8",
     "esbuild": "^0.28.2",
     "tailwindcss": "^4.1.18",

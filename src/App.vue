@@ -1,14 +1,21 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, shallowRef, watch, type ComponentPublicInstance } from 'vue'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import DesktopLayout from './components/layout/DesktopLayout.vue'
+import WindowTitleBar from './components/layout/WindowTitleBar.vue'
 import SidebarThreadControls from './components/sidebar/SidebarThreadControls.vue'
+import WorkspaceSidebar, { type SidebarThread } from './components/sidebar/WorkspaceSidebar.vue'
 import ContentHeader from './components/content/ContentHeader.vue'
 import ThreadConversation from './components/content/ThreadConversation.vue'
+import CodesysStatusPanel from './components/content/CodesysStatusPanel.vue'
 import type { ThreadConversationExposed } from './components/content/ThreadConversation.vue'
 import ThreadComposer from './components/content/ThreadComposer.vue'
+import ComposerQueue from './components/content/ComposerQueue.vue'
+import ModelSettingsPanel from './components/settings/ModelSettingsPanel.vue'
+import SettingsPage from './components/settings/SettingsPage.vue'
 import type { ComposerDraftPayload, ThreadComposerExposed, SubmitPayload } from './components/content/ThreadComposer.vue'
+import { useWorkspaceThreads, type WorkspaceThread } from './composables/useWorkspaceThreads'
+import { useAppTheme } from './composables/useAppTheme'
 import IconTablerBolt from './components/icons/IconTablerBolt.vue'
 import IconTablerSettings from './components/icons/IconTablerSettings.vue'
 import IconTablerSearch from './components/icons/IconTablerSearch.vue'
@@ -23,10 +30,13 @@ import {
   abortAgent,
   compactContext,
   compileProject,
+  deleteModel,
   discoverModels,
+  duplicateModel,
   EMPTY_SNAPSHOT,
   getSkillContent,
   getSnapshot,
+  modelFormFromSummary,
   deleteSession,
   forkSession,
   pickProjectFolder,
@@ -37,16 +47,21 @@ import {
   runAgent,
   saveMcp,
   saveModel,
+  setActiveModel,
+  setModelEnabled,
   selectProject,
   startNewSession,
+  startTemporaryWorkspace,
   syncCurrentProject,
   type AgentEvent,
+  type AgentStreamPayload,
   type AgentResult,
   type AgentRunOptions,
   type CommandSummary,
   type ModelDiscoveryResult,
   type McpForm,
   type ModelForm,
+  type ModelSummary,
   type PendingChange,
   type SessionRecord,
   type Snapshot,
@@ -59,48 +74,51 @@ import type {
   UiMessage,
   UiMentionReference,
   UiResponseTextAnnotation,
+  UiRetryPayload,
   UiThreadTokenUsage,
 } from './types/codex'
 import type { Diagnostic } from './api/plcBridge'
 
-type Theme = 'dark' | 'light'
 type View = 'chat' | 'overview' | 'skills'
 
 const snapshot = shallowRef<Snapshot>(EMPTY_SNAPSHOT)
-const messages = shallowRef<UiMessage[]>([])
+const workspace = useWorkspaceThreads()
+const messages = workspace.field('messages')
 /** 当前 Composer 中等待随下一条用户消息发送的回复批注。 */
-const pendingResponseAnnotations = shallowRef<UiResponseTextAnnotation[]>([])
+const pendingResponseAnnotations = workspace.field('pendingResponseAnnotations')
 const activeView = shallowRef<View>('chat')
-const activeThreadId = shallowRef('local-plc-thread')
+const activeThreadId = workspace.activeId
 const isSidebarCollapsed = shallowRef(false)
-const isBusy = shallowRef(false)
+const isBusy = workspace.field('isBusy')
 const isWindowDropActive = shallowRef(false)
 const isRefreshing = shallowRef(false)
 const notice = shallowRef('')
 const isDiscoveringModels = shallowRef(false)
 const modelDiscovery = shallowRef<ModelDiscoveryResult | null>(null)
 const modelDiscoveryError = shallowRef('')
-const liveOverlay = shallowRef<UiLiveOverlay | null>(null)
-const diagnostics = shallowRef<Diagnostic[]>([])
-const diagnosticNote = shallowRef('')
+const liveOverlay = workspace.field('liveOverlay')
+const diagnostics = workspace.field('diagnostics')
+const diagnosticNote = workspace.field('diagnosticNote')
 const showSettings = shallowRef(false)
+const settingsCategory = shallowRef('models')
 const showCommandPalette = shallowRef(false)
+const showAbout = shallowRef(false)
+const showReward = shallowRef(false)
+type AppDialog = { kind: 'confirm' | 'prompt'; title: string; message: string; value: string; resolve: (value: boolean | string | null) => void } | null
+const appDialog = shallowRef<AppDialog>(null)
 const showSkillDetail = shallowRef(false)
 const selectedSkillId = shallowRef('')
 const selectedSkillContent = shallowRef('')
 const projectPathDraft = shallowRef('')
 const composerRef = shallowRef<ComponentPublicInstance<ThreadComposerExposed> | null>(null)
 const conversationRef = shallowRef<ComponentPublicInstance<ThreadConversationExposed> | null>(null)
-const theme = shallowRef<Theme>(loadTheme())
-const collaborationMode = shallowRef<CollaborationModeKind>('default')
-const selectedModel = shallowRef('gpt-5')
-const reasoningEffort = shallowRef<'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'>('medium')
-const modelForm = shallowRef<ModelForm>({
-  provider: 'responses',
-  baseUrl: 'https://api.openai.com/v1',
-  model: 'gpt-5',
-  apiKey: '',
-})
+const { preference: theme } = useAppTheme()
+const collaborationMode = workspace.field('collaborationMode')
+const selectedModel = workspace.field('selectedModel')
+const selectedModelProfileId = workspace.field('selectedModelProfileId')
+const reasoningEffort = workspace.field('reasoningEffort')
+const queuedSubmits = workspace.field('queuedSubmits')
+const queuePaused = workspace.field('queuePaused')
 const mcpForm = shallowRef<McpForm>({
   id: 'codesys',
   name: 'CODESYS MCP',
@@ -110,6 +128,20 @@ const mcpForm = shallowRef<McpForm>({
   url: '',
   authToken: '',
 })
+
+function requestConfirm(title: string, message: string): Promise<boolean> {
+  return new Promise((resolve) => { appDialog.value = { kind: 'confirm', title, message, value: '', resolve: (value) => resolve(Boolean(value)) } })
+}
+
+function requestPrompt(title: string, message: string, value = ''): Promise<string | null> {
+  return new Promise((resolve) => { appDialog.value = { kind: 'prompt', title, message, value, resolve: (result) => resolve(typeof result === 'string' ? result : null) } })
+}
+
+function closeAppDialog(result: boolean | string | null): void {
+  const dialog = appDialog.value
+  appDialog.value = null
+  dialog?.resolve(result)
+}
 
 const fallbackCommands: CommandSummary[] = [
   { command: '/help', label: '帮助', detail: '查看命令和安全边界', category: 'session', supports_args: false },
@@ -130,18 +162,32 @@ const fallbackCommands: CommandSummary[] = [
   { command: '/reject', label: '拒绝修改', detail: '丢弃审批卡片中的工程写入', category: 'safety', supports_args: true },
   { command: '/new', label: '新会话', detail: '清空当前对话，不改工程', category: 'session', supports_args: false },
   { command: '/stop', label: '停止任务', detail: '停止当前工具轮次', category: 'session', supports_args: false },
+  { command: '/plan', label: '计划模式', detail: '以只读方式整理本轮执行计划', category: 'session', supports_args: true },
 ]
 
 const commands = computed(() => snapshot.value.commands.length > 0 ? snapshot.value.commands : fallbackCommands)
 const modelOptions = computed(() => {
-  const configured = snapshot.value.model.model.trim()
-  const discovered = modelDiscovery.value?.models.map((model) => model.id) || []
-  return Array.from(new Set([...discovered, configured, selectedModel.value, 'gpt-5'].filter(Boolean)))
+  const configured = snapshot.value.models
+    .filter((model) => model.enabled)
+    .map((model) => ({ id: model.id, name: model.name, model: model.model }))
+  if (configured.length > 0) return configured
+  return [{ id: snapshot.value.model.id, name: snapshot.value.model.name, model: snapshot.value.model.model }]
 })
-const currentProject = computed(() => snapshot.value.project)
+const selectedModelProfile = computed<ModelSummary | null>(() => (
+  snapshot.value.models.find((model) => model.id === selectedModelProfileId.value && model.enabled)
+    ?? snapshot.value.models.find((model) => model.model === selectedModel.value && model.enabled)
+    ?? null
+))
+const selectedReasoningEfforts = computed(() => {
+  const supported = selectedModelProfile.value?.reasoning_levels ?? []
+  const allowed = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
+  const values = allowed.filter((value) => supported.includes(value))
+  return values.length > 0 ? values : [...allowed]
+})
+const currentProject = computed(() => workspace.active.value.project)
 const recentProjects = computed(() => snapshot.value.projects.filter((project) => !isSamePath(project.path, currentProject.value.path)))
 const currentCwd = computed(() => currentProject.value.working_directory || currentProject.value.project_directory || currentProject.value.path || '')
-const currentTitle = computed(() => snapshot.value.session.name || currentProject.value.name || 'PLC Pilot')
+const currentTitle = computed(() => workspace.active.value.session.name || currentProject.value.name || 'PLC Pilot')
 const skills = computed(() => snapshot.value.skills.map((skill) => ({
   name: skill.name,
   displayName: skill.name,
@@ -150,10 +196,11 @@ const skills = computed(() => snapshot.value.skills.map((skill) => ({
   scope: skill.scope,
   enabled: skill.enabled,
 })))
-const pendingChanges = computed(() => snapshot.value.pending_changes.filter((item) => item.status === 'pending'))
+const pendingChanges = computed(() => workspace.active.value.pendingChanges.filter((item) => item.status === 'pending'))
 const tokenUsage = computed<UiThreadTokenUsage | null>(() => {
-  const session = snapshot.value.session
-  if (!session.context_window && !session.tokens.total) return null
+  const session = workspace.active.value.session
+  const contextWindow = selectedModelProfile.value?.context_window || session.context_window || 0
+  if (!contextWindow && !session.tokens.total) return null
   const breakdown = {
     totalTokens: session.tokens.total,
     inputTokens: session.tokens.input,
@@ -164,10 +211,12 @@ const tokenUsage = computed<UiThreadTokenUsage | null>(() => {
   return {
     total: breakdown,
     last: breakdown,
-    modelContextWindow: session.context_window || null,
+    modelContextWindow: contextWindow || null,
     currentContextTokens: session.context_tokens,
-    remainingContextTokens: session.context_window ? Math.max(0, session.context_window - session.context_tokens) : null,
-    remainingContextPercent: session.context_window ? Math.max(0, 100 - session.context_percent) : null,
+    remainingContextTokens: contextWindow ? Math.max(0, contextWindow - session.context_tokens) : null,
+    remainingContextPercent: contextWindow
+      ? Math.max(0, Math.round((1 - session.context_tokens / contextWindow) * 100))
+      : null,
   }
 })
 
@@ -181,23 +230,51 @@ const agentContext = computed(() => ({
   active_file: currentProject.value.active_file,
 }))
 
-function loadTheme(): Theme {
-  try {
-    return window.localStorage.getItem('plc-pilot-theme') === 'light' ? 'light' : 'dark'
-  } catch {
-    return 'dark'
+const sidebarProjects = computed(() => snapshot.value.projects.filter((project) => !/\/documents\/plcpilot\/\d{4}-\d{2}-\d{2}\//iu.test(pathKey(project.path))))
+const sidebarThreads = computed<SidebarThread[]>(() => {
+  const locals = workspace.threads.value.map((thread) => ({
+    id: thread.id,
+    name: thread.session.name && thread.session.name !== thread.project.name ? thread.session.name : thread.messages.find((message) => message.role === 'user')?.text.slice(0, 36) || '新对话',
+    cwd: thread.project.project_directory || thread.project.path || '', busy: thread.isBusy,
+    status: thread.liveOverlay?.activityLabel || (thread.queuePaused ? '队列已暂停' : ''), persisted: Boolean(thread.session.session_file),
+  }))
+  const sessions = snapshot.value.sessions.filter((record) => !workspace.threads.value.some((thread) => thread.session.session_id === record.session_id)).map((record) => ({
+    id: record.session_id, name: record.name || record.messages.find((message) => message.role === 'user')?.content.slice(0, 36) || '未命名会话',
+    cwd: record.cwd || '', busy: false, status: '', persisted: true,
+  }))
+  return [...locals, ...sessions]
+})
+
+async function selectSidebarThread(id: string): Promise<void> {
+  const thread = workspace.threads.value.find((item) => item.id === id)
+  if (thread) {
+    workspace.select(thread)
+    activeView.value = 'chat'
+    showSettings.value = false
+    if (thread.project.path) await selectProject(thread.project.path).catch((error) => showNotice(String(error)))
+    await refresh()
+  } else {
+    const record = snapshot.value.sessions.find((item) => item.session_id === id)
+    if (record) await onResumeSession(record)
   }
 }
 
-function applyTheme(value: Theme): void {
-  if (typeof document === 'undefined') return
-  document.documentElement.classList.toggle('dark', value === 'dark')
-  document.documentElement.dataset.theme = value
-  try {
-    window.localStorage.setItem('plc-pilot-theme', value)
-  } catch {
-    // 桌面运行时禁用存储时仍保留当前窗口主题。
-  }
+function sidebarSessionRecord(id: string): SessionRecord | undefined {
+  const thread = workspace.threads.value.find((item) => item.id === id)
+  return snapshot.value.sessions.find((record) => record.session_id === (thread?.session.session_id || id))
+}
+
+async function renameSidebarThread(id: string): Promise<void> {
+  const record = sidebarSessionRecord(id)
+  if (record) await onRenameSession(record)
+}
+
+async function deleteSidebarThread(id: string): Promise<void> {
+  const thread = workspace.threads.value.find((item) => item.id === id)
+  if (thread?.isBusy) return
+  const record = sidebarSessionRecord(id)
+  if (record) await onDeleteSession(record)
+  else if (thread) workspace.remove(thread)
 }
 
 function newId(prefix: string): string {
@@ -232,10 +309,13 @@ function restoredImageAttachment(imageUrl: string, messageIndex: number, imageIn
 
 function restoreSessionMessages(record: SessionRecord): UiMessage[] {
   let turnIndex = -1
-  const restored = record.messages.map((item, index) => {
+  const restored = record.messages.map<UiMessage>((item, index) => {
     if (item.role === 'user') turnIndex += 1
     const normalizedTurnIndex = Math.max(0, turnIndex)
-    const responseAnnotations = (item.response_annotations ?? [])
+    const metadata = item.role === 'user' ? record.ui_turns?.find((entry) => entry.turn_index === normalizedTurnIndex) : undefined
+    const restoredProfileId = item.model_profile_id || record.model_profile_id || undefined
+    const restoredProfile = snapshot.value.models.find((model) => model.id === restoredProfileId)
+    const responseAnnotations = (metadata?.response_annotations ?? item.response_annotations ?? [])
       .filter((annotation) => Boolean(annotation)
         && typeof annotation.selected_text === 'string'
         && typeof annotation.body === 'string'
@@ -253,12 +333,19 @@ function restoreSessionMessages(record: SessionRecord): UiMessage[] {
     return {
       id: newId(item.role),
       role: item.role === 'assistant' ? 'assistant' : 'user',
-      text: item.content,
-      attachments: (item.images ?? []).map((image, imageIndex) => restoredImageAttachment(image.image_url, index, imageIndex)),
+      text: metadata?.text ?? item.content,
+      attachments: metadata?.attachments?.map<UiAttachment>((attachment) => ({ id: attachment.id || newId('attachment'), name: attachment.name, size: attachment.size, mimeType: attachment.mime_type, kind: attachment.kind === 'image' ? 'image' : attachment.kind === 'text' ? 'text' : 'file', status: attachment.error ? 'error' : 'ready', error: attachment.error, dataBase64: attachment.data_base64, textContent: attachment.text_content })) ?? (item.images ?? []).map((image, imageIndex) => restoredImageAttachment(image.image_url, index, imageIndex)),
+      references: metadata?.references,
+      skills: metadata?.skills?.map((path) => ({ path, name: snapshot.value.skills.find((skill) => skill.path === path || `builtin://${skill.id}` === path)?.name || path })),
+      collaborationMode: metadata?.collaboration_mode,
       responseAnnotations: responseAnnotations.length > 0 ? responseAnnotations : undefined,
+      modelProfileId: restoredProfileId,
+      model: restoredProfile?.model,
+      reasoningEffort: item.reasoning_effort || record.reasoning_effort || undefined,
       turnIndex: normalizedTurnIndex,
       turnId: `restored-${normalizedTurnIndex}`,
       sessionMessageIndex: index,
+      sessionTurnIndex: normalizedTurnIndex,
     }
   })
   // 旧会话通常把批注写在发送它的 user 记录上；恢复时把标记重新挂到对应的
@@ -278,10 +365,16 @@ function restoreSessionMessages(record: SessionRecord): UiMessage[] {
         })),
     ]
   }
-  return restored
+  return restored.flatMap((message) => {
+    if (message.role !== 'assistant') return [message]
+    const activities = record.activities?.filter((entry) => entry.turn_index === message.sessionTurnIndex).map((entry) => eventToMessage(entry.event, entry.turn_index, record.cwd || '')) ?? []
+    if (!activities.length) return [message]
+    return [...activities, { id: newId('worked'), role: 'system' as const, text: `${activities.length} 项后台操作`, messageType: 'worked', activityEventIds: activities.map((item) => item.id), turnIndex: message.turnIndex, turnId: message.turnId }, message]
+  })
 }
 
 function messageTurnIndex(message: UiMessage): number {
+  if (typeof message.sessionTurnIndex === 'number') return message.sessionTurnIndex
   if (typeof message.turnIndex === 'number' && Number.isFinite(message.turnIndex)) {
     return Math.max(0, Math.trunc(message.turnIndex))
   }
@@ -308,10 +401,32 @@ function messageDraftPayload(message: UiMessage): ComposerDraftPayload {
   }
 }
 
+function restoreSessionModelSelection(record: SessionRecord): void {
+  const profileId = record.model_profile_id
+  if (!profileId) return
+  const profile = snapshot.value.models.find((model) => model.id === profileId && model.enabled)
+  if (!profile) return
+  selectedModelProfileId.value = profile.id
+  selectedModel.value = profile.model
+  reasoningEffort.value = normalizeReasoningEffort(record.reasoning_effort || reasoningEffort.value, profile)
+}
+
+function restoreMessageModelSelection(message: UiMessage): void {
+  if (!message.modelProfileId) return
+  const profile = snapshot.value.models.find((model) => model.id === message.modelProfileId && model.enabled)
+  if (!profile) return
+  selectedModelProfileId.value = profile.id
+  selectedModel.value = profile.model
+  reasoningEffort.value = normalizeReasoningEffort(message.reasoningEffort || reasoningEffort.value, profile)
+  collaborationMode.value = message.collaborationMode || collaborationMode.value
+}
+
 function applyForkedSession(record: SessionRecord): void {
-  activeThreadId.value = record.session_id
+  workspace.create(currentProject.value, record.session_id)
   pendingResponseAnnotations.value = []
   messages.value = restoreSessionMessages(record)
+  restoreSessionModelSelection(record)
+  workspace.active.value.session = { ...workspace.active.value.session, session_id: record.session_id, session_file: record.path, name: record.name, message_count: record.message_count }
   snapshot.value = {
     ...snapshot.value,
     session: {
@@ -329,7 +444,7 @@ async function forkMessageSession(message: UiMessage, mode: 'before_turn' | 'thr
     showNotice('当前任务仍在运行，请先停止或等待它完成。')
     return null
   }
-  const sessionFile = snapshot.value.session.session_file
+  const sessionFile = workspace.active.value.session.session_file
   if (!sessionFile) {
     showNotice('这条消息还没有持久化会话，暂时无法创建分支。')
     return null
@@ -357,6 +472,16 @@ function showNotice(message: string): void {
   }, 5000)
 }
 
+function normalizeReasoningEffort(
+  value: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh',
+  profile: ModelSummary | null,
+): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
+  const supported = profile?.reasoning_levels ?? []
+  if (supported.includes(value)) return value
+  if (supported.includes('medium')) return 'medium'
+  return (['high', 'low', 'minimal', 'none'] as const).find((level) => supported.includes(level)) ?? 'none'
+}
+
 async function refresh(): Promise<void> {
   if (isRefreshing.value) return
   isRefreshing.value = true
@@ -364,13 +489,20 @@ async function refresh(): Promise<void> {
     const next = await getSnapshot()
     snapshot.value = next
     projectPathDraft.value = next.project.path || ''
-    selectedModel.value = next.model.model || selectedModel.value
-    modelForm.value = {
-      provider: next.model.provider,
-      baseUrl: next.model.base_url,
-      model: next.model.model,
-      apiKey: '',
+    const activeModel = next.models.find((model) => model.id === next.active_model_id && model.enabled)
+      ?? next.models.find((model) => model.enabled)
+      ?? next.model
+    const selectedProfileStillAvailable = next.models.some((model) => model.id === selectedModelProfileId.value && model.enabled)
+    const selectedModelStillAvailable = next.models.some((model) => model.model === selectedModel.value && model.enabled)
+    if (!selectedModelProfileId.value || (!selectedProfileStillAvailable && !selectedModelStillAvailable)) {
+      selectedModelProfileId.value = activeModel.id
+      selectedModel.value = activeModel.model
+    } else if (!selectedProfileStillAvailable) {
+      selectedModelProfileId.value = next.models.find((model) => model.model === selectedModel.value && model.enabled)?.id || activeModel.id
+    } else {
+      selectedModel.value = next.models.find((model) => model.id === selectedModelProfileId.value)?.model || activeModel.model
     }
+    reasoningEffort.value = normalizeReasoningEffort(reasoningEffort.value, selectedModelProfile.value)
     modelDiscovery.value = null
     modelDiscoveryError.value = ''
     const server = next.mcp_servers[0]
@@ -391,23 +523,52 @@ async function refresh(): Promise<void> {
   }
 }
 
-function eventToMessage(event: AgentEvent, turnIndex: number): UiMessage {
-  const status = event.status === 'warning' || event.status === 'error' ? 'failed' : event.status === 'done' || event.status === 'approved' ? 'completed' : 'inProgress'
+function eventToMessage(event: AgentEvent, turnIndex: number, cwd = currentCwd.value): UiMessage {
+  const status = event.status === 'warning' || event.status === 'error' ? 'failed' : event.status === 'done' || event.status === 'approved' ? 'completed' : event.status === 'waiting' ? 'waiting' : event.status === 'blocked' ? 'declined' : 'inProgress'
+  const command = event.title || event.tool || event.kind
   return {
-    id: event.id || newId('event'),
+    // 后端事件 ID 只保证单轮内稳定（例如 toolCallId）；增加 turn 前缀既能让
+    // start/end 原位更新，也不会与下一轮的 agent-run、retry-1 等固定 ID 冲突。
+    id: event.id ? `turn-${turnIndex}:${event.id}` : newId('event'),
     role: 'system',
     text: event.detail || event.title,
     messageType: 'commandExecution',
     turnId: `turn-${turnIndex}`,
     turnIndex,
     commandExecution: {
-      command: event.tool || event.kind || event.title,
-      cwd: currentCwd.value || null,
+      command,
+      tool: event.tool,
+      kind: event.kind,
+      cwd: cwd || null,
       status,
       aggregatedOutput: event.detail || event.title,
       exitCode: status === 'completed' ? 0 : null,
     },
   }
+}
+
+function isVisibleActivityEvent(event: AgentEvent): boolean {
+  return ['tool', 'command', 'retry', 'approval', 'safety', 'compaction', 'progress'].includes(event.kind)
+    || (event.kind === 'mcp' && ['warning', 'error', 'blocked'].includes(event.status))
+}
+
+/**
+ * 将单次工具生命周期固定在一行中：start 首次插入，update/end 依据同一 ID 原位替换。
+ * 插入点始终位于 live assistant 正文之前，所以工具调用顺序与模型真实执行顺序一致。
+ */
+function upsertLiveAgentEvent(event: AgentEvent, turnIndex: number, thread = workspace.active.value): void {
+  const { messages, streamingAssistantId } = workspace.refs(thread)
+  if (!isVisibleActivityEvent(event)) return
+  const nextMessage = eventToMessage(event, turnIndex, thread.project.project_directory || thread.project.path || '')
+  const next = [...messages.value]
+  const existingIndex = next.findIndex((message) => message.id === nextMessage.id)
+  if (existingIndex >= 0) {
+    next[existingIndex] = nextMessage
+  } else {
+    const assistantIndex = next.findIndex((message) => message.id === streamingAssistantId.value)
+    next.splice(assistantIndex >= 0 ? assistantIndex : next.length, 0, nextMessage)
+  }
+  messages.value = next
 }
 
 function appendAgentResult(
@@ -417,10 +578,19 @@ function appendAgentResult(
   attachments: SubmitPayload['attachments'] = [],
   references: UiMentionReference[] = [],
   responseAnnotations: UiResponseTextAnnotation[] = [],
+  activityDurationMs = 0,
+  modelProfileId = '',
+  modelId = '',
+  reasoningEffortId: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' = 'medium',
+  collaborationModeId: CollaborationModeKind = 'default',
+  thread = workspace.active.value,
+  sessionTurnIndex?: number,
 ): void {
-  const turnIndex = messages.value.filter((item) => item.role === 'user').length
+  const { messages, liveOverlay, diagnostics, diagnosticNote } = workspace.refs(thread)
+  const queuedMessages = messages.value.filter((item) => item.messageType === 'queued')
+  const turnIndex = messages.value.filter((item) => item.role === 'user' && item.messageType !== 'queued').length
   const annotatedBaseMessages = messages.value
-    .filter((item) => !item.id.startsWith('pending-assistant-'))
+    .filter((item) => !item.id.startsWith('pending-assistant-') && item.messageType !== 'queued')
     .map((item) => {
       if (item.role !== 'assistant') return item
       const additions = responseAnnotations.filter((annotation) => annotation.sourceMessageId === item.id)
@@ -437,21 +607,48 @@ function appendAgentResult(
     attachments: attachments.length > 0 ? attachments : undefined,
     references: references.length > 0 ? references : undefined,
     responseAnnotations: responseAnnotations.length > 0 ? responseAnnotations : undefined,
+    modelProfileId: modelProfileId || undefined,
+    model: modelId || undefined,
+    reasoningEffort: reasoningEffortId,
+    collaborationMode: collaborationModeId,
     turnId: `turn-${turnIndex}`,
     turnIndex,
+    sessionTurnIndex: sessionTurnIndex ?? null,
+    messageType: sessionTurnIndex === undefined ? 'localCommand' : undefined,
   }
-  const resultMessages = result.events.map((event) => eventToMessage(event, turnIndex))
+  const resultMessages = result.events
+    .filter(isVisibleActivityEvent)
+    .map((event) => eventToMessage(event, turnIndex, thread.project.project_directory || thread.project.path || ''))
+  const activityEventIds = resultMessages.map((message) => message.id)
+  const activityMessage: UiMessage | null = activityEventIds.length > 0 || activityDurationMs > 0
+    ? {
+        id: newId('worked'),
+        role: 'system',
+        text: activityEventIds.length === 0 ? '处理完成' : activityEventIds.length === 1
+          ? '已完成 1 项后台操作'
+          : `已完成 ${activityEventIds.length} 项后台操作`,
+        messageType: 'worked',
+        activityEventIds,
+        activityDurationMs: Math.max(0, Math.round(activityDurationMs)),
+        turnId: `turn-${turnIndex}`,
+        turnIndex,
+      }
+    : null
   const assistantMessage: UiMessage = {
     id: newId('assistant'),
     role: 'assistant',
     text: result.text,
     turnId: `turn-${turnIndex}`,
     turnIndex,
+    sessionTurnIndex: sessionTurnIndex ?? null,
+    messageType: sessionTurnIndex === undefined ? 'localCommand' : undefined,
   }
   // 批注的显示标记属于被选中的旧 AI 回复；同时把同一份结构化数据放进
   // 新用户消息，供 Pi/JSONL 会话作为下一轮上下文持久化。两处使用同一 ID，
   // 不会在恢复或再次渲染时生成重复编号。
-  messages.value = [...annotatedBaseMessages, userMessage, ...resultMessages, assistantMessage]
+  messages.value = [...annotatedBaseMessages, userMessage, ...resultMessages, ...(activityMessage ? [activityMessage] : []), assistantMessage, ...queuedMessages]
+  thread.session = result.session
+  thread.pendingChanges = result.pending_changes
   snapshot.value = {
     ...snapshot.value,
     pending_changes: result.pending_changes,
@@ -460,7 +657,7 @@ function appendAgentResult(
   diagnostics.value = result.diagnostics
   diagnosticNote.value = result.diagnostics.length > 0 ? '本轮 Agent 返回了诊断项。' : ''
   liveOverlay.value = null
-  if (result.pending_changes.some((item) => item.status === 'pending')) activeView.value = 'overview'
+  if (thread === workspace.active.value && result.pending_changes.some((item) => item.status === 'pending')) activeView.value = 'overview'
 }
 
 function readDiagnosticPayload(content: unknown): { diagnostics: Diagnostic[]; note: string } {
@@ -492,21 +689,112 @@ function insertFileMention(): void {
   composerRef.value?.appendTextToDraft('@')
 }
 
-async function onSubmit(payload: SubmitPayload): Promise<void> {
+function queuedMessageFromPayload(id: string, payload: SubmitPayload): UiMessage {
+  const attachments = messageAttachments((payload.attachments ?? []).filter((attachment) => attachment.status === 'ready'))
+  return {
+    id,
+    role: 'user',
+    text: payload.text.trim(),
+    attachments: attachments.length > 0 ? attachments : undefined,
+    references: payload.references.length > 0 ? payload.references : undefined,
+    responseAnnotations: payload.responseAnnotations.length > 0 ? payload.responseAnnotations : undefined,
+    modelProfileId: payload.modelProfileId,
+    model: payload.model,
+    reasoningEffort: payload.reasoningEffort,
+    collaborationMode: payload.collaborationMode,
+    messageType: 'queued',
+    turnId: `queued-${id}`,
+    turnIndex: messages.value.filter((item) => item.role === 'user' && item.messageType !== 'queued').length,
+  }
+}
+
+function enqueueSubmit(payload: SubmitPayload, thread = workspace.active.value, first = false): void {
+  const { queuedSubmits, messages, selectedModel, selectedModelProfileId, reasoningEffort, collaborationMode } = workspace.refs(thread)
+  const id = newId('queued')
+  const queuedPayload: SubmitPayload = {
+    ...payload,
+    modelProfileId: payload.modelProfileId || selectedModelProfileId.value,
+    model: payload.model || selectedModel.value,
+    reasoningEffort: payload.reasoningEffort || reasoningEffort.value,
+    collaborationMode: payload.collaborationMode || collaborationMode.value,
+  }
+  queuedSubmits.value = first ? [{ id, payload: queuedPayload }, ...queuedSubmits.value] : [...queuedSubmits.value, { id, payload: queuedPayload }]
+  showNotice(`已加入队列（前方 ${queuedSubmits.value.length} 条任务）`)
+}
+
+async function drainSubmitQueue(thread = workspace.active.value): Promise<void> {
+  const { isBusy, isDrainingSubmitQueue, queuedSubmits, messages } = workspace.refs(thread)
+  if (thread.queuePaused || isBusy.value || isDrainingSubmitQueue.value || queuedSubmits.value.length === 0) return
+  const next = queuedSubmits.value[0]
+  if (!next) return
+  isDrainingSubmitQueue.value = true
+  queuedSubmits.value = queuedSubmits.value.slice(1)
+  messages.value = messages.value.filter((message) => message.id !== next.id)
+  try {
+    await onSubmit(next.payload, thread)
+  } finally {
+    isDrainingSubmitQueue.value = false
+    if (!isBusy.value && queuedSubmits.value.length > 0) void drainSubmitQueue(thread)
+  }
+}
+
+function cancelQueuedSubmit(id: string): void {
+  queuedSubmits.value = queuedSubmits.value.filter((item) => item.id !== id)
+  messages.value = messages.value.filter((message) => message.id !== id)
+}
+
+function resumeSubmitQueue(): void {
+  queuePaused.value = false
+  void drainSubmitQueue()
+}
+
+async function onSubmit(payload: SubmitPayload, thread = workspace.active.value): Promise<void> {
+  const { messages, isBusy, liveOverlay, pendingResponseAnnotations, streamingRequestId, streamingAssistantId, selectedModel, selectedModelProfileId, reasoningEffort, collaborationMode } = workspace.refs(thread)
+  const { displayedText: streamingText, start: startTextStream, reset: resetTextStream, append: appendTextDelta, flush: flushTextStream, stop: stopTextStream } = thread.textStream
   const text = payload.text.trim()
+  if (text === '/stop') { await onInterrupt(false, thread); return }
+  if (text === '/new') { await startNewThread(); return }
+  if (text === '/clear' && !thread.isBusy) { workspace.create(thread.project); return }
+  if (text === '/model') { settingsCategory.value = 'models'; showSettings.value = true; await onDiscoverModels(modelFormFromSummary(snapshot.value.models.find((model) => model.id === thread.selectedModelProfileId) || snapshot.value.model)); return }
+  if (text === '/skills' || text === '/mcp') { settingsCategory.value = text.slice(1); showSettings.value = true; return }
+  if (text === '/tools') { activeView.value = 'skills'; showSettings.value = false; return }
+  if (/^\/(approve|reject)\s+/u.test(text)) {
+    const [action, id] = text.split(/\s+/u)
+    const change = thread.pendingChanges.find((change) => change.id === id)
+    if (!change) { showNotice('找不到该会话中的待审批动作。'); return }
+    if (action === '/approve') await onApprove(change); else await onReject(change)
+    return
+  }
   const attachments = (payload.attachments ?? []).filter((attachment) => attachment.status === 'ready')
   const responseAnnotations = payload.responseAnnotations ?? []
   const visibleAttachments = messageAttachments(attachments)
-  if ((!text && attachments.length === 0 && responseAnnotations.length === 0) || isBusy.value) return
+  if (!text && attachments.length === 0 && responseAnnotations.length === 0) return
+  if (isBusy.value) {
+    enqueueSubmit(payload, thread, payload.mode === 'steer')
+    if (payload.mode === 'steer') await onInterrupt(true, thread)
+    return
+  }
   isBusy.value = true
+  const startedAt = globalThis.performance?.now?.() ?? Date.now()
+  const requestId = newId('request')
+  streamingRequestId.value = requestId
+  startTextStream(requestId)
   liveOverlay.value = {
     activityLabel: '正在处理 PLC 任务',
     activityDetails: ['读取当前工程快照', '按审批边界规划工具调用'],
     reasoningText: '',
     errorText: '',
+    status: 'working',
   }
-  const baseMessages = messages.value
+  const queuedMessagesAtStart = messages.value.filter((item) => item.messageType === 'queued')
+  const baseMessages = messages.value.filter((item) => item.messageType !== 'queued')
   const pendingTurnIndex = baseMessages.filter((item) => item.role === 'user').length
+  const requestModel = payload.model?.trim() || selectedModel.value
+  const requestModelProfileId = payload.modelProfileId?.trim() || selectedModelProfileId.value
+  const requestReasoningEffort = payload.reasoningEffort ?? reasoningEffort.value
+  const requestCollaborationMode: CollaborationModeKind = /^\/plan(?:\s|$)/iu.test(text)
+    ? 'plan'
+    : payload.collaborationMode ?? collaborationMode.value
   const pendingUserMessage: UiMessage = {
     id: newId('user'),
     role: 'user',
@@ -514,12 +802,188 @@ async function onSubmit(payload: SubmitPayload): Promise<void> {
     attachments: visibleAttachments.length > 0 ? visibleAttachments : undefined,
     references: payload.references.length > 0 ? payload.references : undefined,
     responseAnnotations: responseAnnotations.length > 0 ? responseAnnotations : undefined,
+    modelProfileId: requestModelProfileId,
+    model: requestModel,
+    reasoningEffort: requestReasoningEffort,
+    collaborationMode: requestCollaborationMode,
     turnId: `turn-${pendingTurnIndex}`,
     turnIndex: pendingTurnIndex,
   }
-  // 读取上下文和模型阶段由 liveOverlay 展示；不要再插入一个 assistant 占位，
-  // 否则真实 agent-event 会与占位文案在同一轮重复出现。
-  messages.value = [...baseMessages, pendingUserMessage]
+  const streamingAssistantMessage: UiMessage = {
+    id: newId('assistant-live'),
+    role: 'assistant',
+    text: '',
+    messageType: 'agentMessage.live',
+    turnId: `turn-${pendingTurnIndex}`,
+    turnIndex: pendingTurnIndex,
+  }
+  streamingAssistantId.value = streamingAssistantMessage.id
+  const stopWatchingText = watch(streamingText, (text) => {
+    messages.value = messages.value.map((message) => message.id === streamingAssistantId.value ? { ...message, text } : message)
+  })
+  // live assistant 是真实模型增量的承载消息，不是静态占位；首个 delta 到达后立即出现正文。
+  messages.value = [...baseMessages, pendingUserMessage, streamingAssistantMessage, ...queuedMessagesAtStart]
+  let lastStreamSequence = 0
+  let nativeTurnIndex: number | undefined
+  let thinkingStartedAt = 0
+  let thinkingTimer: number | undefined
+
+  function stopThinkingTimer(): void {
+    if (thinkingTimer !== undefined) window.clearInterval(thinkingTimer)
+    thinkingTimer = undefined
+    thinkingStartedAt = 0
+  }
+
+  function showThinkingActivity(): void {
+    if (!thinkingStartedAt || streamingRequestId.value !== requestId) return
+    const elapsedSeconds = Math.max(0, Math.floor((Date.now() - thinkingStartedAt) / 1000))
+    liveOverlay.value = {
+      activityLabel: '正在思考…',
+      activityDetails: elapsedSeconds > 0 ? [`已持续 ${elapsedSeconds} 秒`] : ['正在分析上下文'],
+      reasoningText: '',
+      errorText: '',
+      status: 'working',
+    }
+  }
+
+  function startThinkingTimer(): void {
+    if (!thinkingStartedAt) thinkingStartedAt = Date.now()
+    showThinkingActivity()
+    if (thinkingTimer === undefined) {
+      thinkingTimer = window.setInterval(showThinkingActivity, 1000)
+    }
+  }
+
+  function showAgentEvent(item: AgentEvent): void {
+    if (item.kind === 'turn' && item.detail) {
+      const metadata = JSON.parse(item.detail) as { turn_index?: number }
+      if (typeof metadata.turn_index === 'number' && Number.isInteger(metadata.turn_index)) {
+        nativeTurnIndex = metadata.turn_index
+        pendingUserMessage.sessionTurnIndex = nativeTurnIndex
+        messages.value = messages.value.map((message) => message.turnIndex === pendingTurnIndex ? { ...message, sessionTurnIndex: nativeTurnIndex } : message)
+      }
+      return
+    }
+    if (item.kind === 'retry' && item.status === 'running') {
+      messages.value = messages.value.map((message) => message.commandExecution?.kind === 'retry' && message.commandExecution.status === 'inProgress' ? { ...message, commandExecution: { ...message.commandExecution, status: 'completed', exitCode: 0 } } : message)
+    }
+    upsertLiveAgentEvent(item, pendingTurnIndex, thread)
+    if (item.kind === 'retry') {
+      stopThinkingTimer()
+      if (item.status === 'running' || item.status === 'warning') {
+        // 上一次失败流可能已经产生半截文字；重连等待开始时清理该尝试，
+        // 下一次 assistant stream_start 会再次确认边界。
+        resetTextStream(requestId)
+        const attempt = item.retry_attempt ?? 1
+        const maxAttempts = item.retry_max_attempts ?? 5
+        const wait = item.retry_delay_ms === null || item.retry_delay_ms === undefined
+          ? ''
+          : ` · ${(item.retry_delay_ms / 1000).toFixed(1)} 秒后重试`
+        const statusCode = item.retry_status ? `HTTP ${item.retry_status}` : '连接中断'
+        liveOverlay.value = {
+          activityLabel: `Reconnecting… 第 ${attempt}/${maxAttempts} 次`,
+          activityDetails: [`${statusCode}${wait}`],
+          reasoningText: '',
+          errorText: '',
+          status: 'reconnecting',
+        }
+      } else if (item.status === 'done') {
+        liveOverlay.value = {
+          activityLabel: '已重新连接，继续生成…',
+          activityDetails: [],
+          reasoningText: '',
+          errorText: '',
+          status: 'working',
+        }
+      }
+      return
+    }
+    if (item.kind === 'model') {
+      if (item.status === 'running') startThinkingTimer()
+      else if (streamingText.value) {
+        stopThinkingTimer()
+        liveOverlay.value = {
+          activityLabel: '正在完成回复…',
+          activityDetails: [],
+          reasoningText: '',
+          errorText: '',
+          status: 'streaming',
+        }
+      }
+      return
+    }
+    if (isVisibleActivityEvent(item)) {
+      stopThinkingTimer()
+      const failed = ['warning', 'error', 'blocked'].includes(item.status)
+      liveOverlay.value = {
+        activityLabel: item.status === 'running' ? item.title : failed ? '工具返回了诊断' : '工具已完成，正在继续…',
+        activityDetails: [],
+        reasoningText: '',
+        errorText: failed ? item.detail || '' : '',
+        status: failed ? 'error' : 'working',
+      }
+    }
+  }
+
+  function onAgentStream(payload: AgentStreamPayload): void {
+    if (payload.request_id !== requestId || payload.sequence <= lastStreamSequence) return
+    lastStreamSequence = payload.sequence
+    if (payload.type === 'session' && payload.session) {
+      thread.session = payload.session
+      return
+    }
+    if (payload.type === 'request_start') {
+      liveOverlay.value = {
+        activityLabel: '正在连接模型…',
+        activityDetails: [],
+        reasoningText: '',
+        errorText: '',
+        status: 'working',
+      }
+      return
+    }
+    if (payload.type === 'thinking') {
+      if (payload.phase === 'end') {
+        stopThinkingTimer()
+        liveOverlay.value = {
+          activityLabel: '正在整理思考结果…',
+          activityDetails: [],
+          reasoningText: '',
+          errorText: '',
+          status: 'working',
+        }
+      } else {
+        startThinkingTimer()
+      }
+      return
+    }
+    if (payload.type === 'stream_start') {
+      stopThinkingTimer()
+      resetTextStream(requestId)
+      liveOverlay.value = {
+        activityLabel: '正在接收模型输出…',
+        activityDetails: [],
+        reasoningText: '',
+        errorText: '',
+        status: 'streaming',
+      }
+      return
+    }
+    if (payload.type === 'delta' && payload.delta) {
+      stopThinkingTimer()
+      appendTextDelta(requestId, payload.delta)
+      liveOverlay.value = {
+        activityLabel: '正在生成回复…',
+        activityDetails: [],
+        reasoningText: '',
+        errorText: '',
+        status: 'streaming',
+      }
+      return
+    }
+    if (payload.type === 'event' && payload.event) showAgentEvent(payload.event)
+  }
+
   try {
     const history = baseMessages
       .filter((item) => item.role === 'user' || item.role === 'assistant')
@@ -532,80 +996,130 @@ async function onSubmit(payload: SubmitPayload): Promise<void> {
         references: item.references,
         responseAnnotations: item.responseAnnotations,
       }))
+    const agentText = /^\/plan(?:\s|$)/iu.test(text)
+      ? text.replace(/^\/plan(?:\s+)?/iu, '').trim() || '请先制定并展示本轮执行计划。'
+      : text
     const runOptions: AgentRunOptions = {
-      model: selectedModel.value,
-      reasoningEffort: reasoningEffort.value,
-      collaborationMode: collaborationMode.value,
+      model: requestModel,
+      modelProfileId: requestModelProfileId,
+      reasoningEffort: requestReasoningEffort,
+      collaborationMode: requestCollaborationMode,
       skills: payload.skills,
       attachments,
       references: payload.references,
       responseAnnotations,
+      requestId,
+      displayMessage: text,
+      clientThreadId: thread.id,
+      workspacePath: thread.project.path || undefined,
+      sessionFile: thread.session.session_file || undefined,
+      onEvent: onAgentStream,
     }
-    const result = await runAgent(text, history, agentContext.value, runOptions)
+    const result = await runAgent(agentText, history, {
+      snapshot_id: thread.project.snapshot_id, project_path: thread.project.path,
+      project_directory: thread.project.project_directory, working_directory: thread.project.working_directory,
+      project_key: thread.project.project_key, active_object: thread.project.active_object, active_file: thread.project.active_file,
+    }, runOptions)
+    // 等真实 delta 的可见缓冲排空后再换成最终消息，防止 Vue 把连续更新
+    // 与最终落地合并成一次绘制，造成“看起来没有流式”的问题。
+    await flushTextStream(requestId)
     // runAgent 返回的是本轮完整结果；以发送前的历史为基线，避免把本轮用户消息
     // 误当成历史再次拼接，或者在占位消息清理时误删上一轮消息。
-    messages.value = baseMessages
-    appendAgentResult(result, text, payload.skills, visibleAttachments, payload.references, responseAnnotations)
+    const queuedMessages = messages.value.filter((item) => item.messageType === 'queued')
+    messages.value = [...baseMessages, ...queuedMessages]
+    const finishedAt = globalThis.performance?.now?.() ?? Date.now()
+    appendAgentResult(result, text, payload.skills, visibleAttachments, payload.references, responseAnnotations, finishedAt - startedAt, requestModelProfileId, requestModel, requestReasoningEffort, requestCollaborationMode, thread, nativeTurnIndex)
     pendingResponseAnnotations.value = []
     await refresh()
   } catch (error) {
     const errorText = error instanceof Error ? error.message : String(error)
+    const interrupted = /已中止|已停止/u.test(errorText)
+    // 中断或最终错误无需继续播放动画，但要保留已经收到的完整部分回复。
+    await flushTextStream(requestId, true)
+    const queuedMessages = messages.value.filter((item) => item.messageType === 'queued')
+    const activityMessages = messages.value.filter((item) => item.turnIndex === pendingTurnIndex && item.commandExecution).map((item): UiMessage => (
+      item.commandExecution?.status === 'inProgress' ? { ...item, commandExecution: { ...item.commandExecution, status: 'interrupted' } } : item
+    ))
+    const partialText = streamingText.value.trim()
+    const partialAssistant: UiMessage | null = partialText
+      ? {
+          id: newId('assistant-partial'),
+          role: 'assistant',
+          text: partialText,
+          messageType: 'assistant.partial',
+          sessionTurnIndex: nativeTurnIndex ?? null,
+          turnId: `turn-${pendingTurnIndex}`,
+          turnIndex: pendingTurnIndex,
+        }
+      : null
     messages.value = [
       ...baseMessages,
-      pendingUserMessage,
+      { ...pendingUserMessage, sessionTurnIndex: nativeTurnIndex ?? null },
+      ...activityMessages,
+      ...(partialAssistant ? [partialAssistant] : []),
       {
         id: newId('turn-error'),
         role: 'assistant',
-        text: `这次任务还没有完成：${errorText}`,
-        messageType: 'turnError',
+        text: interrupted ? '已停止当前任务。' : `这次任务还没有完成：${errorText}`,
+        messageType: interrupted ? 'turnInterrupted' : 'turnError',
+        sessionTurnIndex: nativeTurnIndex ?? null,
         turnId: `turn-${pendingTurnIndex}`,
         turnIndex: pendingTurnIndex,
+        retryPayload: {
+          text,
+          modelProfileId: requestModelProfileId,
+          model: requestModel,
+          reasoningEffort: requestReasoningEffort,
+          collaborationMode: requestCollaborationMode,
+          skills: payload.skills,
+          attachments,
+          references: payload.references,
+          responseAnnotations,
+        } satisfies UiRetryPayload,
       },
+      ...queuedMessages,
     ]
     // 请求未完成时把批注和原始草稿放回 Composer，确保手动重试不会丢失
     // 所选文本、用户评论及其来源消息绑定。
     pendingResponseAnnotations.value = responseAnnotations
-    composerRef.value?.hydrateDraft({
+    if (thread === workspace.active.value && !/已中止|已停止/u.test(errorText)) composerRef.value?.hydrateDraft({
       text,
       skills: payload.skills,
       attachments,
       references: payload.references,
       responseAnnotations,
     })
+    // Rust/Pi 可能已经创建了包含失败轮次的 JSONL；刷新快照拿到 session_file，
+    // 让后续手动重试可以从失败用户消息之前建立干净分支。
+    try {
+      await refresh()
+    } catch {
+      // 错误消息已经保留在当前窗口；快照刷新失败不应覆盖可重试入口。
+    }
     liveOverlay.value = null
   } finally {
+    stopThinkingTimer()
+    stopWatchingText()
     isBusy.value = false
+    streamingRequestId.value = ''
+    streamingAssistantId.value = ''
+    stopTextStream(requestId)
+    if (thread.queuedSubmits.length > 0) void drainSubmitQueue(thread)
   }
 }
 
 async function onCompact(): Promise<void> {
   if (isBusy.value) return
-  isBusy.value = true
-  try {
-    const result = await compactContext('', agentContext.value)
-    messages.value = [...messages.value, eventToMessage({
-      id: newId('compact'),
-      kind: 'compact',
-      title: '已压缩当前上下文',
-      detail: result.text,
-      status: 'done',
-      tool: 'compact_context',
-    }, messages.value.length)]
-    snapshot.value = { ...snapshot.value, session: result.session }
-    diagnostics.value = result.diagnostics
-    diagnosticNote.value = result.diagnostics.length > 0 ? '压缩前保留了本轮诊断项。' : ''
-    showNotice('上下文已压缩，关键工程结论已保留。')
-  } catch (error) {
-    showNotice(error instanceof Error ? error.message : String(error))
-  } finally {
-    isBusy.value = false
-  }
+  await onSubmit({ text: '/compact', skills: [], attachments: [], references: [], responseAnnotations: [], mode: 'steer' })
 }
 
-async function onInterrupt(): Promise<void> {
+async function onInterrupt(continueQueue = false, thread = workspace.active.value): Promise<void> {
+  const { isBusy } = workspace.refs(thread)
   if (!isBusy.value) return
   try {
-    const result = await abortAgent()
+    thread.queuePaused = !continueQueue
+    thread.liveOverlay = { activityLabel: '正在停止当前任务…', activityDetails: [], reasoningText: '', errorText: '', status: 'working' }
+    const result = await abortAgent(thread.streamingRequestId)
     showNotice(result.aborted ? '已请求停止当前 Agent 任务。' : '当前任务已接近完成，无需重复停止。')
   } catch (error) {
     showNotice(error instanceof Error ? error.message : '停止请求尚未送达桌面运行时。')
@@ -635,7 +1149,7 @@ async function onCompile(): Promise<void> {
 }
 
 function pathKey(value: string | null | undefined): string {
-  return (value || '').trim().replaceAll('\\', '/').replace(/\/+$/u, '').toLowerCase()
+  return normalizePathForUi(value || '').trim().replaceAll('\\', '/').replace(/\/+$/u, '').toLowerCase()
 }
 
 function isSamePath(left: string | null | undefined, right: string | null | undefined): boolean {
@@ -654,7 +1168,7 @@ function projectPathLabel(path: string | null | undefined): string {
 }
 
 function resetConversationForWorkspace(): void {
-  activeThreadId.value = `local-${Date.now()}`
+  workspace.create(snapshot.value.project)
   messages.value = []
   pendingResponseAnnotations.value = []
   diagnostics.value = []
@@ -672,12 +1186,14 @@ async function activateProject(path: string): Promise<void> {
   try {
     const project = await selectProject(normalized)
     snapshot.value = { ...snapshot.value, project }
+    const existing = workspace.threads.value.find((thread) => isSamePath(thread.project.path, project.path))
+    if (existing) workspace.select(existing)
+    else workspace.create(project)
     projectPathDraft.value = project.path || normalized
     if (!isSamePath(previousPath, project.path)) {
       await startNewSession()
-      resetConversationForWorkspace()
     }
-    activeView.value = 'overview'
+    activeView.value = 'chat'
     await refresh()
     showNotice(`已打开工程：${project.name || project.path || normalized}`)
   } catch (error) {
@@ -703,7 +1219,7 @@ async function onOpenProject(project: WorkspaceProject): Promise<void> {
 }
 
 async function onRemoveProject(project: WorkspaceProject): Promise<void> {
-  if (!window.confirm(`从工作区移除“${project.name}”吗？不会删除磁盘上的文件。`)) return
+  if (!await requestConfirm('移除工程', `从工作区移除“${project.name}”吗？不会删除磁盘上的文件。`)) return
   try {
     const projects = await removeProject(project.id)
     snapshot.value = { ...snapshot.value, projects }
@@ -720,13 +1236,17 @@ async function onRemoveProject(project: WorkspaceProject): Promise<void> {
 
 async function onResumeSession(record: SessionRecord): Promise<void> {
   try {
+    const existing = workspace.threads.value.find((thread) => thread.session.session_id === record.session_id)
+    if (existing) { workspace.select(existing); activeView.value = 'chat'; return }
     if (record.cwd && !isSamePath(currentCwd.value, record.cwd)) {
       const project = await selectProject(record.cwd)
       snapshot.value = { ...snapshot.value, project }
       projectPathDraft.value = project.path || record.cwd
     }
     const resumed = await resumeSession(record.path)
-    activeThreadId.value = resumed.session_id
+    workspace.create(snapshot.value.project, resumed.session_id)
+    workspace.active.value.session = { ...workspace.active.value.session, session_id: resumed.session_id, session_file: resumed.path, name: resumed.name, message_count: resumed.message_count }
+    restoreSessionModelSelection(resumed)
     pendingResponseAnnotations.value = []
     messages.value = restoreSessionMessages(resumed)
     snapshot.value = {
@@ -745,6 +1265,7 @@ async function onEditMessage(message: UiMessage): Promise<void> {
   if (message.role !== 'user') return
   const record = await forkMessageSession(message, 'before_turn')
   if (!record) return
+  restoreMessageModelSelection(message)
   await nextTick()
   composerRef.value?.hydrateDraft(messageDraftPayload(message))
   showNotice('已从这条消息前创建编辑分支，请修改后发送。')
@@ -761,10 +1282,57 @@ async function onResendMessage(message: UiMessage): Promise<void> {
   }))
   await onSubmit({
     text: message.text,
+    model: message.model,
+    modelProfileId: message.modelProfileId,
+    reasoningEffort: message.reasoningEffort,
+    collaborationMode: message.collaborationMode,
     skills: message.skills ?? [],
     attachments,
     references: message.references ?? [],
     responseAnnotations: message.responseAnnotations ?? [],
+    mode: 'steer',
+  })
+}
+
+async function onRetryMessage(message: UiMessage): Promise<void> {
+  const retryPayload = message.retryPayload
+  if (message.messageType !== 'turnError' || !retryPayload || isBusy.value) return
+  const currentProfile = snapshot.value.models.find((model) => model.id === selectedModelProfileId.value && model.enabled)
+  if (!currentProfile) {
+    showNotice('原模型配置已删除或停用，请先在 Composer 中选择可用模型后重新发送。')
+    return
+  }
+  const retryReasoningEffort = normalizeReasoningEffort(reasoningEffort.value, currentProfile)
+  const configurationChanged = currentProfile.id !== retryPayload.modelProfileId || currentProfile.model !== retryPayload.model
+    || retryReasoningEffort !== retryPayload.reasoningEffort
+
+  // Pi 已把失败用户轮次写入 JSONL 时，先复制失败轮次之前的内容再重试。
+  // 这样重试只会写入一条新的用户消息，不会重复历史或重放已完成工具。
+  if (workspace.active.value.session.session_file && message.sessionTurnIndex !== null) {
+    const forked = await forkMessageSession(message, 'before_turn', '重试本轮')
+    if (!forked) return
+  } else {
+    messages.value = messages.value.filter((item) => (
+      item.turnId !== message.turnId || item.messageType === 'queued'
+    ))
+  }
+
+  selectedModelProfileId.value = currentProfile.id
+  selectedModel.value = currentProfile.model
+  reasoningEffort.value = retryReasoningEffort
+  showNotice(configurationChanged
+    ? `模型配置已更新，改用 ${currentProfile.model} / 思考 ${retryReasoningEffort} 重试本轮。`
+    : `正在使用 ${currentProfile.model} / 思考 ${retryReasoningEffort} 重试本轮。`)
+  await onSubmit({
+    text: retryPayload.text,
+    skills: retryPayload.skills,
+    attachments: retryPayload.attachments,
+    references: retryPayload.references,
+    responseAnnotations: retryPayload.responseAnnotations,
+    model: currentProfile.model,
+    modelProfileId: currentProfile.id,
+    reasoningEffort: retryReasoningEffort,
+    collaborationMode: retryPayload.collaborationMode,
     mode: 'steer',
   })
 }
@@ -848,10 +1416,12 @@ function removeResponseAnnotation(id: string): void {
 
 async function onRenameSession(record: SessionRecord): Promise<void> {
   const currentName = record.name || ''
-  const name = window.prompt('输入新的会话名称', currentName)
+  const name = await requestPrompt('重命名会话', '输入新的会话名称', currentName)
   if (name === null || !name.trim()) return
   try {
     await renameSession(name, record.path)
+    const local = workspace.threads.value.find((thread) => thread.session.session_id === record.session_id)
+    if (local) local.session = { ...local.session, name: name.trim() }
     await refresh()
     showNotice('会话名称已更新。')
   } catch (error) {
@@ -860,15 +1430,11 @@ async function onRenameSession(record: SessionRecord): Promise<void> {
 }
 
 async function onDeleteSession(record: SessionRecord): Promise<void> {
-  if (!window.confirm(`清理会话“${record.name || record.session_id.slice(0, 12)}”吗？这只会删除本地会话记录。`)) return
+  if (!await requestConfirm('清理会话', `清理会话“${record.name || record.session_id.slice(0, 12)}”吗？这只会删除本地会话记录。`)) return
   try {
     const sessions = await deleteSession(record.path)
     snapshot.value = { ...snapshot.value, sessions }
-    if (record.session_id === snapshot.value.session.session_id) {
-      await startNewSession()
-      resetConversationForWorkspace()
-      snapshot.value = { ...snapshot.value, session: { ...snapshot.value.session, session_id: null, session_file: null, name: null, message_count: 0 } }
-    }
+    for (const thread of workspace.threads.value.filter((thread) => thread.session.session_id === record.session_id)) workspace.remove(thread)
     showNotice('本地会话记录已清理。')
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
@@ -876,18 +1442,30 @@ async function onDeleteSession(record: SessionRecord): Promise<void> {
 }
 
 async function onApprove(change: PendingChange): Promise<void> {
+  const thread = workspace.active.value
+  if (thread.isBusy) { showNotice('请等待该会话结束或停止当前任务后再审批。'); return }
+  thread.isBusy = true
+  thread.streamingRequestId = `approval-${change.id}`
   try {
-    await approveChange(change.id)
-    showNotice('修改已通过审批，请重新编译验证。')
+    const turnIndex = Math.max(0, thread.messages.filter((message) => message.role === 'user').length - 1)
+    const result = await approveChange(change.id, (event) => upsertLiveAgentEvent(event, turnIndex, thread))
+    thread.pendingChanges = thread.pendingChanges.filter((pending) => pending.id !== change.id)
+    if (change.tool_name !== 'exec_command') thread.messages = [...thread.messages, eventToMessage({ id: change.id, kind: 'tool', title: result.is_error ? '动作返回诊断' : '已完成审批动作', detail: JSON.stringify(result.content, null, 2), status: result.is_error ? 'error' : 'done', tool: change.tool_name }, turnIndex, thread.project.project_directory || thread.project.path || '')]
+    showNotice(result.is_error ? '动作返回诊断，请查看工具详情。' : '审批动作已执行。')
     await refresh()
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
+  } finally {
+    thread.isBusy = false
+    thread.streamingRequestId = ''
+    thread.liveOverlay = null
   }
 }
 
 async function onReject(change: PendingChange): Promise<void> {
   try {
     await rejectChange(change.id)
+    workspace.active.value.pendingChanges = workspace.active.value.pendingChanges.filter((pending) => pending.id !== change.id)
     showNotice('已拒绝这次工程修改。')
     await refresh()
   } catch (error) {
@@ -895,35 +1473,93 @@ async function onReject(change: PendingChange): Promise<void> {
   }
 }
 
-async function onSaveModel(): Promise<void> {
+async function onSaveModel(form: ModelForm): Promise<void> {
   try {
-    snapshot.value = { ...snapshot.value, model: await saveModel(modelForm.value) }
-    selectedModel.value = modelForm.value.model
-    showSettings.value = false
-    showNotice('模型配置已保存到本机运行时。')
+    const summary = await saveModel(form)
+    const discovery = modelDiscovery.value
+    selectedModelProfileId.value = summary.id
+    selectedModel.value = summary.model
+    reasoningEffort.value = normalizeReasoningEffort(reasoningEffort.value, summary)
+    await refresh()
+    modelDiscovery.value = discovery
+    showNotice(`模型“${summary.name}”已保存到本机配置。`)
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
   }
 }
 
-function selectDiscoveredModel(modelId: string): void {
-  modelForm.value = { ...modelForm.value, model: modelId }
-  selectedModel.value = modelId
-}
-
-async function onDiscoverModels(): Promise<void> {
+async function onDiscoverModels(form: ModelForm): Promise<void> {
   modelDiscoveryError.value = ''
   isDiscoveringModels.value = true
   try {
-    const result = await discoverModels({ ...modelForm.value })
+    const result = await discoverModels({ ...form })
+    await refresh()
     modelDiscovery.value = result
     showNotice(result.models.length > 0 ? `已获取 ${result.models.length} 个可用模型。` : '接口已响应，但没有返回可用模型。')
   } catch (error) {
+    const errorText = error instanceof Error ? error.message : String(error)
+    await refresh()
     modelDiscovery.value = null
-    modelDiscoveryError.value = error instanceof Error ? error.message : String(error)
+    modelDiscoveryError.value = errorText
     showNotice('模型列表获取未完成，请查看设置面板中的原因。')
   } finally {
     isDiscoveringModels.value = false
+  }
+}
+
+async function onSetActiveModel(id: string): Promise<void> {
+  try {
+    const summary = await setActiveModel(id)
+    selectedModelProfileId.value = summary.id
+    selectedModel.value = summary.model
+    reasoningEffort.value = normalizeReasoningEffort(reasoningEffort.value, summary)
+    await refresh()
+    showNotice(`当前模型已切换为“${summary.name}”。`)
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function onToggleModel(id: string, enabled: boolean): Promise<void> {
+  try {
+    await setModelEnabled(id, enabled)
+    await refresh()
+    showNotice(enabled ? '模型已启用。' : '模型已停用。')
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function onDuplicateModel(id: string): Promise<void> {
+  try {
+    const summary = await duplicateModel(id)
+    await refresh()
+    selectedModelProfileId.value = summary.id
+    selectedModel.value = summary.model
+    showNotice(`已复制模型“${summary.name}”。`)
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function onDeleteModel(id: string): Promise<void> {
+  const target = snapshot.value.models.find((model) => model.id === id)
+  if (!target || !await requestConfirm('删除模型', `删除模型配置“${target.name}”吗？本机保存的对应 Key 也会一并移除。`)) return
+  try {
+    await deleteModel(id)
+    await refresh()
+    showNotice('模型配置已删除。')
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+function onComposerModelChange(profileId: string): void {
+  const profile = snapshot.value.models.find((model) => model.enabled && model.id === profileId)
+  if (profile) {
+    selectedModelProfileId.value = profile.id
+    selectedModel.value = profile.model
+    reasoningEffort.value = normalizeReasoningEffort(reasoningEffort.value, profile)
   }
 }
 
@@ -957,15 +1593,13 @@ function chooseCommand(command: string, supportsArgs: boolean): void {
   if (!supportsArgs) void onSubmit({ text: command, skills: [], attachments: [], references: [], responseAnnotations: [], mode: 'steer' })
 }
 
-async function startNewThread(): Promise<void> {
-  if (isBusy.value) {
-    showNotice('当前任务仍在运行，请先停止或等待它完成。')
-    return
-  }
+async function startNewThread(project?: WorkspaceProject): Promise<void> {
   try {
-    const session = await startNewSession()
-    resetConversationForWorkspace()
-    snapshot.value = { ...snapshot.value, session }
+    const context = project ? await selectProject(project.path) : await startTemporaryWorkspace()
+    workspace.create(context)
+    showSettings.value = false
+    snapshot.value = { ...snapshot.value, project: context }
+    await refresh()
     activeView.value = 'chat'
     showNotice('已新建会话，工程文件没有改动。')
   } catch (error) {
@@ -1073,40 +1707,32 @@ function onKeyDown(event: KeyboardEvent): void {
   }
 }
 
-let stopListening: UnlistenFn | undefined
-let stopWindowDrop: UnlistenFn | undefined
+let stopWindowDrop: (() => void) | undefined
 let syncTimer: number | undefined
-
-watch(theme, applyTheme, { immediate: true })
 
 onMounted(async () => {
   await refresh()
+  try {
+    const restored = await workspace.restore()
+    if (!restored) workspace.active.value.project = snapshot.value.project
+    if (!workspace.active.value.project.path) workspace.active.value.project = await startTemporaryWorkspace()
+    else await selectProject(workspace.active.value.project.path)
+    await refresh()
+  } catch (error) { showNotice(`恢复会话工作区未完成：${String(error)}`) }
   window.addEventListener('keydown', onKeyDown)
   await setupNativeWindowDrop()
-  try {
-    stopListening = await listen<AgentEvent>('agent-event', (event) => {
-      const item = event.payload
-      liveOverlay.value = {
-        activityLabel: item.title,
-        activityDetails: item.detail ? [item.detail] : [],
-        reasoningText: '',
-        errorText: item.status === 'warning' || item.status === 'error' ? item.detail || '' : '',
-      }
-    })
-  } catch {
-    // 浏览器预览没有 Tauri 事件桥接，仍可查看静态界面。
-  }
   syncTimer = window.setInterval(() => {
     void syncCurrentProject().then((project) => {
-      snapshot.value = { ...snapshot.value, project }
-      projectPathDraft.value = project.path || projectPathDraft.value
+      if (!workspace.active.value.isBusy && isSamePath(project.path, currentProject.value.path)) {
+        workspace.active.value.project = project
+        projectPathDraft.value = project.path || projectPathDraft.value
+      }
     }).catch(() => undefined)
   }, 4000)
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeyDown)
-  stopListening?.()
   stopWindowDrop?.()
   if (syncTimer) window.clearInterval(syncTimer)
 })
@@ -1115,94 +1741,59 @@ onUnmounted(() => {
 <template>
   <DesktopLayout
     :is-sidebar-collapsed="isSidebarCollapsed"
+    :is-settings-mode="showSettings"
     @close-sidebar="isSidebarCollapsed = true"
     @dragover="onWindowDragOver"
     @dragleave="onWindowDragLeave"
     @drop="onWindowDrop"
   >
     <template #sidebar>
-      <aside class="plc-sidebar">
-        <SidebarThreadControls
-          :is-sidebar-collapsed="isSidebarCollapsed"
-          :show-new-thread-button="true"
-          @toggle-sidebar="isSidebarCollapsed = !isSidebarCollapsed"
-          @start-new-thread="startNewThread"
-        >
-          <button class="plc-sidebar-icon-button" type="button" title="搜索线程" aria-label="搜索线程" @click="showCommandPalette = true">
-            <IconTablerSearch />
-          </button>
-        </SidebarThreadControls>
+      <WorkspaceSidebar :projects="sidebarProjects" :threads="sidebarThreads" :active-id="activeThreadId" :theme="theme" @update:theme="theme = $event"
+        @new-thread="startNewThread" @select-thread="selectSidebarThread" @open-project="onOpenProject"
+        @add-project="onPickProjectFolder" @remove-project="onRemoveProject" @rename-thread="renameSidebarThread" @delete-thread="deleteSidebarThread"
+        @open-settings="showSettings = true" @open-skills="activeView = 'skills'; showSettings = false" @open-overview="activeView = 'overview'; showSettings = false" />
+    </template>
 
-        <button class="plc-brand-row" type="button" @click="activeView = 'chat'">
-          <span class="plc-brand-mark">P</span>
-          <span class="plc-brand-copy"><strong>PLC Pilot</strong><small>CODESYS 3.5.22</small></span>
-        </button>
-
-        <div class="plc-sidebar-rule" />
-        <div class="plc-project-heading">
-          <span class="plc-sidebar-label plc-sidebar-label-inline">项目</span>
-          <button class="plc-sidebar-add-button" type="button" aria-label="添加项目" title="添加项目文件夹" @click="onPickProjectFolder">
-            <IconTablerFolder />
-          </button>
-        </div>
-        <button class="plc-project-row" type="button" @click="activeView = 'overview'">
-          <span class="plc-project-status" :data-state="currentProject.exists ? 'ok' : 'idle'" />
-          <span class="plc-project-copy"><strong>{{ currentProject.name || '尚未选择工程' }}</strong><small>{{ projectPathLabel(currentProject.path) || '选择一个 .project 或工程目录' }}</small></span>
-        </button>
-        <div v-if="recentProjects.length > 0" class="plc-project-list">
-          <div v-for="project in recentProjects" :key="project.id" class="plc-project-list-row">
-            <button class="plc-project-list-main" type="button" :title="projectPathLabel(project.path)" @click="onOpenProject(project)">
-              <span class="plc-project-status" :data-state="project.exists ? 'ok' : 'idle'" />
-              <span class="plc-project-copy"><strong>{{ project.name }}</strong><small>{{ projectPathLabel(project.path) }}</small></span>
-            </button>
-            <button class="plc-project-remove" type="button" :aria-label="`从工作区移除 ${project.name}`" :title="`从工作区移除 ${project.name}`" @click="onRemoveProject(project)">
-              <IconTablerTrash />
-            </button>
-          </div>
-        </div>
-
-        <p class="plc-sidebar-label plc-sidebar-label-spaced">会话</p>
-        <div class="plc-session-list">
-          <div
-            v-for="record in snapshot.sessions"
-            :key="record.path"
-            class="plc-session-row"
-            :class="{ 'is-active': record.session_id === snapshot.session.session_id }"
-          >
-            <button class="plc-session-main" type="button" @click="onResumeSession(record)">
-              <span class="plc-session-dot" />
-              <span class="plc-session-copy"><strong>{{ record.name || record.session_id.slice(0, 12) }}</strong><small>{{ record.message_count }} 条消息 · {{ record.cwd || '本地会话' }}</small></span>
-            </button>
-            <button class="plc-session-action" type="button" :aria-label="`重命名会话 ${record.name || record.session_id.slice(0, 12)}`" title="重命名会话" @click="onRenameSession(record)"><IconTablerFilePencil /></button>
-            <button class="plc-session-action plc-session-delete" type="button" :aria-label="`清理会话 ${record.name || record.session_id.slice(0, 12)}`" title="清理本地会话" @click="onDeleteSession(record)"><IconTablerTrash /></button>
-          </div>
-          <p v-if="snapshot.sessions.length === 0" class="plc-empty-side">发送第一条任务后，会话会自动保留。</p>
-        </div>
-
-        <div class="plc-sidebar-grow" />
-        <button class="plc-sidebar-link" type="button" :class="{ 'is-active': activeView === 'skills' }" @click="activeView = 'skills'">
-          <IconTablerBolt /><span><strong>PLC Skills</strong><small>工程规范与安全审查</small></span>
-        </button>
-        <button class="plc-sidebar-link" type="button" @click="showSettings = true">
-          <IconTablerSettings /><span><strong>设置</strong><small>模型、MCP 和主题</small></span>
-        </button>
-      </aside>
+    <template #topbar>
+      <WindowTitleBar
+        :title="currentTitle"
+        :show-sidebar-toggle="!showSettings"
+        :is-sidebar-collapsed="isSidebarCollapsed"
+        @toggle-sidebar="isSidebarCollapsed = !isSidebarCollapsed"
+        @open-chat="activeView = 'chat'"
+        @start-new-thread="startNewThread"
+        @open-project="onPickProjectFolder"
+        @open-command-palette="showCommandPalette = true"
+        @open-skills="activeView = 'skills'"
+        @open-settings="showSettings = true"
+        @window-error="showNotice"
+        @open-about="showAbout = true"
+        @open-reward="showReward = true"
+        @open-github="showNotice('GitHub 链接待配置。')"
+      />
     </template>
 
     <template #header>
-      <ContentHeader :title="currentTitle" :accent="activeView !== 'chat'">
+      <ContentHeader :title="showSettings ? '设置' : currentTitle" :accent="activeView !== 'chat'">
         <template #leading>
           <span class="plc-header-status" :data-state="isBusy ? 'busy' : currentProject.exists ? 'ok' : 'idle'" />
         </template>
         <template #actions>
           <button class="plc-header-action" type="button" title="命令面板" aria-label="命令面板" @click="showCommandPalette = true">⌘K</button>
-          <button class="plc-header-action" type="button" title="切换主题" aria-label="切换主题" @click="theme = theme === 'dark' ? 'light' : 'dark'">{{ theme === 'dark' ? '○' : '●' }}</button>
         </template>
       </ContentHeader>
     </template>
 
     <template #content>
-      <section class="content-root plc-content">
+      <SettingsPage v-if="showSettings" v-model:category="settingsCategory" :snapshot="snapshot" :theme="theme" @close="showSettings = false" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
+        <template #models>
+          <ModelSettingsPanel :models="snapshot.models" :active-model-id="snapshot.active_model_id" :selected-model-id="selectedModelProfileId"
+            :discovery="modelDiscovery" :discovery-error="modelDiscoveryError" :is-discovering="isDiscoveringModels"
+            :current-context-tokens="workspace.active.value.session.context_tokens" :remaining-context-percent="tokenUsage?.remainingContextPercent ?? null" :auto-compaction-enabled="workspace.active.value.session.auto_compaction_enabled"
+            @save="onSaveModel" @discover="onDiscoverModels" @set-active="onSetActiveModel" @toggle-enabled="onToggleModel" @duplicate="onDuplicateModel" @remove="onDeleteModel" />
+        </template>
+      </SettingsPage>
+      <section v-else class="content-root plc-content">
         <div v-if="activeView === 'chat'" class="plc-chat-layout">
           <ThreadConversation
             ref="conversationRef"
@@ -1215,6 +1806,7 @@ onUnmounted(() => {
             :cwd="currentCwd"
             @edit-message="onEditMessage"
             @resend-message="onResendMessage"
+            @retry-message="onRetryMessage"
             @fork-message="onForkMessage"
             @add-response-annotation="addResponseAnnotation"
             @update-response-annotation="updateResponseAnnotation"
@@ -1246,14 +1838,16 @@ onUnmounted(() => {
 
         <div v-else class="plc-detail-layout">
           <section class="plc-detail-section"><div class="plc-section-heading"><div><p class="plc-eyebrow">内置能力</p><h2>PLC Skills</h2></div><span class="plc-section-meta">{{ snapshot.skills.length }} 项</span></div><div class="plc-skill-grid"><button v-for="skill in snapshot.skills" :key="skill.id" class="plc-skill-card" type="button" @click="onOpenSkill(skill.id)"><span class="plc-skill-badge"><IconTablerBolt /></span><span><strong>{{ skill.name }}</strong><small>{{ skill.description }}</small></span><span class="plc-skill-arrow">→</span></button></div></section>
-          <section class="plc-detail-section plc-safety-note"><p class="plc-eyebrow">默认安全边界</p><h2>先读、再预览、审批后写入</h2><p>工程读取、ST 分析、编译和诊断可以自动进行；修改、删除、下载和在线控制会先生成可审阅的动作卡片。</p></section>
+          <CodesysStatusPanel :codesys="snapshot.codesys" :project="currentProject" />
+          <section class="plc-detail-section plc-safety-note"><p class="plc-eyebrow">默认安全边界</p><h2>先读、再预览、审批后写入</h2><p>工程读取、ST 分析、编译和诊断可以自动进行；修改、删除和命令执行需要审批，PLC 下载和在线控制保持阻止。</p></section>
         </div>
       </section>
     </template>
 
     <template #composer>
+      <ComposerQueue v-if="!showSettings && activeView === 'chat' && queuedSubmits.length" :items="queuedSubmits" :paused="queuePaused" @cancel="cancelQueuedSubmit" @resume="resumeSubmitQueue" />
       <ThreadComposer
-        v-if="activeView === 'chat'"
+        v-if="!showSettings && activeView === 'chat'"
         ref="composerRef"
         class="plc-composer"
         :active-thread-id="activeThreadId"
@@ -1261,21 +1855,22 @@ onUnmounted(() => {
         :collaboration-modes="[{ value: 'default', label: '执行' }, { value: 'plan', label: '计划' }]"
         :selected-collaboration-mode="collaborationMode"
         :models="modelOptions"
-        :selected-model="selectedModel"
+        :selected-model="selectedModelProfileId"
         :selected-reasoning-effort="reasoningEffort"
+        :reasoning-efforts="selectedReasoningEfforts"
         :commands="commands"
         :skills="skills"
         :thread-token-usage="tokenUsage"
         :is-turn-in-progress="isBusy"
         :disabled="false"
         :send-with-enter="true"
-        :in-progress-submit-mode="'steer'"
+        :in-progress-submit-mode="'queue'"
         :response-annotations="pendingResponseAnnotations"
         @submit="onSubmit"
         @interrupt="onInterrupt"
         @update:selected-collaboration-mode="collaborationMode = $event"
-        @update:selected-model="selectedModel = $event"
-        @update:selected-reasoning-effort="reasoningEffort = $event"
+        @update:selected-model="onComposerModelChange"
+        @update:selected-reasoning-effort="reasoningEffort = $event || 'none'"
         @update:response-annotations="pendingResponseAnnotations = $event"
         @edit-response-annotation="onEditResponseAnnotation"
         @remove-response-annotation="removeResponseAnnotation"
@@ -1296,60 +1891,21 @@ onUnmounted(() => {
           <button v-for="item in commands" :key="item.command" class="plc-command-row" type="button" @click="chooseCommand(item.command, item.supports_args)"><code>{{ item.command }}</code><span><strong>{{ item.label }}</strong><small>{{ item.detail }}</small></span><kbd>↵</kbd></button>
         </section>
       </div>
-      <div v-if="showSettings" class="plc-overlay" @click.self="showSettings = false">
-        <section class="plc-settings-modal" role="dialog" aria-modal="true" aria-label="PLC Pilot 设置">
-          <div class="plc-modal-heading"><div><p class="plc-eyebrow">工作台设置</p><h2>连接与外观</h2></div><button class="plc-close-button" type="button" @click="showSettings = false"><IconTablerX /></button></div>
-          <div class="plc-settings-storage">
-            <span>配置目录</span>
-            <code>{{ snapshot.config_directory || '桌面运行时启动后显示' }}</code>
-            <small>config.json · auth.json · skills · sessions</small>
-          </div>
-          <div class="plc-settings-group">
-            <label>模型接口
-              <select v-model="modelForm.provider">
-                <option value="responses">Responses</option>
-                <option value="messages">Messages</option>
-                <option value="chatcompletions">Chat Completions</option>
-                <option value="ollama">Ollama</option>
-              </select>
-            </label>
-            <label>接口地址<input v-model="modelForm.baseUrl" type="url" /></label>
-            <div class="plc-model-row">
-              <label>模型<input v-model="modelForm.model" type="text" list="plc-discovered-models" /></label>
-              <button class="plc-button plc-button-quiet plc-model-discover-button" type="button" :disabled="isDiscoveringModels" @click="onDiscoverModels">
-                <IconTablerSearch />
-                {{ isDiscoveringModels ? '获取中' : '获取模型' }}
-              </button>
-            </div>
-            <datalist id="plc-discovered-models">
-              <option v-for="model in modelDiscovery?.models || []" :key="model.id" :value="model.id">{{ model.name }}</option>
-            </datalist>
-            <div v-if="modelDiscoveryError" class="plc-model-discovery-error" role="alert">{{ modelDiscoveryError }}</div>
-            <div v-else-if="modelDiscovery" class="plc-model-discovery" aria-live="polite">
-              <div class="plc-model-discovery-meta">
-                <span>HTTP {{ modelDiscovery.status }} · {{ modelDiscovery.models.length }} 个模型</span>
-                <code>{{ modelDiscovery.endpoint }}</code>
-              </div>
-              <div v-if="modelDiscovery.models.length > 0" class="plc-model-discovery-list">
-                <button v-for="model in modelDiscovery.models" :key="model.id" class="plc-model-option" type="button" @click="selectDiscoveredModel(model.id)">
-                  <span>{{ model.name }}</span>
-                  <code>{{ model.id }}</code>
-                </button>
-              </div>
-              <p v-else class="plc-model-discovery-empty">接口已响应，但没有返回可用模型。</p>
-            </div>
-            <label>API Key
-              <small v-if="snapshot.model.api_key_configured">已保存至 auth.json；留空则继续使用现有 Key</small>
-              <small v-else>保存至当前配置目录的 auth.json</small>
-              <input v-model="modelForm.apiKey" type="password" autocomplete="off" />
-            </label>
-            <button class="plc-button plc-button-primary" type="button" @click="onSaveModel">保存模型</button>
-          </div>
-          <div class="plc-settings-group"><div class="plc-settings-group-title">MCP / Bridge</div><label>服务名称<input v-model="mcpForm.name" type="text" /></label><label>stdio 命令<input v-model="mcpForm.command" type="text" placeholder="python -m codesys_mcp" /></label><label>HTTP URL<input v-model="mcpForm.url" type="url" placeholder="https://..." /></label><button class="plc-button plc-button-quiet" type="button" @click="onSaveMcp">保存 MCP</button></div>
-          <div class="plc-settings-group plc-settings-theme"><span>主题</span><button class="plc-theme-choice" :class="{ 'is-active': theme === 'dark' }" type="button" @click="theme = 'dark'">深色</button><button class="plc-theme-choice" :class="{ 'is-active': theme === 'light' }" type="button" @click="theme = 'light'">浅色</button></div>
+      <div v-if="showAbout || showReward" class="plc-overlay" @click.self="showAbout = showReward = false">
+        <section class="plc-info-dialog" role="dialog" aria-modal="true" :aria-label="showAbout ? '关于作者' : '打赏作者'">
+          <div class="plc-modal-heading"><div><p class="plc-eyebrow">PLC Pilot</p><h2>{{ showAbout ? '关于作者' : '打赏作者' }}</h2></div><button class="plc-close-button" type="button" aria-label="关闭" @click="showAbout = showReward = false"><IconTablerX /></button></div>
+          <p v-if="showAbout" class="plc-info-dialog-copy">作者：蔡徐坤</p>
+          <template v-else><p class="plc-info-dialog-copy">感谢支持 PLC Pilot。打赏入口待配置。</p><div class="plc-reward-placeholder" aria-label="打赏二维码占位">打赏二维码待配置</div></template>
         </section>
-        </div>
-
+      </div>
+      <div v-if="appDialog" class="plc-overlay plc-dialog-overlay" @click.self="closeAppDialog(appDialog.kind === 'confirm' ? false : null)">
+        <section class="plc-info-dialog plc-app-dialog" role="alertdialog" aria-modal="true" :aria-label="appDialog.title">
+          <div class="plc-modal-heading"><div><p class="plc-eyebrow">PLC Pilot</p><h2>{{ appDialog.title }}</h2></div><button class="plc-close-button" type="button" aria-label="关闭" @click="closeAppDialog(appDialog.kind === 'confirm' ? false : null)"><IconTablerX /></button></div>
+          <p class="plc-info-dialog-copy">{{ appDialog.message }}</p>
+          <input v-if="appDialog.kind === 'prompt'" v-model="appDialog.value" class="plc-app-dialog-input" autofocus @keydown.enter="closeAppDialog(appDialog.value)" @keydown.esc="closeAppDialog(null)" />
+          <div class="plc-app-dialog-actions"><button class="plc-button plc-button-quiet" type="button" @click="closeAppDialog(appDialog.kind === 'confirm' ? false : null)">取消</button><button class="plc-button plc-button-primary" type="button" @click="closeAppDialog(appDialog.kind === 'confirm' ? true : appDialog.value)">确定</button></div>
+        </section>
+      </div>
       <div v-if="showSkillDetail" class="plc-overlay" @click.self="showSkillDetail = false">
         <section class="plc-skill-modal" role="dialog" aria-modal="true" aria-label="Skill 内容"><div class="plc-modal-heading"><div><p class="plc-eyebrow">SKILL.md</p><h2>{{ snapshot.skills.find((skill) => skill.id === selectedSkillId)?.name }}</h2></div><button class="plc-close-button" type="button" @click="showSkillDetail = false"><IconTablerX /></button></div><pre class="plc-skill-content">{{ selectedSkillContent }}</pre></section>
       </div>
@@ -1479,15 +2035,17 @@ onUnmounted(() => {
 .plc-overlay { @apply fixed inset-0 z-[500] flex items-center justify-center bg-zinc-950/45 p-4; }
 .plc-command-palette, .plc-settings-modal, .plc-skill-modal { @apply max-h-[min(720px,calc(100vh-2rem))] w-full overflow-y-auto rounded-2xl bg-white p-5 shadow-2xl; }
 .plc-command-palette { @apply max-w-lg; }
-.plc-settings-modal { @apply max-w-xl; }
+.plc-command-palette { max-width: 460px; max-height: min(560px, calc(100vh - 5rem)); padding: 14px; border-radius: 12px; }
+.plc-settings-modal { @apply max-w-5xl; }
 .plc-skill-modal { @apply max-w-3xl; }
 .plc-close-button { @apply flex h-7 w-7 items-center justify-center rounded-md border-0 bg-transparent text-slate-400 hover:bg-slate-100 hover:text-slate-700; }
 .plc-close-button :deep(svg) { @apply h-4 w-4; }
 .plc-command-row { @apply flex w-full items-center gap-3 border-0 border-b border-slate-100 bg-transparent px-2 py-3 text-left transition hover:bg-amber-50; }
-.plc-command-row code { @apply w-24 shrink-0 text-xs text-amber-700; }
+.plc-command-row { min-height: 42px; gap: 10px; padding: 8px 7px; }
+.plc-command-row code { @apply w-20 shrink-0 text-xs text-sky-600; }
 .plc-command-row span { @apply flex min-w-0 flex-1 flex-col gap-0.5; }
-.plc-command-row strong { @apply text-sm font-medium text-zinc-800; }
-.plc-command-row small { @apply text-xs text-slate-500; }
+.plc-command-row strong { @apply text-xs font-medium text-zinc-800; }
+.plc-command-row small { display: block; max-width: 270px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: #737373; }
 .plc-command-row kbd { @apply text-xs text-slate-300; }
 .plc-settings-group { @apply mt-5 grid gap-3 border-t border-slate-100 pt-4; }
 .plc-settings-group-title { @apply text-xs font-semibold text-zinc-800; }
@@ -1516,6 +2074,15 @@ onUnmounted(() => {
 .plc-theme-choice.is-active { @apply border-zinc-900 bg-zinc-900 text-white; }
 .plc-skill-content { @apply mt-5 max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-950 p-4 font-mono text-xs leading-5 text-zinc-200; }
 .plc-toast { @apply fixed bottom-5 left-1/2 z-[600] -translate-x-1/2 rounded-full bg-zinc-900 px-4 py-2 text-xs text-white shadow-xl; }
+.plc-info-dialog { width: min(420px, calc(100vw - 32px)); border: 1px solid rgba(128,128,128,.25); border-radius: 12px; background: var(--plc-dialog-bg, #fff); color: var(--plc-dialog-text, #333); padding: 18px; box-shadow: 0 18px 48px rgba(0,0,0,.24); }
+.plc-info-dialog-copy { margin: 16px 0; color: #666; font-size: 13px; line-height: 1.7; }
+.plc-reward-placeholder { display: grid; min-height: 180px; place-items: center; border: 1px dashed #bbb; border-radius: 8px; color: #999; font-size: 12px; }
+.plc-app-dialog-input { width: 100%; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; padding: 8px 10px; background: transparent; color: inherit; }
+.plc-app-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.plc-dialog-overlay { z-index: 800; }
+:global(.dark .plc-info-dialog) { --plc-dialog-bg: #252526; --plc-dialog-text: #d4d4d4; }
+:global(.dark .plc-info-dialog-copy) { color: #aaa; }
+:global(.dark .plc-app-dialog-input) { border-color: #555; }
 .plc-window-drop-overlay { @apply pointer-events-none fixed inset-3 z-[700] flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-sky-500 bg-sky-500/10 text-sky-700 backdrop-blur-sm; }
 .plc-window-drop-overlay :deep(svg) { @apply h-8 w-8; }
 .plc-window-drop-overlay strong { @apply text-base font-semibold; }

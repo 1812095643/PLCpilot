@@ -1,0 +1,105 @@
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - button "收起侧边栏" [ref=e7] [cursor=pointer]
+    - navigation "应用菜单" [ref=e10]:
+      - button "文件" [ref=e12] [cursor=pointer]
+      - button "编辑" [ref=e14] [cursor=pointer]
+      - button "视图" [ref=e16] [cursor=pointer]
+      - button "帮助" [ref=e18] [cursor=pointer]
+    - generic [ref=e20]:
+      - button "最小化" [ref=e21] [cursor=pointer]
+      - button "最大化" [ref=e23] [cursor=pointer]
+      - button "关闭" [ref=e25] [cursor=pointer]
+  - generic [ref=e27]:
+    - complementary [ref=e28]:
+      - complementary [ref=e29]:
+        - generic [ref=e30]:
+          - strong [ref=e31]: PLC Pilot
+          - button "搜索会话" [ref=e32] [cursor=pointer]
+          - button "新建临时会话" [ref=e36] [cursor=pointer]
+        - button "新对话" [ref=e39] [cursor=pointer]
+        - button "工程概览" [ref=e43] [cursor=pointer]
+        - button "Skills 与工具" [ref=e47] [cursor=pointer]
+        - generic [ref=e51]:
+          - generic [ref=e52]:
+            - generic [ref=e53]: 项目
+            - button "添加项目" [ref=e54] [cursor=pointer]
+          - generic [ref=e57]:
+            - generic [ref=e58]:
+              - button "收起 codesys测试工程" [ref=e59] [cursor=pointer]
+              - button "codesys测试工程" [ref=e62] [cursor=pointer]
+              - button "在 codesys测试工程 新建会话" [ref=e63] [cursor=pointer]
+              - button "移除项目 codesys测试工程" [ref=e66] [cursor=pointer]
+            - generic [ref=e70]:
+              - generic [ref=e71]:
+                - button "新对话" [ref=e72] [cursor=pointer]
+                - button "删除 新对话" [ref=e75] [cursor=pointer]
+              - generic [ref=e79]:
+                - button "codesys测试工程" [ref=e80] [cursor=pointer]
+                - button "重命名 codesys测试工程" [ref=e83] [cursor=pointer]
+                - button "删除 codesys测试工程" [ref=e86] [cursor=pointer]
+          - generic [ref=e90]:
+            - generic [ref=e91]: 临时会话
+            - button "添加临时会话" [ref=e92] [cursor=pointer]
+          - generic [ref=e95]:
+            - button "临时会话" [ref=e96] [cursor=pointer]
+            - button "重命名 临时会话" [ref=e99] [cursor=pointer]
+            - button "删除 临时会话" [active] [ref=e102] [cursor=pointer]
+          - generic [ref=e106]:
+            - button "并发验证B：请用中文分8段写一份约1000字的PLC通信诊断流程。首行只" [ref=e107] [cursor=pointer]
+            - button "重命名 并发验证B：请用中文分8段写一份约1000字的PLC通信诊断流程。首行只" [ref=e110] [cursor=pointer]
+            - button "删除 并发验证B：请用中文分8段写一份约1000字的PLC通信诊断流程。首行只" [ref=e113] [cursor=pointer]
+          - generic [ref=e117]:
+            - button "本机HTTP重连验证，不读取文件。" [ref=e118] [cursor=pointer]
+            - button "重命名 本机HTTP重连验证，不读取文件。" [ref=e121] [cursor=pointer]
+            - button "删除 本机HTTP重连验证，不读取文件。" [ref=e124] [cursor=pointer]
+          - generic [ref=e128]:
+            - button "本机HTTP 429 重连验证，不读取文件。" [ref=e129] [cursor=pointer]
+            - button "重命名 本机HTTP 429 重连验证，不读取文件。" [ref=e132] [cursor=pointer]
+            - button "删除 本机HTTP 429 重连验证，不读取文件。" [ref=e135] [cursor=pointer]
+          - generic [ref=e139]:
+            - button "临时会话" [ref=e140] [cursor=pointer]
+            - button "重命名 临时会话" [ref=e143] [cursor=pointer]
+            - button "删除 临时会话" [ref=e146] [cursor=pointer]
+          - generic [ref=e150]:
+            - button "新对话" [ref=e151] [cursor=pointer]
+            - button "删除 新对话" [ref=e154] [cursor=pointer]
+        - generic [ref=e158]:
+          - button "设置" [ref=e159] [cursor=pointer]
+          - button "颜色主题：跟随系统" [ref=e166] [cursor=pointer]
+    - button "调整侧边栏宽度" [ref=e169]
+    - generic [ref=e170]:
+      - generic [ref=e172]:
+        - heading "20-17-46-0a8e3397" [level=1] [ref=e175]
+        - button "命令面板" [ref=e177] [cursor=pointer]: ⌘K
+      - main [ref=e178]:
+        - paragraph [ref=e182]: 暂无消息
+      - generic [ref=e185]:
+        - generic [ref=e186]:
+          - textbox "描述要检查、修改或诊断的 PLC 任务…" [ref=e187]
+          - generic [ref=e188]:
+            - generic [ref=e189]: Enter 发送 · Shift+Enter 换行
+            - generic [ref=e190]:
+              - code [ref=e191]: "@"
+              - text: 引用文件、文件夹或历史会话
+        - generic [ref=e192]:
+          - generic [ref=e193]:
+            - button "添加附件" [ref=e194] [cursor=pointer]
+            - button "PLC Skills" [ref=e198] [cursor=pointer]
+          - generic [ref=e202]:
+            - button "gpt-5.6-sol · 标准" [ref=e204] [cursor=pointer]:
+              - generic [ref=e205]: gpt-5.6-sol
+              - generic [ref=e206]: ·
+              - generic [ref=e207]: 标准
+            - generic "剩余 100% · 0 / 128,000 tokens" [ref=e208]
+            - button "发送任务" [disabled] [ref=e211]
+  - alertdialog "清理会话" [ref=e215]:
+    - generic [ref=e216]:
+      - generic [ref=e217]:
+        - paragraph [ref=e218]: PLC Pilot
+        - heading "清理会话" [level=2] [ref=e219]
+      - button "关闭" [ref=e220] [cursor=pointer]
+    - paragraph [ref=e223]: 清理会话“临时会话”吗？这只会删除本地会话记录。
+    - generic [ref=e224]:
+      - button "取消" [ref=e225] [cursor=pointer]
+      - button "确定" [ref=e226] [cursor=pointer]

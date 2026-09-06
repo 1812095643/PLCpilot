@@ -1,7 +1,7 @@
 # PLC Pilot Codex 风格工作台需求汇总
 
 > 编制日期：2026-09-03  
-> 当前状态：需求基线持续维护；回复选区批注及应用壳布局插槽已完成代码接入，等待 EXE 人工验收；项目/会话侧栏、临时会话目录和设置页等后续结构仍未实施。
+> 当前状态（2026-09-05）：用户已授权完成本文全部待办；本轮正在修复真实流式与窗口控制，并继续实现多项目、会话持久化和完整设置页。提交、推送仍等待验收批准。
 
 ## 1. 来源与优先级
 
@@ -371,3 +371,76 @@ cargo test --manifest-path ... --lib  28 passed / 0 failed
 7. 多模型配置：模型列表、上下文长度、思考等级和每会话模型选择的持久化。
 8. MCP/Skills 多实例：手动添加、开关、扫描、错误状态和真实调用目录。
 9. 整体视觉验收：VS Code 黑/灰/白主题、宽屏/窄窗口、拖拽、剪贴板附件和无障碍键盘流。
+
+## 11. 2026-09-05 全部待办收口
+
+### 11.1 已定位问题与实测证据
+
+- 实时输出的根因已在真实 EXE 复现：Tauri 资源路径携带 Windows `\\?\` 前缀，Node 入口加载器报 `EISDIR: lstat 'C:'`；旧代码随后静默切换到非流式 Rust 后备链路。
+- 已采用 Codex 同样使用的 `dunce` 处理外部进程路径，取消静默降级。真实模型验证收到 606 个 delta，首次到达为 5067 ms，首次 DOM 文字更新为 5084 ms，最终结果为 21565 ms。
+- 已观察到真实 `ls`、`find`、`read` 各自的运行和完成事件。后续并发改造仍须重新进行完整 EXE 验证。
+- 窗口控制缺少 Tauri capability；已补最小化、最大化、关闭和拖动权限。调试 EXE 已验证最大化实际生效，其他控制需最终回归。
+- 原 `vue-tsc --noEmit` 在仅有项目引用的根配置上没有检查应用；构建命令已改为显式检查 `tsconfig.app.json`，已修复暴露出的应用类型问题。
+
+### 11.2 当前实施顺序
+
+- [x] 复现流式问题并定位到真实宿主启动边界。
+- [x] 修复 Windows 宿主路径并验证实际增量与 DOM 更新时间。
+- [ ] 收口停止、排队、取消、重连、工具状态及终态保留。（停止保留 1254 字部分回复、队列取消/暂停/继续已在 EXE 实测；404 五次重试已通过。）
+- [ ] 完成多项目/多会话独立运行、切换、恢复与上下文隔离。
+- [ ] 完成文档目录下的临时会话工作目录及 C 盘草稿、界面状态持久化。
+- [ ] 完成分类设置页、MCP 多实例与 Skills 多实例真实管理。
+- [ ] 补齐工具目录、补丁审批、命令输出、CODESYS 启动与错误恢复。
+- [ ] 完成导轨、主题、宽窄窗口、附件、消息操作的真实运行回归。
+- [ ] 打包并启动最终 EXE，汇报验收结果；等待批准后提交。
+
+### 11.3 导轨追加参考
+
+![Codex 会话导轨真实刻度参考](docs/codex-reference/codex-timeline-scrubber-reference.png)
+
+- 参考图中的刻度为细短横线，不使用胶囊、渐变、光晕或贯通虚线。
+- 每条已发送用户消息对应一个节点；运行中可逐步补充回复预览，排队消息尚未发送时不占节点。
+- 少量节点整体垂直居中，节点增多后向上下延伸；长会话不得硬截断为前 21 条。
+- 悬停节点约为默认宽度四倍，上下各三枚逐步缩短，横向缩放动效保持左端对齐。
+- 白天灰色到淡灰，黑夜灰色到白色；浮层与全局主题一致，并保留可辨认边界。
+
+### 11.4 最新窗口与设置页补充
+
+![窗口四处调整](docs/codex-reference/window-layout-revision.png)
+
+![设置占满窗口主体](docs/codex-reference/settings-full-window-revision.png)
+
+- 删除菜单栏中重复的品牌图标和当前会话名称，保留侧栏切换及窗口控制。
+- 对话区右上角不再放主题按钮；“Skills 与工具”移到“工程概览”下方。
+- 设置必须占据标题栏以下的整个窗口；项目/会话侧栏暂时替换为设置分类导航，不能仍局限于原对话面板。
+- 模型页减少重复标题、说明和统计块，统一字段尺寸、分组间距与黑白主题。
+- 主题按钮位于工作区侧栏底部，与设置同一行、右对齐；太阳、月亮和系统图标对应明亮、暗黑、跟随系统三档。系统档实时响应系统主题，并保存本机偏好。
+
+### 11.5 滚动条、通知、作者入口补充
+
+- 全局滚动条隐藏视觉轨道和滑块，但保留滚轮、触控板、键盘和触控拖动滚动能力；代码区域、命令面板和设置页不能出现横向溢出。
+- 命令面板采用紧凑的 Codex 风格行高、短描述和窄弹层；长命令内容截断显示，详情仍可通过键盘和滚动查看。
+- 禁用浏览器原生 `window.confirm`、`window.prompt` 和 `window.alert` 作为产品通知；删除、重命名等操作使用 PLC Pilot 自己的应用内对话框，标题不能出现 `tauri.localhost`。
+- 顶部帮助菜单新增“关于作者 · 蔡徐坤”“打赏作者”“GitHub（链接待配置）”；GitHub 入口保留空链接状态，待后续补充真实仓库地址。
+
+### 11.6 MCP/Skills/工具能力收口（2026-09-05）
+
+- [x] 设置页加入免费 MCP 商店，当前提供至少 11 个来源和许可证可核验的条目：官方 Filesystem、Memory、Sequential Thinking、Everything、Puppeteer，以及社区 Context7、CODESYS MCP Toolkit、CODESYS MCP SP21+、CODESYS MCP SP21+ 中文版、Festo CODESYS MCP、CODESYS Persistent MCP；其中 5 个社区条目直接面向 CODESYS，点击安装会写入真实 MCP 配置，使用 `npx` 首次获取包，不伪造安装成功。
+- [x] MCP 配置支持自定义请求头，敏感请求头与 Bearer Token 不回显，并在运行时从受保护凭据恢复。
+- [x] 设置页加入免费 Skill 商店；内置 `codesys-agent`、`plc-safety`、`iec61131-st`、`codesys-debugging`、`plc-commissioning` 五项可写入 C 盘应用目录，并通过统一 Skill 发现链自动加载。
+- [x] 工具目录增加来源、风险、读写能力和可用状态矩阵，支持搜索和仅查看修改工具；工具仍通过现有 Rust 审批/阻止策略执行。
+- [x] Windows 凭据文件改为 DPAPI 保护信封；旧版明文 `auth.json` 仅用于一次兼容读取，后续保存自动迁移，普通运行配置继续不包含 Key/Token。
+- [ ] CODESYS 原生插件仍需在真实 CODESYS 3.5.22 安装环境完成 package 安装、重启、`host_ready` 握手和实时事件回归；当前可用路径仍是 ScriptEngine 桥接快照，不把启动程序误报为已连接。
+- [x] 已核验多个免费社区 CODESYS 工程 MCP：`mcptoolkit-for-codesys`（SP22 实机验证）、`Codesys-MCP-Server`（SP22）、`codesys-mcp-sp21-plus`、`codesys-mcp-sp21-plus-ch`、`festo-codesys-mcp`；商店只加入有来源、许可证和可安装入口的实现，并保留版本与运行前提说明。
+
+### 11.7 CODESYS Agent 自动工作流闭环（2026-09-06）
+
+- [x] 明确不做工作区侧边栏和全局常驻 CODESYS sidecar；CODESYS MCP 仅在一次 Agent 任务需要时启动，并在该任务结束、失败或中断后释放。
+- [x] 同一 Agent 任务内的 stdio MCP 服务只执行一次 initialize，后续工具调用复用同一进程和 ScriptEngine 上下文；失败时回收整个子进程树，避免残留 CODESYS/npx 进程。
+- [x] CODESYS Profile 不再固定 SP22；从本机安装目录的 `Profiles/*.profile.xml` 选择最高版本，SP19/SP20/SP21/SP22 均按实际 Profile 传入。SP21/SP22 作为推荐版本，不作为硬限制。
+- [x] CODESYS 商店安装为不同社区实现注入各自的 `CODESYS_PATH`/`CODESYS_EXE`/`FESTO_MCP_CODESYS_PATH` 和 Profile 环境变量，并为 persistent 实现默认使用 SP21+ headless 参数。
+- [x] 编译工具按真实 schema 自动适配 `project_path`、`projectFilePath`、`projectPath`、`path` 和 Application 参数；未发现真实 CODESYS 编译工具时直接报配置问题，不再把静态检查冒充编译成功。
+- [x] CODESYS 高风险工具（连接、下载、RUN/STOP、Reset、Force、在线写入、脚本、凭据等）在审批模式下进入可批准/拒绝队列；完全访问模式才允许直接执行，计划模式始终阻止修改。
+- [x] 审批模式和完全访问模式已持久化到本机偏好设置，并在设置页提供切换入口。
+- [x] 完全访问模式的安全语义已固定：只有用户主动切换后才绕过高风险工具审批；`/plan` 计划模式即使在完全访问偏好下仍然只读。
+- [ ] 当前仍未实现 CODESYS 编辑器内部的实时光标/选区事件；这需要独立的原生编辑器扩展 API，不能由通用 ScriptEngine 快照推断。工程/POU/DUT/GVL/任务写回和真实编译不依赖该扩展。

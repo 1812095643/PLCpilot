@@ -3,13 +3,14 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use similar::TextDiff;
@@ -17,7 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    process::{Child, Command},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
     time::{sleep, timeout},
 };
@@ -30,16 +31,28 @@ const MAX_AGENT_TURNS: usize = 8;
 const PI_HOST_TIMEOUT_SECONDS: u64 = 240;
 const MAX_SESSION_PREVIEW_MESSAGES: usize = 80;
 const MAX_SESSION_PREVIEW_CHARS: usize = 6000;
+/// 每次模型请求最多额外重试五次；初始请求不计入该数字。
+const MAX_MODEL_RETRIES: usize = 5;
+const MODEL_RETRY_BASE_DELAY_MS: u64 = 1_000;
+const MAX_MODEL_RETRY_DELAY_MS: u64 = 60_000;
+const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 const RPC_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const RPC_PROTOCOL_VERSION: u32 = 1;
 const RPC_REQUEST_TIMEOUT_SECONDS: u64 = 300;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 mod attachments;
+mod agent_runtime;
+mod settings;
+mod generic_tools;
 use attachments::{prepare_attachments, read_local_file, AttachmentInput, CodexImageInput};
 
 const CODESYS_SKILL: &str = include_str!("../../skills/codesys-agent/SKILL.md");
 const PLC_SAFETY_SKILL: &str = include_str!("../../skills/plc-safety/SKILL.md");
 const IEC_ST_SKILL: &str = include_str!("../../skills/iec61131-st/SKILL.md");
+const CODESYS_DEBUGGING_SKILL: &str = include_str!("../../skills/codesys-debugging/SKILL.md");
+const PLC_COMMISSIONING_SKILL: &str = include_str!("../../skills/plc-commissioning/SKILL.md");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -58,6 +71,11 @@ impl Default for ProviderKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
+    /// 模型 profile 的稳定 ID；旧版单模型配置没有该字段，加载时会补齐。
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
     pub provider: ProviderKind,
     pub base_url: String,
     pub model: String,
@@ -65,20 +83,55 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default = "default_context_window")]
+    pub context_window: u64,
+    #[serde(default = "default_reasoning_levels")]
+    pub reasoning_levels: Vec<String>,
+    #[serde(default = "default_model_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_checked_at: Option<String>,
 }
 
 fn default_max_tokens() -> u32 {
     4096
 }
 
+fn default_context_window() -> u64 {
+    DEFAULT_CONTEXT_WINDOW
+}
+
+fn default_reasoning_levels() -> Vec<String> {
+    ["none", "minimal", "low", "medium", "high", "xhigh"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_model_enabled() -> bool {
+    true
+}
+
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            id: "model-default".to_string(),
+            name: "GPT-5".to_string(),
             provider: ProviderKind::Responses,
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-5".to_string(),
             api_key: None,
             max_tokens: 4096,
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            reasoning_levels: default_reasoning_levels(),
+            enabled: true,
+            is_default: true,
+            last_error: None,
+            last_checked_at: None,
         }
     }
 }
@@ -98,6 +151,43 @@ pub struct McpServerConfig {
     pub transport: String,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+/// 设置页商店展示的免费开源 MCP 服务条目。
+///
+/// 条目只描述可复现的安装配置，真正安装仍然落到本机 MCP 配置并在首次调用时
+/// 由 npx/python 等真实运行时安装或启动，不在界面中伪造“已安装”。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpCatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub license: String,
+    pub package: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub transport: String,
+    pub requires_workspace: bool,
+    #[serde(default)]
+    pub requires_credentials: bool,
+    #[serde(default)]
+    pub requires_codesys: bool,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillCatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub source: String,
+    pub license: String,
+    pub installed: bool,
+    pub free: bool,
 }
 
 fn default_mcp_enabled() -> bool {
@@ -203,6 +293,8 @@ pub struct AppSnapshot {
     pub app_version: String,
     pub config_directory: String,
     pub model: ModelSummary,
+    pub models: Vec<ModelSummary>,
+    pub active_model_id: String,
     pub mcp_servers: Vec<McpSummary>,
     pub project: ProjectContext,
     pub projects: Vec<WorkspaceProject>,
@@ -217,11 +309,21 @@ pub struct AppSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSummary {
+    pub id: String,
+    pub name: String,
     pub provider: ProviderKind,
     pub base_url: String,
     pub model: String,
     pub configured: bool,
     pub api_key_configured: bool,
+    pub context_window: u64,
+    pub max_tokens: u32,
+    pub reasoning_levels: Vec<String>,
+    pub enabled: bool,
+    pub is_default: bool,
+    pub last_error: Option<String>,
+    pub last_checked_at: Option<String>,
+    pub connection_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -230,7 +332,20 @@ struct PersistedSecrets {
     #[serde(default, alias = "api_key", alias = "OPENAI_API_KEY")]
     model_api_key: Option<String>,
     #[serde(default)]
+    model_api_keys: HashMap<String, String>,
+    #[serde(default)]
     mcp_auth_tokens: HashMap<String, String>,
+    #[serde(default)]
+    mcp_secret_env: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
+    mcp_secret_headers: HashMap<String, HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProtectedSecretsFile {
+    version: u32,
+    protected: bool,
+    data: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +383,8 @@ pub struct CodesysStatus {
     pub detected: bool,
     pub executable: Option<String>,
     pub supported_version: String,
+    #[serde(default)]
+    pub profile: Option<String>,
     pub note: String,
 }
 
@@ -300,8 +417,17 @@ pub struct SessionRecord {
     pub message_count: usize,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// 最近一次发送该会话使用的模型 profile ID。
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub ui_turns: Vec<Value>,
+    #[serde(default)]
+    pub activities: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +438,10 @@ pub struct ChatMessage {
     pub images: Vec<CodexImageInput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<MentionReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(
         default,
         alias = "responseAnnotations",
@@ -361,7 +491,18 @@ pub struct ForkSessionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentRequest {
+    #[serde(default)]
+    pub client_thread_id: Option<String>,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub session_file: Option<String>,
+    /// 前端轮次 ID；同时用于实时文本增量事件的归属。
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub message: String,
+    #[serde(default)]
+    pub display_message: Option<String>,
     #[serde(default)]
     pub history: Vec<ChatMessage>,
     #[serde(default)]
@@ -369,6 +510,9 @@ pub struct AgentRequest {
     /// 本轮临时覆盖的模型名称；为空时使用设置中的默认模型。
     #[serde(default)]
     pub model: Option<String>,
+    /// 本轮选择的持久化模型 profile；为空时使用当前默认模型。
+    #[serde(default)]
+    pub model_profile_id: Option<String>,
     /// Pi 思考级别，前端的 none 会在宿主侧转换为 off。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
@@ -452,6 +596,137 @@ pub struct AgentEvent {
     pub detail: Option<String>,
     pub status: String,
     pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_max_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_status: Option<u16>,
+}
+
+/// 单次 Agent 调用专用的实时 IPC 消息。
+///
+/// 控制面 `run_agent` 只返回 accepted；本消息由后台 Agent 任务写入进程级通知流。
+/// request_id 隔离不同轮次，sequence 让客户端可以重排和去重。
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentStreamPayload {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub request_id: String,
+    pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<AgentEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<AgentRunResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<AgentSessionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentStartAck {
+    pub request_id: String,
+    pub accepted: bool,
+}
+
+#[derive(Clone)]
+struct AgentStreamSender {
+    app: AppHandle,
+    request_id: String,
+    sequence: Arc<AtomicU64>,
+}
+
+impl AgentStreamSender {
+    fn new(request_id: String, app: AppHandle) -> Self {
+        Self {
+            app,
+            request_id,
+            sequence: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn send(
+        &self,
+        event_type: &str,
+        phase: Option<&str>,
+        delta: Option<String>,
+        event: Option<AgentEvent>,
+    ) {
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let payload = AgentStreamPayload {
+            event_type: event_type.to_string(),
+            request_id: self.request_id.clone(),
+            sequence,
+            phase: phase.map(str::to_string),
+            delta,
+            event,
+            result: None,
+            error: None,
+            session: None,
+        };
+        self.send_payload(payload);
+    }
+
+    fn send_payload(&self, payload: AgentStreamPayload) {
+        let _ = self.app.emit("agent-stream", payload);
+    }
+
+    fn send_event(&self, event: AgentEvent) {
+        self.send("event", None, None, Some(event));
+    }
+
+    fn send_delta(&self, delta: &str) {
+        self.send("delta", None, Some(delta.to_string()), None);
+    }
+
+    fn send_status(&self, event_type: &str, phase: Option<&str>) {
+        self.send(event_type, phase, None, None);
+    }
+
+    fn send_session(&self, session: AgentSessionSummary) {
+        self.send_payload(AgentStreamPayload {
+            event_type: "session".into(), request_id: self.request_id.clone(),
+            sequence: self.sequence.fetch_add(1, Ordering::SeqCst) + 1,
+            phase: None, delta: None, event: None, result: None, error: None, session: Some(session),
+        });
+    }
+
+    fn send_result(&self, result: AgentRunResult) {
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        self.send_payload(AgentStreamPayload {
+            event_type: "result".to_string(),
+            request_id: self.request_id.clone(),
+            sequence,
+            phase: None,
+            delta: None,
+            event: None,
+            result: Some(result),
+            error: None,
+            session: None,
+        });
+    }
+
+    fn send_error(&self, error: String) {
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        self.send_payload(AgentStreamPayload {
+            event_type: "error".to_string(),
+            request_id: self.request_id.clone(),
+            sequence,
+            phase: None,
+            delta: None,
+            event: None,
+            result: None,
+            error: Some(error),
+            session: None,
+        });
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -482,7 +757,17 @@ pub struct ToolSummary {
     pub description: Option<String>,
     pub input_schema: Value,
     pub mutating: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub risk: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default = "default_tool_available")]
+    pub available: bool,
 }
+
+fn default_tool_available() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigureMcpRequest {
@@ -569,10 +854,29 @@ pub struct AppState {
     pub agent_runs: Arc<Mutex<()>>,
     /// 由界面停止按钮设置；运行中的宿主在等待模型输出时会及时检查它。
     pub abort_requested: Arc<AtomicBool>,
+    pub abort_notify: Arc<tokio::sync::Notify>,
+    pub running: Arc<Mutex<HashMap<String, agent_runtime::RunHandle>>>,
+    pub isolated: bool,
+}
+
+impl AppState {
+    fn new(runtime: RuntimeState) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(runtime)),
+            agent_runs: Arc::new(Mutex::new(())),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            abort_notify: Arc::new(tokio::sync::Notify::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
+            isolated: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
+    pub models: Vec<ModelConfig>,
+    pub active_model_id: String,
+    /// 兼容现有调用链的当前模型镜像；始终与 models[active_model_id] 同步。
     pub model: ModelConfig,
     pub mcp_servers: Vec<McpServerConfig>,
     pub project: ProjectContext,
@@ -586,6 +890,10 @@ pub struct RuntimeState {
 struct PersistedRuntimeConfig {
     #[serde(default)]
     model: Option<ModelConfig>,
+    #[serde(default)]
+    models: Vec<ModelConfig>,
+    #[serde(default)]
+    active_model_id: Option<String>,
     #[serde(default)]
     mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
@@ -625,8 +933,11 @@ pub struct AppliedFilePatch {
 
 impl Default for RuntimeState {
     fn default() -> Self {
+        let model = ModelConfig::default();
         Self {
-            model: ModelConfig::default(),
+            active_model_id: model.id.clone(),
+            models: vec![model.clone()],
+            model,
             mcp_servers: Vec::new(),
             project: ProjectContext::default(),
             projects: Vec::new(),
@@ -666,12 +977,111 @@ fn ensure_runtime_layout() -> Result<(), AppError> {
     Ok(())
 }
 
+fn normalize_model_profile(mut model: ModelConfig, index: usize) -> ModelConfig {
+    if model.id.trim().is_empty() {
+        model.id = if index == 0 {
+            "model-default".to_string()
+        } else {
+            format!("model-{}", index + 1)
+        };
+    }
+    model.id = model.id.trim().to_string();
+    if model.name.trim().is_empty() {
+        model.name = model.model.trim().to_string();
+    } else {
+        model.name = model.name.trim().to_string();
+    }
+    if model.context_window == 0 {
+        model.context_window = DEFAULT_CONTEXT_WINDOW;
+    }
+    if model.max_tokens == 0 {
+        model.max_tokens = default_max_tokens();
+    }
+    if model.reasoning_levels.is_empty() {
+        model.reasoning_levels = default_reasoning_levels();
+    }
+    model.reasoning_levels = model
+        .reasoning_levels
+        .into_iter()
+        .map(|level| level.trim().to_ascii_lowercase())
+        .filter(|level| {
+            matches!(
+                level.as_str(),
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            )
+        })
+        .collect();
+    if model.reasoning_levels.is_empty() {
+        model.reasoning_levels = default_reasoning_levels();
+    }
+    model
+}
+
+fn normalize_model_collection(models: Vec<ModelConfig>) -> Vec<ModelConfig> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, mut model) in models.into_iter().enumerate() {
+        model = normalize_model_profile(model, index);
+        if !seen.insert(model.id.clone()) {
+            let base = model.id.clone();
+            let mut suffix = 2;
+            while !seen.insert(format!("{base}-{suffix}")) {
+                suffix += 1;
+            }
+            model.id = format!("{base}-{suffix}");
+        }
+        normalized.push(model);
+    }
+    if normalized.is_empty() {
+        normalized.push(ModelConfig::default());
+    }
+    if !normalized.iter().any(|model| model.is_default) {
+        if let Some(first) = normalized.first_mut() {
+            first.is_default = true;
+        }
+    }
+    normalized
+}
+
+fn sync_active_model(state: &mut RuntimeState) {
+    state.models = normalize_model_collection(std::mem::take(&mut state.models));
+    let active_index = state
+        .models
+        .iter()
+        .position(|model| model.id == state.active_model_id && model.enabled)
+        .or_else(|| {
+            state
+                .models
+                .iter()
+                .position(|model| model.is_default && model.enabled)
+        })
+        .or_else(|| state.models.iter().position(|model| model.enabled))
+        .unwrap_or(0);
+    for (index, model) in state.models.iter_mut().enumerate() {
+        model.is_default = index == active_index;
+    }
+    if let Some(active) = state.models.get_mut(active_index) {
+        if !active.enabled {
+            active.enabled = true;
+        }
+        state.active_model_id = active.id.clone();
+        state.model = active.clone();
+    }
+}
+
 fn load_persisted_secrets() -> Result<PersistedSecrets, AppError> {
     let path = auth_file_path();
     match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str::<PersistedSecrets>(&content).map_err(|error| {
-            AppError::Configuration(format!("解析 PLC Pilot 凭据文件未完成：{error}"))
-        }),
+        Ok(content) => {
+            if let Ok(envelope) = serde_json::from_str::<ProtectedSecretsFile>(&content) {
+                let bytes = base64::engine::general_purpose::STANDARD.decode(envelope.data).map_err(|error| AppError::Configuration(format!("解析 PLC Pilot 凭据编码未完成：{error}")))?;
+                let plain = if envelope.protected { unprotect_secret(&bytes)? } else { bytes };
+                serde_json::from_slice::<PersistedSecrets>(&plain).map_err(|error| AppError::Configuration(format!("解析 PLC Pilot 凭据文件未完成：{error}")))
+            } else {
+                // 兼容旧版本明文 auth.json；本次保存时会自动迁移到 DPAPI。
+                serde_json::from_str::<PersistedSecrets>(&content).map_err(|error| AppError::Configuration(format!("解析 PLC Pilot 凭据文件未完成：{error}")))
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(PersistedSecrets::default())
         }
@@ -679,6 +1089,49 @@ fn load_persisted_secrets() -> Result<PersistedSecrets, AppError> {
             "读取 PLC Pilot 凭据文件未完成：{error}"
         ))),
     }
+}
+
+fn protect_secret(value: &[u8]) -> Result<Vec<u8>, AppError> {
+    #[cfg(windows)]
+    {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB};
+        let input = CRYPT_INTEGER_BLOB { cbData: value.len() as u32, pbData: value.as_ptr() as *mut u8 };
+        let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: null_mut() };
+        let ok = unsafe { CryptProtectData(&input, std::ptr::null(), std::ptr::null(), null_mut(), std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output) };
+        if ok == 0 { return Err(AppError::Configuration("Windows DPAPI 无法保护 PLC Pilot 凭据。".into())); }
+        let bytes = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+        unsafe { LocalFree(output.pbData as *mut core::ffi::c_void); }
+        Ok(bytes)
+    }
+    #[cfg(not(windows))]
+    { Ok(value.to_vec()) }
+}
+
+fn unprotect_secret(value: &[u8]) -> Result<Vec<u8>, AppError> {
+    #[cfg(windows)]
+    {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+        let input = CRYPT_INTEGER_BLOB { cbData: value.len() as u32, pbData: value.as_ptr() as *mut u8 };
+        let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: null_mut() };
+        let ok = unsafe { CryptUnprotectData(&input, null_mut(), null_mut(), null_mut(), null_mut(), 0, &mut output) };
+        if ok == 0 { return Err(AppError::Configuration("Windows DPAPI 无法解密 PLC Pilot 凭据，请确认当前 Windows 用户未变化。".into())); }
+        let bytes = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+        unsafe { LocalFree(output.pbData as *mut core::ffi::c_void); }
+        Ok(bytes)
+    }
+    #[cfg(not(windows))]
+    { Ok(value.to_vec()) }
+}
+
+fn write_protected_secrets(path: &Path, secrets: &PersistedSecrets) -> Result<(), AppError> {
+    let plain = serde_json::to_vec_pretty(secrets).map_err(|error| AppError::Configuration(format!("编码 PLC Pilot 凭据未完成：{error}")))?;
+    let protected = protect_secret(&plain)?;
+    let envelope = ProtectedSecretsFile { version: 1, protected: cfg!(windows), data: base64::engine::general_purpose::STANDARD.encode(protected) };
+    write_private_json(path, &envelope, "凭据")
 }
 
 fn load_runtime_state() -> RuntimeState {
@@ -691,12 +1144,18 @@ fn load_runtime_state() -> RuntimeState {
     let mut needs_config_migration = false;
     match fs::read_to_string(&path) {
         Ok(content) => {
-            needs_config_migration = content.contains("\"api_key\"");
+            needs_config_migration =
+                content.contains("\"api_key\"") || !content.contains("\"models\"");
             match serde_json::from_str::<PersistedRuntimeConfig>(&content) {
                 Ok(config) => {
-                    if let Some(model) = config.model {
-                        state.model = model;
+                    if config.models.is_empty() {
+                        if let Some(model) = config.model {
+                            state.models = vec![model];
+                        }
+                    } else {
+                        state.models = config.models;
                     }
+                    state.active_model_id = config.active_model_id.unwrap_or_default();
                     state.mcp_servers = config.mcp_servers;
                     state.projects = config.projects;
                     active_project_path = config.active_project_path;
@@ -709,6 +1168,7 @@ fn load_runtime_state() -> RuntimeState {
         }
         Err(_) => {}
     }
+    sync_active_model(&mut state);
     if let Some(path) = active_project_path.filter(|value: &String| !value.trim().is_empty()) {
         let candidate = PathBuf::from(&path);
         if let Ok(metadata) = fs::metadata(&candidate) {
@@ -727,7 +1187,7 @@ fn load_runtime_state() -> RuntimeState {
                     .or_else(|| candidate.file_name())
                     .and_then(|value| value.to_str())
                     .map(str::to_string),
-                version: Some("SP22（目标版本）".to_string()),
+                version: Some(detect_codesys_installation().supported_version),
                 exists: metadata.is_file() || metadata.is_dir(),
                 extension: candidate
                     .extension()
@@ -741,14 +1201,30 @@ fn load_runtime_state() -> RuntimeState {
     upsert_project(&mut state.projects, &project, false);
     match load_persisted_secrets() {
         Ok(secrets) => {
-            if secrets
-                .model_api_key
-                .as_deref()
-                .is_some_and(|key| !key.trim().is_empty())
-            {
-                state.model.api_key = secrets.model_api_key;
+            for model in &mut state.models {
+                if let Some(key) = secrets
+                    .model_api_keys
+                    .get(&model.id)
+                    .filter(|key| !key.trim().is_empty())
+                {
+                    model.api_key = Some(key.clone());
+                }
             }
+            if let Some(key) = secrets.model_api_key.filter(|key| !key.trim().is_empty()) {
+                if let Some(model) = state
+                    .models
+                    .iter_mut()
+                    .find(|model| model.id == state.active_model_id)
+                {
+                    if model.api_key.is_none() {
+                        model.api_key = Some(key);
+                    }
+                }
+            }
+            sync_active_model(&mut state);
             for server in &mut state.mcp_servers {
+                if let Some(values) = secrets.mcp_secret_env.get(&server.id) { server.env.extend(values.clone()); }
+                if let Some(values) = secrets.mcp_secret_headers.get(&server.id) { server.headers.extend(values.clone()); }
                 if let Some(token) = secrets.mcp_auth_tokens.get(&server.id) {
                     server
                         .env
@@ -771,7 +1247,7 @@ fn persist_runtime_state(state: &RuntimeState) -> Result<(), AppError> {
     // 非敏感连接配置与凭据分离保存；配置文件中永远不写入 API Key 或 MCP Token。
     let config = runtime_config_without_secrets(state);
     let secrets = persisted_secrets(state)?;
-    write_private_json(&auth_file_path(), &secrets, "凭据")?;
+    write_protected_secrets(&auth_file_path(), &secrets)?;
     write_json_atomic(&config_file_path(), &config, "配置")?;
     Ok(())
 }
@@ -780,12 +1256,24 @@ fn runtime_config_without_secrets(state: &RuntimeState) -> PersistedRuntimeConfi
     let mut mcp_servers = state.mcp_servers.clone();
     for server in &mut mcp_servers {
         server.env.retain(|key, _| !is_secret_env_key(key));
+        server.headers.retain(|key, _| !is_secret_header_key(key));
     }
+    let models = state
+        .models
+        .iter()
+        .cloned()
+        .map(|model| ModelConfig {
+            api_key: None,
+            ..model
+        })
+        .collect::<Vec<_>>();
     PersistedRuntimeConfig {
         model: Some(ModelConfig {
             api_key: None,
             ..state.model.clone()
         }),
+        models,
+        active_model_id: Some(state.active_model_id.clone()),
         mcp_servers,
         projects: state.projects.clone(),
         active_project_path: state.project.path.clone(),
@@ -794,16 +1282,38 @@ fn runtime_config_without_secrets(state: &RuntimeState) -> PersistedRuntimeConfi
 
 fn persisted_secrets(state: &RuntimeState) -> Result<PersistedSecrets, AppError> {
     let mut secrets = load_persisted_secrets()?;
-    if let Some(key) = state
+    let model_ids = state
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<HashSet<_>>();
+    secrets
+        .model_api_keys
+        .retain(|id, _| model_ids.contains(id.as_str()));
+    for model in &state.models {
+        if let Some(key) = model
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            secrets
+                .model_api_keys
+                .insert(model.id.clone(), key.to_string());
+        } else {
+            secrets.model_api_keys.remove(&model.id);
+        }
+    }
+    secrets.model_api_key = state
         .model
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|key| !key.is_empty())
-    {
-        secrets.model_api_key = Some(key.to_string());
-    }
+        .map(str::to_string);
     for server in &state.mcp_servers {
+        secrets.mcp_secret_env.insert(server.id.clone(), server.env.iter().filter(|(key, _)| is_secret_env_key(key)).map(|(key, value)| (key.clone(), value.clone())).collect());
+        secrets.mcp_secret_headers.insert(server.id.clone(), server.headers.iter().filter(|(key, _)| is_secret_header_key(key)).map(|(key, value)| (key.clone(), value.clone())).collect());
         if let Some(token) = server
             .env
             .get("MCP_AUTH_TOKEN")
@@ -825,6 +1335,11 @@ fn is_secret_env_key(key: &str) -> bool {
         || key.contains("API_KEY")
         || key.contains("SECRET")
         || key.contains("PASSWORD")
+}
+
+fn is_secret_header_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("authorization") || key.contains("token") || key.contains("api-key") || key.contains("apikey") || key.contains("secret") || key.contains("password")
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<(), AppError> {
@@ -895,7 +1410,9 @@ fn restrict_secret_file(path: &Path) -> Result<(), AppError> {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let identity = std::process::Command::new("whoami")
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .ok()
             .and_then(|output| {
@@ -917,6 +1434,7 @@ fn restrict_secret_file(path: &Path) -> Result<(), AppError> {
             .arg(format!("{identity}:(F)"))
             .arg("*S-1-5-18:(F)")
             .arg("*S-1-5-32-544:(F)")
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|error| AppError::Configuration(format!("设置凭据文件权限未完成：{error}")))?;
         if !output.status.success() {
@@ -1152,7 +1670,11 @@ async fn dispatch_local_rpc(
                 modified_at: None,
                 message_count: 0,
                 cwd: None,
+                model_profile_id: None,
+                reasoning_effort: None,
                 messages: Vec::new(),
+                ui_turns: Vec::new(),
+                activities: Vec::new(),
             }))
             .map_err(|error| AppError::Internal(format!("编码线程读取结果未完成：{error}")))?
         }
@@ -1219,11 +1741,20 @@ async fn dispatch_local_rpc(
                 ));
             }
             let request = AgentRequest {
+                request_id: args
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 message,
                 history,
                 codesys_context: context_binding_from_args(&args),
                 model: args
                     .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                model_profile_id: args
+                    .get("model_profile_id")
+                    .or_else(|| args.get("modelProfileId"))
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 reasoning_effort: args
@@ -1251,7 +1782,7 @@ async fn dispatch_local_rpc(
                     .unwrap_or_default(),
                 ..AgentRequest::default()
             };
-            serde_json::to_value(run_agent_inner(app.clone(), request, &state).await?)
+            serde_json::to_value(run_agent_inner(app.clone(), request, &state, None).await?)
                 .map_err(|error| AppError::Internal(format!("编码轮次结果未完成：{error}")))?
         }
         "context/compact" => {
@@ -1288,6 +1819,27 @@ async fn dispatch_local_rpc(
             let config = model_config_with_saved_key(config, &state).await;
             serde_json::to_value(discover_models_inner(config).await?)
                 .map_err(|error| AppError::Internal(format!("编码模型列表未完成：{error}")))?
+        }
+        "set_active_model" | "model/set_active" => {
+            let id = required_string_arg(&args, "id")?;
+            serde_json::to_value(set_active_model_inner(id, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码当前模型结果未完成：{error}")))?
+        }
+        "set_model_enabled" | "model/set_enabled" => {
+            let id = required_string_arg(&args, "id")?;
+            let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            serde_json::to_value(set_model_enabled_inner(id, enabled, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码模型启停结果未完成：{error}")))?
+        }
+        "duplicate_model" | "model/duplicate" => {
+            let id = required_string_arg(&args, "id")?;
+            serde_json::to_value(duplicate_model_inner(id, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码模型副本结果未完成：{error}")))?
+        }
+        "delete_model" | "model/delete" => {
+            let id = required_string_arg(&args, "id")?;
+            serde_json::to_value(delete_model_inner(id, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码模型删除结果未完成：{error}")))?
         }
         "configure_mcp" => {
             let request = nested_arg::<ConfigureMcpRequest>(&args, "request")?;
@@ -1327,7 +1879,7 @@ async fn dispatch_local_rpc(
             if let Some(binding) = context_binding_from_args(&args) {
                 request.codesys_context = Some(binding);
             }
-            serde_json::to_value(run_agent_inner(app.clone(), request, &state).await?)
+            serde_json::to_value(run_agent_inner(app.clone(), request, &state, None).await?)
                 .map_err(|error| AppError::Internal(format!("编码 Agent 结果未完成：{error}")))?
         }
         "compact_context" => {
@@ -1565,7 +2117,7 @@ const BUILTIN_SERVER_ID: &str = "builtin";
 /// PLC Pilot 自带的工程工具。它们不经过外部 MCP 进程，直接在受控 Rust 层执行，
 /// 这样常用的读取、Diff 和诊断不需要用户另行安装服务，也不会把工程路径交给未知进程。
 fn builtin_tools() -> Vec<McpTool> {
-    vec![
+    let mut tools = vec![
         McpTool {
             server_id: BUILTIN_SERVER_ID.to_string(),
             name: "project_snapshot".to_string(),
@@ -1657,7 +2209,9 @@ fn builtin_tools() -> Vec<McpTool> {
                 "additionalProperties": false
             }),
         },
-    ]
+    ];
+    tools.extend(generic_tools::tools());
+    tools
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1743,11 +2297,7 @@ impl serde::Serialize for AppError {
 }
 
 pub fn run() {
-    let state = AppState {
-        inner: Arc::new(Mutex::new(load_runtime_state())),
-        agent_runs: Arc::new(Mutex::new(())),
-        abort_requested: Arc::new(AtomicBool::new(false)),
-    };
+    let state = AppState::new(load_runtime_state());
 
     tauri::Builder::default()
         .manage(state)
@@ -1764,6 +2314,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             configure_model,
+            set_active_model,
+            set_model_enabled,
+            duplicate_model,
+            delete_model,
             discover_models,
             configure_mcp,
             select_project,
@@ -1771,6 +2325,29 @@ pub fn run() {
             list_mcp_tools,
             call_mcp_tool,
             run_agent,
+            agent_runtime::start_temporary_workspace,
+            agent_runtime::load_workspace_state,
+            agent_runtime::save_workspace_state,
+            agent_runtime::load_composer_draft,
+            agent_runtime::save_composer_draft,
+            agent_runtime::launch_codesys,
+            settings::get_preferences,
+            settings::save_theme_preference,
+            settings::save_retry_settings,
+            settings::save_access_mode,
+            settings::save_skill,
+            settings::toggle_skill,
+            settings::delete_skill,
+            settings::pick_skill_path,
+            settings::get_mcp_configs,
+            settings::save_mcp_server,
+            settings::delete_mcp_server,
+            settings::duplicate_mcp_server,
+            settings::probe_mcp_server,
+            settings::list_mcp_catalog,
+            settings::install_mcp_catalog,
+            settings::list_skill_catalog,
+            settings::install_skill_catalog,
             abort_agent,
             approve_change,
             reject_change,
@@ -1813,6 +2390,53 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, AppErro
     snapshot_from_app_state(&state).await
 }
 
+fn normalize_model_for_save(mut config: ModelConfig) -> Result<ModelConfig, AppError> {
+    config.id = config.id.trim().to_string();
+    if config.id.is_empty() {
+        config.id = format!("model-{}", Uuid::new_v4());
+    }
+    config.model = config.model.trim().to_string();
+    config.base_url = config.base_url.trim().trim_end_matches('/').to_string();
+    config.name = if config.name.trim().is_empty() {
+        config.model.clone()
+    } else {
+        config.name.trim().to_string()
+    };
+    config.api_key = config
+        .api_key
+        .take()
+        .and_then(|key| (!key.trim().is_empty()).then(|| key.trim().to_string()));
+    if config.model.is_empty() {
+        return Err(AppError::Configuration("模型名称不能为空".to_string()));
+    }
+    if config.base_url.is_empty() {
+        return Err(AppError::Configuration("接口地址不能为空".to_string()));
+    }
+    if !(config.base_url.starts_with("http://") || config.base_url.starts_with("https://")) {
+        return Err(AppError::Configuration(
+            "接口地址必须以 http:// 或 https:// 开头".to_string(),
+        ));
+    }
+    if config.context_window < 1_024 || config.context_window > 10_000_000 {
+        return Err(AppError::Configuration(
+            "上下文长度需要在 1,024 到 10,000,000 之间".to_string(),
+        ));
+    }
+    if config.max_tokens == 0 || u64::from(config.max_tokens) > config.context_window {
+        return Err(AppError::Configuration(
+            "最大输出 Token 必须大于 0 且不能超过上下文长度".to_string(),
+        ));
+    }
+    if config.is_default && !config.enabled {
+        return Err(AppError::Configuration("默认模型必须保持启用".to_string()));
+    }
+    Ok(normalize_model_profile(config, 0))
+}
+
+fn model_summaries(models: &[ModelConfig]) -> Vec<ModelSummary> {
+    models.iter().map(model_summary).collect()
+}
+
 #[tauri::command]
 async fn configure_model(
     config: ModelConfig,
@@ -1825,19 +2449,190 @@ async fn configure_model_inner(
     config: ModelConfig,
     state: &AppState,
 ) -> Result<ModelSummary, AppError> {
-    let current = state.inner.lock().await.model.clone();
-    let config = apply_saved_model_key(config, &current);
-    if config.model.trim().is_empty() {
-        return Err(AppError::Configuration("模型名称不能为空".to_string()));
+    let requested_id = config.id.trim().to_string();
+    let mut config = normalize_model_for_save(config)?;
+    let mut guard = state.inner.lock().await;
+    if !config.enabled
+        && !guard
+            .models
+            .iter()
+            .any(|model| model.id != requested_id && model.enabled)
+    {
+        return Err(AppError::Configuration(
+            "至少保留一个启用的模型".to_string(),
+        ));
     }
-    if config.base_url.trim().is_empty() {
-        return Err(AppError::Configuration("接口地址不能为空".to_string()));
+    if let Some(existing) = guard.models.iter().find(|model| model.id == requested_id) {
+        if config.api_key.is_none() && same_model_scope(&config, existing) {
+            config.api_key = existing.api_key.clone();
+        }
+        if config.last_checked_at.is_none()
+            && same_model_scope(&config, existing)
+            && config.model == existing.model
+        {
+            config.last_checked_at = existing.last_checked_at.clone();
+            config.last_error = existing.last_error.clone();
+        }
     }
-    let summary = model_summary(&config);
-    state.inner.lock().await.model = config;
-    let persisted = state.inner.lock().await.clone();
+    let config_id = config.id.clone();
+    if let Some(index) = guard.models.iter().position(|model| model.id == config_id) {
+        guard.models[index] = config;
+    } else {
+        guard.models.push(config);
+    }
+    if guard.models.len() == 1
+        || guard
+            .models
+            .iter()
+            .any(|model| model.id == config_id && model.is_default)
+    {
+        for model in &mut guard.models {
+            model.is_default = model.id == config_id;
+        }
+        guard.active_model_id = config_id.clone();
+    }
+    sync_active_model(&mut guard);
+    let summary = guard
+        .models
+        .iter()
+        .find(|model| model.id == config_id)
+        .map(model_summary)
+        .ok_or_else(|| AppError::Internal("保存模型后找不到 profile".to_string()))?;
+    let persisted = guard.clone();
+    drop(guard);
     persist_runtime_state(&persisted)?;
     Ok(summary)
+}
+
+async fn set_active_model_inner(id: String, state: &AppState) -> Result<ModelSummary, AppError> {
+    let requested = id.trim();
+    if requested.is_empty() {
+        return Err(AppError::Configuration("请选择要使用的模型".to_string()));
+    }
+    let mut guard = state.inner.lock().await;
+    let exists = guard
+        .models
+        .iter()
+        .any(|model| model.id == requested && model.enabled);
+    if !exists {
+        return Err(AppError::Configuration("该模型不存在或已停用".to_string()));
+    }
+    guard.active_model_id = requested.to_string();
+    for model in &mut guard.models {
+        model.is_default = model.id == requested;
+    }
+    sync_active_model(&mut guard);
+    let summary = model_summary(&guard.model);
+    let persisted = guard.clone();
+    drop(guard);
+    persist_runtime_state(&persisted)?;
+    Ok(summary)
+}
+
+async fn set_model_enabled_inner(
+    id: String,
+    enabled: bool,
+    state: &AppState,
+) -> Result<Vec<ModelSummary>, AppError> {
+    let requested = id.trim();
+    if requested.is_empty() {
+        return Err(AppError::Configuration("请选择要切换的模型".to_string()));
+    }
+    let mut guard = state.inner.lock().await;
+    let Some(index) = guard.models.iter().position(|model| model.id == requested) else {
+        return Err(AppError::Configuration("该模型不存在".to_string()));
+    };
+    let was_enabled = guard.models[index].enabled;
+    if !enabled && was_enabled && guard.models.iter().filter(|item| item.enabled).count() <= 1 {
+        return Err(AppError::Configuration(
+            "至少保留一个启用的模型".to_string(),
+        ));
+    }
+    guard.models[index].enabled = enabled;
+    sync_active_model(&mut guard);
+    let summaries = model_summaries(&guard.models);
+    let persisted = guard.clone();
+    drop(guard);
+    persist_runtime_state(&persisted)?;
+    Ok(summaries)
+}
+
+async fn duplicate_model_inner(id: String, state: &AppState) -> Result<ModelSummary, AppError> {
+    let requested = id.trim();
+    let mut guard = state.inner.lock().await;
+    let Some(source) = guard
+        .models
+        .iter()
+        .find(|model| model.id == requested)
+        .cloned()
+    else {
+        return Err(AppError::Configuration("找不到要复制的模型".to_string()));
+    };
+    let mut copy = source;
+    copy.id = format!("model-{}", Uuid::new_v4());
+    copy.name = format!("{} 副本", copy.name);
+    copy.is_default = false;
+    copy.enabled = true;
+    copy.last_error = None;
+    copy.last_checked_at = None;
+    let summary = model_summary(&copy);
+    guard.models.push(copy);
+    let persisted = guard.clone();
+    drop(guard);
+    persist_runtime_state(&persisted)?;
+    Ok(summary)
+}
+
+async fn delete_model_inner(id: String, state: &AppState) -> Result<Vec<ModelSummary>, AppError> {
+    let requested = id.trim();
+    let mut guard = state.inner.lock().await;
+    if guard.models.len() <= 1 {
+        return Err(AppError::Configuration("至少保留一个模型配置".to_string()));
+    }
+    let before = guard.models.len();
+    guard.models.retain(|model| model.id != requested);
+    if guard.models.len() == before {
+        return Err(AppError::Configuration("该模型不存在".to_string()));
+    }
+    if guard.active_model_id == requested {
+        guard.active_model_id.clear();
+    }
+    sync_active_model(&mut guard);
+    let summaries = model_summaries(&guard.models);
+    let persisted = guard.clone();
+    drop(guard);
+    persist_runtime_state(&persisted)?;
+    Ok(summaries)
+}
+
+#[tauri::command]
+async fn set_active_model(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<ModelSummary, AppError> {
+    set_active_model_inner(id, &state).await
+}
+
+#[tauri::command]
+async fn set_model_enabled(
+    id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<ModelSummary>, AppError> {
+    set_model_enabled_inner(id, enabled, &state).await
+}
+
+#[tauri::command]
+async fn duplicate_model(id: String, state: State<'_, AppState>) -> Result<ModelSummary, AppError> {
+    duplicate_model_inner(id, &state).await
+}
+
+#[tauri::command]
+async fn delete_model(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ModelSummary>, AppError> {
+    delete_model_inner(id, &state).await
 }
 
 #[tauri::command]
@@ -1846,7 +2641,31 @@ async fn discover_models(
     state: State<'_, AppState>,
 ) -> Result<ModelDiscoveryResult, AppError> {
     let config = model_config_with_saved_key(config, state.inner()).await;
-    discover_models_inner(config).await
+    let result = discover_models_inner(config.clone()).await;
+    let mut guard = state.inner.lock().await;
+    let matched = guard.models.iter_mut().find(|model| {
+        (!config.id.trim().is_empty() && model.id == config.id)
+            || (model.provider == config.provider
+                && model.base_url.trim_end_matches('/') == config.base_url.trim_end_matches('/')
+                && model.model == config.model)
+    });
+    let should_persist = if let Some(profile) = matched {
+        profile.last_checked_at = Some(now_iso());
+        profile.last_error = result.as_ref().err().map(ToString::to_string);
+        true
+    } else {
+        false
+    };
+    if should_persist {
+        let persisted = guard.clone();
+        drop(guard);
+        if let Err(error) = persist_runtime_state(&persisted) {
+            return Err(error);
+        }
+    } else {
+        drop(guard);
+    }
+    result
 }
 
 #[tauri::command]
@@ -1891,6 +2710,12 @@ async fn configure_mcp_inner(
                 server
                     .env
                     .insert("MCP_AUTH_TOKEN".to_string(), token.clone());
+            }
+        }
+        let stored_headers = stored_secrets.mcp_secret_headers.get(&server.id);
+        for (key, value) in stored_headers.into_iter().flat_map(|values| values.iter()) {
+            if server.headers.get(key).is_none_or(|value| value.trim().is_empty()) {
+                server.headers.insert(key.clone(), value.clone());
             }
         }
         if server.transport.trim().is_empty() {
@@ -2007,6 +2832,12 @@ async fn select_project_inner(path: String, state: &AppState) -> Result<ProjectC
             "当前任务仍在运行，完成或停止后再切换工程".to_string(),
         ));
     }
+    let scanned = resolve_project_path(&path)?;
+    persist_selected_project(state, scanned.clone()).await?;
+    Ok(scanned)
+}
+
+fn resolve_project_path(path: &str) -> Result<ProjectContext, AppError> {
     let normalized = path.trim().trim_matches('"');
     if normalized.is_empty() {
         return Err(AppError::Project(
@@ -2038,14 +2869,12 @@ async fn select_project_inner(path: String, state: &AppState) -> Result<ProjectC
         path: Some(path_buf.to_string_lossy().into_owned()),
         project_directory,
         name: Some(name),
-        version: Some("SP22（目标版本）".to_string()),
+        version: Some(detect_codesys_installation().supported_version),
         exists: metadata.is_file() || metadata.is_dir(),
         extension,
         ..ProjectContext::default()
     };
-    let scanned = scan_project_context(project);
-    persist_selected_project(state, scanned.clone()).await?;
-    Ok(scanned)
+    Ok(scan_project_context(project))
 }
 
 #[tauri::command]
@@ -2156,7 +2985,11 @@ async fn rename_session_inner(
             modified_at: None,
             message_count: guard.session.message_count,
             cwd: None,
+            model_profile_id: None,
+            reasoning_effort: None,
             messages: Vec::new(),
+            ui_turns: Vec::new(),
+            activities: Vec::new(),
         }
     };
     if !target.path.trim().is_empty() {
@@ -2208,6 +3041,7 @@ async fn delete_session_inner(
         .into_iter()
         .find(|item| session_paths_equal(&item.path, requested))
         .ok_or_else(|| AppError::Configuration("会话文件不在 PLC Pilot 会话目录中".to_string()))?;
+    let record = parse_session_record_with_mode(Path::new(&record.path), false).ok_or_else(|| AppError::Configuration("完整会话内容无法解析。".into()))?;
     let root = fs::canonicalize(agent_session_dir())
         .map_err(|error| AppError::Configuration(format!("会话目录不可用：{error}")))?;
     let target = fs::canonicalize(&record.path)
@@ -2494,7 +3328,7 @@ async fn fork_session_inner(
         }
     }
 
-    let forked_record = parse_session_record(&target_path).ok_or_else(|| {
+    let forked_record = parse_session_record_with_mode(&target_path, false).ok_or_else(|| {
         let _ = fs::remove_file(&target_path);
         AppError::Internal("新会话分支写入后无法重新读取".to_string())
     })?;
@@ -2536,7 +3370,9 @@ async fn sync_current_project(state: State<'_, AppState>) -> Result<ProjectConte
 
 async fn sync_current_project_inner(state: &AppState) -> Result<ProjectContext, AppError> {
     let current = state.inner.lock().await.project.clone();
-    let synced = sync_project_from_codesys(current);
+    if state.isolated { return Ok(current); }
+    let synced = sync_project_from_codesys(current.clone());
+    if current.path.as_ref().zip(synced.path.as_ref()).is_some_and(|(current, synced)| !session_paths_equal(current, synced)) { return Ok(current); }
     let mut guard = state.inner.lock().await;
     guard.project = synced.clone();
     let project = guard.project.clone();
@@ -2844,10 +3680,8 @@ async fn search_composer_mentions_inner(
     limit: usize,
     state: &AppState,
 ) -> Result<Vec<ComposerMentionSuggestion>, AppError> {
-    let (project, current_session_id) = {
-        let guard = state.inner.lock().await;
-        (guard.project.clone(), guard.session.session_id.clone())
-    };
+    let project = agent_runtime::project_for_cwd(state, &cwd).await?;
+    let current_session_id = state.inner.lock().await.session.session_id.clone();
     let cap = limit.clamp(1, 50);
     let mut suggestions = Vec::new();
     if project.exists {
@@ -2909,7 +3743,7 @@ async fn search_project_files_inner(
     limit: usize,
     state: &AppState,
 ) -> Result<Vec<ComposerFileSuggestion>, AppError> {
-    let project = state.inner.lock().await.project.clone();
+    let project = agent_runtime::project_for_cwd(state, &cwd).await?;
     if !project.exists {
         return Ok(Vec::new());
     }
@@ -3139,6 +3973,7 @@ async fn compact_context_inner(
             ..AgentRequest::default()
         },
         state,
+        None,
     )
     .await
 }
@@ -3174,14 +4009,10 @@ async fn call_mcp_tool_inner(
     request: ToolCallRequest,
     state: &AppState,
 ) -> Result<ToolCallResult, AppError> {
-    if is_forbidden_tool(&request.tool_name) {
+    let full_access = settings::read_preferences()?.access_mode == "full";
+    if !full_access && (is_forbidden_tool(&request.tool_name) || is_mutating_tool(&request.tool_name)) {
         return Err(AppError::Mcp(
-            "这个工具属于默认关闭的高风险在线操作，不能直接调用".to_string(),
-        ));
-    }
-    if is_mutating_tool(&request.tool_name) {
-        return Err(AppError::Mcp(
-            "这个工具可能改变工程，必须先通过审批卡片执行".to_string(),
+            "这个工具可能改变工程或在线设备，必须先通过审批卡片批准，或由用户启用完全访问模式。".to_string(),
         ));
     }
     if request.server_id == BUILTIN_SERVER_ID {
@@ -3195,10 +4026,27 @@ async fn call_mcp_tool_inner(
 
 #[tauri::command]
 async fn approve_change(
+    app: AppHandle,
     id: String,
     state: State<'_, AppState>,
 ) -> Result<ToolCallResult, AppError> {
-    approve_change_inner(id, &state).await
+    let pending = state.inner.lock().await.pending.get(&id).cloned().ok_or_else(|| AppError::Mcp("待审批动作不存在。".into()))?;
+    if pending.summary.tool_name == "exec_command" {
+        if pending.summary.status != "pending" { return Err(AppError::Mcp("这个动作已经处理过了。".into())); }
+        if let Some(item) = state.inner.lock().await.pending.get_mut(&id) { item.summary.status = "applying".into(); }
+        let stream = AgentStreamSender::new(format!("approval-{id}"), app.clone());
+        stream.send_event(AgentEvent::new(&id, "command", "正在运行 PowerShell 命令", Some(pending.arguments["command"].as_str().unwrap_or_default().into()), "running", Some("powershell".into())));
+        let result = generic_tools::host_action(&app, &state, &pending, "execute_approved", Some(&stream), None).await;
+        let (status, detail) = match &result { Ok(result) => (if result.is_error { "error" } else { "done" }, serde_json::to_string_pretty(&result.content).unwrap_or_default()), Err(error) => ("error", error.to_string()) };
+        stream.send_event(AgentEvent::new(&id, "command", &format!("已运行命令 {}", pending.arguments["command"].as_str().unwrap_or_default()), Some(detail), status, Some("powershell".into())));
+        if let Some(item) = state.inner.lock().await.pending.get_mut(&id) { item.summary.status = if status == "done" { "approved" } else { "error" }.into(); }
+        return result;
+    }
+    let result = approve_change_inner(id, &state).await?;
+    if pending.arguments.get("session_file").and_then(Value::as_str).is_some() {
+        generic_tools::host_action(&app, &state, &pending, "record_approval", None, Some(&result.content)).await?;
+    }
+    Ok(result)
 }
 
 async fn approve_change_inner(id: String, state: &AppState) -> Result<ToolCallResult, AppError> {
@@ -3256,27 +4104,45 @@ async fn compile_project_inner(state: &AppState) -> Result<ToolCallResult, AppEr
         ));
     }
     let tools = list_mcp_tools_inner(state).await?;
-    let compile_tool = tools.iter().find(|tool| {
-        let name = tool.name.to_lowercase();
-        tool.server_id != BUILTIN_SERVER_ID
-            && !tool.mutating
-            && (name.contains("compile") || name.contains("build") || name.contains("diagnostic"))
+    let compile_tool = tools.iter().filter(|tool| tool.server_id != BUILTIN_SERVER_ID && !is_forbidden_tool(&tool.name)).max_by_key(|tool| {
+        let name = tool.name.to_ascii_lowercase();
+        let server = format!("{} {}", tool.server_id, tool.qualified_name).to_ascii_lowercase();
+        let mut score = 0;
+        if name == "compile_project" || name == "codesys_build" { score += 100; }
+        if name.contains("compile") || name.contains("build") { score += 40; }
+        if name.contains("diagnostic") { score += 10; }
+        if server.contains("codesys") { score += 25; }
+        score
     });
     if let Some(tool) = compile_tool {
+        let arguments = tool_arguments_for_project(tool, &project);
         return call_mcp_tool_inner(
             ToolCallRequest {
                 server_id: tool.server_id.clone(),
                 tool_name: tool.name.clone(),
-                arguments: json!({ "project_path": project.path }),
+                arguments,
                 codesys_context: None,
             },
             state,
         )
         .await;
     }
-    // 没有真实 CODESYS 编译 MCP 时仍执行本地静态诊断，但明确告诉调用方没有运行
-    // 目标编译器，避免把“语法结构检查”误报成 CODESYS 编译通过。
-    call_builtin_tool(state, "compile_project", json!({})).await
+    Err(AppError::Mcp("没有发现可用的 CODESYS 真实编译工具；已阻止静态结果冒充目标编译。请在 MCP 设置中启用 CODESYS MCP 后重试。".into()))
+}
+
+fn tool_arguments_for_project(tool: &ToolSummary, project: &ProjectContext) -> Value {
+    let path = project.path.clone().unwrap_or_default();
+    let properties = tool.input_schema.get("properties").and_then(Value::as_object);
+    let mut arguments = serde_json::Map::new();
+    for key in ["project_path", "projectFilePath", "projectPath", "path"] {
+        if properties.is_some_and(|items| items.contains_key(key)) { arguments.insert(key.to_string(), Value::String(path.clone())); break; }
+    }
+    if let Some(properties) = properties {
+        for key in ["application", "applicationPath", "application_path"] {
+            if properties.contains_key(key) { arguments.insert(key.to_string(), Value::String("".into())); break; }
+        }
+    }
+    Value::Object(arguments)
 }
 
 #[tauri::command]
@@ -3300,7 +4166,7 @@ async fn run_agent_legacy(
     let (base_model, project, servers) = {
         let guard = state.inner.lock().await;
         (
-            guard.model.clone(),
+            model_profile_for_request(&guard, &request)?,
             guard.project.clone(),
             guard.mcp_servers.clone(),
         )
@@ -3311,9 +4177,6 @@ async fn run_agent_legacy(
 
     let mut events = Vec::new();
     let tools = discover_tools(&servers, &mut events).await;
-    for event in events.clone() {
-        emit_event(&app, event);
-    }
     let system = build_agent_system_prompt(&project, &request);
     let mut messages = request.history;
     let attachment_text = attachments::attachment_context(&request.attachments);
@@ -3329,6 +4192,8 @@ async fn run_agent_legacy(
         content: prompt_text,
         images: attachments::attachment_images(&request.attachments),
         references: request.references.clone(),
+        model_profile_id: request.model_profile_id.clone(),
+        reasoning_effort: request.reasoning_effort.clone(),
         response_annotations: request.response_annotations.clone(),
     });
     push_event(
@@ -3350,6 +4215,7 @@ async fn run_agent_legacy(
 
     let mut final_text = String::new();
     let mut diagnostics = Vec::new();
+    let mcp_sessions = McpSessionRegistry::default();
     for turn in 0..MAX_AGENT_TURNS {
         push_event(
             &app,
@@ -3363,7 +4229,9 @@ async fn run_agent_legacy(
                 None,
             ),
         );
-        let response = call_model(&model, &system, &messages, &tools).await?;
+        let response =
+            call_model_with_retry(&app, state, &model, &system, &messages, &tools, &mut events)
+                .await?;
         if !response.text.trim().is_empty() {
             final_text = response.text.clone();
         }
@@ -3399,6 +4267,7 @@ async fn run_agent_legacy(
                 &app,
                 state,
                 &servers,
+                &mcp_sessions,
                 json!({
                     "request_id": format!("legacy-{}", call.call_id),
                     "tool_call_id": call.call_id,
@@ -3409,6 +4278,7 @@ async fn run_agent_legacy(
                 &mut events,
                 &mut diagnostics,
                 plan_mode,
+                None,
             )
             .await?;
             let feedback = tool_response
@@ -3422,6 +4292,7 @@ async fn run_agent_legacy(
                 "Agent 已达到本次任务的最大工具轮次，请检查工具时间线和待审批动作。".to_string();
         }
     }
+    mcp_sessions.shutdown_all().await;
 
     let pending_changes = state
         .inner
@@ -3448,18 +4319,63 @@ async fn run_agent_legacy(
 #[tauri::command]
 async fn run_agent(
     app: AppHandle,
-    request: AgentRequest,
+    mut request: AgentRequest,
     state: State<'_, AppState>,
-) -> Result<AgentRunResult, AppError> {
-    run_agent_inner(app, request, &state).await
+) -> Result<AgentStartAck, AppError> {
+    let request_id = request
+        .request_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    request.request_id = Some(request_id.clone());
+    let stream = AgentStreamSender::new(request_id.clone(), app.clone());
+    stream.send_status("request_start", None);
+    let root = state.inner().clone();
+    let state = agent_runtime::isolate_run(&root, &request).await?;
+    // 控制面只确认提交成功；后台任务负责读取宿主 stdout、投影工具/文本事件，
+    // 并在终态发送 result/error。这样 invoke 返回后 WebView 仍有独立事件流可消费。
+    tauri::async_runtime::spawn(async move {
+        // 对应 Codex app-server 的 turn/started：在工程快照、工具发现或模型
+        // 首字节返回前就让界面知道本轮已经进入执行态，不会一直停留在“连接中”。
+        stream.send_status("thinking", Some("start"));
+        let result = run_agent_inner(app, request, &state, Some(stream.clone())).await;
+        // 每个运行实例独立持有会话与 cwd；审批产物按全局唯一 ID 汇回桌面，
+        // 不能用整个 RuntimeState 覆盖当前窗口，否则切换项目会串会话和模型。
+        let runtime = state.inner.lock().await;
+        let mut global = root.inner.lock().await;
+        for (id, pending) in &runtime.pending { global.pending.entry(id.clone()).or_insert_with(|| pending.clone()); }
+        for (id, patch) in &runtime.patches { global.patches.entry(id.clone()).or_insert_with(|| patch.clone()); }
+        drop(global);
+        drop(runtime);
+        root.running.lock().await.remove(&stream.request_id);
+        stream.send_session(state.inner.lock().await.session.clone());
+        match result {
+            Ok(result) => stream.send_result(result),
+            Err(error) => stream.send_error(error.to_string()),
+        }
+    });
+    Ok(AgentStartAck {
+        request_id,
+        accepted: true,
+    })
 }
 
 /// 请求取消正在运行的 Agent。取消只终止当前模型/工具轮次，已审批写入不会被回滚。
 #[tauri::command]
-async fn abort_agent(state: State<'_, AppState>) -> Result<Value, AppError> {
+async fn abort_agent(request_id: Option<String>, state: State<'_, AppState>) -> Result<Value, AppError> {
+    let runs = state.running.lock().await;
+    let target = request_id.as_ref().and_then(|id| runs.get(id)).or_else(|| if request_id.is_none() && runs.len() == 1 { runs.values().next() } else { None });
+    if let Some(run) = target {
+        run.abort_requested.store(true, Ordering::SeqCst);
+        run.abort_notify.notify_one();
+        return Ok(json!({ "aborted": true }));
+    }
+    drop(runs);
+    if request_id.is_some() { return Ok(json!({ "aborted": false })); }
     let running = state.agent_runs.try_lock().is_err();
     if running {
         state.abort_requested.store(true, Ordering::SeqCst);
+        state.abort_notify.notify_one();
     }
     Ok(json!({ "aborted": running }))
 }
@@ -3468,6 +4384,7 @@ async fn run_agent_inner(
     app: AppHandle,
     mut request: AgentRequest,
     state: &AppState,
+    stream: Option<AgentStreamSender>,
 ) -> Result<AgentRunResult, AppError> {
     prepare_attachments(&mut request.attachments);
     if request.message.trim().is_empty()
@@ -3497,7 +4414,8 @@ async fn run_agent_inner(
 
     // 同一工程会话只允许一个 Agent 运行，避免两个模型请求同时写入同一份 JSONL 会话。
     let _run_guard = state.agent_runs.lock().await;
-    state.abort_requested.store(false, Ordering::SeqCst);
+    if !state.isolated { state.abort_requested.store(false, Ordering::SeqCst); }
+    if state.abort_requested.load(Ordering::SeqCst) { return Err(AppError::Internal("当前 Agent 任务已中止".into())); }
     let command = request.message.trim();
     let mut command_parts = command.split_whitespace();
     let command_name = command_parts.next().unwrap_or_default().to_lowercase();
@@ -3906,7 +4824,7 @@ async fn run_agent_inner(
     let (base_model, servers, previous_session) = {
         let guard = state.inner.lock().await;
         (
-            guard.model.clone(),
+            model_profile_for_request(&guard, &request)?,
             guard.mcp_servers.clone(),
             guard.session.clone(),
         )
@@ -3921,7 +4839,9 @@ async fn run_agent_inner(
     let mut events = Vec::new();
     let tools = discover_tools(&servers, &mut events).await;
     for event in events.clone() {
-        emit_event(&app, event);
+        if let Some(stream) = stream.as_ref() {
+            stream.send_event(event.clone());
+        }
     }
     let action = if command_name == "/compact" {
         "compact"
@@ -3941,6 +4861,7 @@ async fn run_agent_inner(
         action,
         &mut events,
         session_name,
+        stream.as_ref(),
     )
     .await;
 
@@ -3949,8 +4870,12 @@ async fn run_agent_inner(
     match result {
         Ok(result) => Ok(result),
         Err(AppError::Internal(message)) if message.starts_with("PI_HOST_UNAVAILABLE:") => {
-            // 兼容没有 Node.js 或未安装 Pi 依赖的开发环境，保留原有 Rust Agent 作为真实后备链路。
-            run_agent_legacy(app, request, &state).await
+            // 宿主启动问题不能静默降级到非流式请求：旧回退会丢失全部 delta、工具状态
+            // 和 Pi 会话落盘，使界面直到最终结果才更新，也掩盖了真正的启动诊断。
+            Err(AppError::Configuration(format!(
+                "实时 Agent 宿主未能启动：{}。请检查 Node.js 22.19+ 或 PLC_PILOT_NODE 配置，以及应用的宿主资源后重试。",
+                message.trim_start_matches("PI_HOST_UNAVAILABLE:")
+            )))
         }
         Err(error) => Err(error),
     }
@@ -4080,22 +5005,32 @@ async fn run_pi_host(
     action: &str,
     events: &mut Vec<AgentEvent>,
     session_name: Option<String>,
+    stream: Option<&AgentStreamSender>,
 ) -> Result<AgentRunResult, AppError> {
-    let script = agent_host_path(app);
+    // resource_dir()/canonicalize() 在 Windows 返回 \\?\ 路径。Node 的入口加载器
+    // 对这种路径执行 realpathSync 时会报 EISDIR（lstat 'C:'），宿主尚未 ready
+    // 就退出。沿用 Codex 使用的 dunce 路径兼容库，仅在外部进程边界转换路径；
+    // 保留 Rust 内部的规范路径和工程安全校验，UNC/必须使用长路径的情形由库处理。
+    let host_path = agent_host_path(app);
+    let script = dunce::simplified(&host_path);
     if !script.is_file() {
         return Err(AppError::Internal(format!(
             "PI_HOST_UNAVAILABLE:找不到 Pi 宿主脚本：{}",
             script.display()
         )));
     }
-    let cwd = agent_cwd(project);
+    let project_cwd = agent_cwd(project);
+    let cwd = dunce::simplified(&project_cwd);
     let mut command = Command::new(agent_node_command(app));
     command
-        .arg(&script)
-        .current_dir(&cwd)
+        .arg(script)
+        .current_dir(cwd)
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     let mut child = command.spawn().map_err(|error| {
         AppError::Internal(format!("PI_HOST_UNAVAILABLE:无法启动 Node.js：{error}"))
     })?;
@@ -4126,7 +5061,11 @@ async fn run_pi_host(
         });
     }
     let mut reader = BufReader::new(stdout);
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = request
+        .request_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let tool_payload = tools
         .iter()
         .map(|tool| {
@@ -4140,17 +5079,22 @@ async fn run_pi_host(
         })
         .collect::<Vec<_>>();
     let model_payload = json!({
+        "id": model.id,
+        "name": model.name,
         "provider": model.provider,
         "base_url": model.base_url,
         "model": model.model,
         "api_key": model.api_key,
         "max_tokens": model.max_tokens,
+        "context_window": model.context_window,
+        "reasoning_levels": model.reasoning_levels,
     });
     let host_request = json!({
         "type": "run",
         "request_id": request_id,
         "action": action,
         "message": request.message,
+        "display_message": request.display_message,
         // 图片沿用 Codex 的 image_url 数据 URI；文本/工作簿正文由宿主拼接到本轮提示。
         "attachments": request.attachments,
         "references": request.references,
@@ -4169,12 +5113,14 @@ async fn run_pi_host(
         "mcp_tools": tool_payload,
         "system_prompt": build_agent_system_prompt(project, request),
         "reasoning_effort": request_thinking_level(request),
+        "retry": settings::read_preferences()?.retry,
         "collaboration_mode": if request_is_plan_mode(request) { "plan" } else { "default" },
         "skills": request.skills,
     });
 
+    let mcp_sessions = McpSessionRegistry::default();
     let result = async {
-        let ready = read_host_json_or_abort(&mut reader, &state.abort_requested).await?;
+        let ready = read_host_json_or_abort(&mut reader, state).await?;
         if ready.get("type").and_then(Value::as_str) != Some("ready") {
             return Err(AppError::Internal(format!(
                 "PI_HOST_UNAVAILABLE:Pi 宿主未就绪：{}",
@@ -4188,18 +5134,42 @@ async fn run_pi_host(
         let mut diagnostics = Vec::new();
         let mut session = previous_session.clone();
         let final_text = loop {
-            let value = read_host_json_or_abort(&mut reader, &state.abort_requested).await?;
+            let value = read_host_json_or_abort(&mut reader, state).await?;
             match value.get("type").and_then(Value::as_str) {
+                Some("session") => {
+                    if let Some(session) = value.get("session").and_then(|value| serde_json::from_value::<AgentSessionSummary>(value.clone()).ok()) {
+                        state.inner.lock().await.session = session.clone();
+                        if let Some(stream) = stream { stream.send_session(session); }
+                    }
+                }
                 Some("event") => {
                     if let Some(event) = value.get("event") {
                         let parsed = serde_json::from_value::<AgentEvent>(event.clone()).map_err(
                             |error| AppError::Internal(format!("Pi 事件格式不正确：{error}")),
                         )?;
-                        push_event(app, events, parsed);
+                        push_event_with_stream(app, events, parsed, stream);
                     }
                 }
                 Some("delta") => {
-                    // 文本增量交给前端的最终消息处理，这里只保留完整结果，避免时间线被拆成数百行。
+                    if let Some(delta) = value
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        if let Some(stream) = stream {
+                            stream.send_delta(delta);
+                        }
+                    }
+                }
+                Some("stream_start") => {
+                    if let Some(stream) = stream {
+                        stream.send_status("stream_start", None);
+                    }
+                }
+                Some("thinking") => {
+                    if let Some(stream) = stream {
+                        stream.send_status("thinking", value.get("phase").and_then(Value::as_str));
+                    }
                 }
                 Some("tool_request") => {
                     let response = tokio::select! {
@@ -4207,12 +5177,14 @@ async fn run_pi_host(
                             app,
                             state,
                             servers,
+                            &mcp_sessions,
                             value,
                             events,
                             &mut diagnostics,
                             request_is_plan_mode(request),
+                            stream,
                         ) => result?,
-                        _ = wait_for_abort(state.abort_requested.clone()) => {
+                        _ = wait_for_abort(state) => {
                             return Err(AppError::Internal("当前 Agent 任务已中止".to_string()));
                         }
                     };
@@ -4239,6 +5211,16 @@ async fn run_pi_host(
                         .and_then(Value::as_str)
                         .unwrap_or("Pi 宿主返回了未知问题")
                         .to_string();
+                    // 即使本轮最终失败，Pi 也已经把用户轮次写入自己的 JSONL。
+                    // 先同步 session_file，手动重试才能从失败轮次之前创建分支，
+                    // 从根上避免把同一条用户消息再次追加到原会话。
+                    if let Some(value) = value.get("session") {
+                        if let Ok(parsed) =
+                            serde_json::from_value::<AgentSessionSummary>(value.clone())
+                        {
+                            state.inner.lock().await.session = parsed;
+                        }
+                    }
                     return Err(AppError::Network(message));
                 }
                 _ => {}
@@ -4248,6 +5230,24 @@ async fn run_pi_host(
         Ok(agent_result_from_state(state, final_text, events.clone(), diagnostics).await)
     }
     .await;
+    // MCP 进程只复用本轮 Agent 任务，任务结束即释放，避免形成全局常驻后台进程。
+    // 无论模型成功、失败还是用户中断，都要清理 CODESYS/Node 子进程树。
+    mcp_sessions.shutdown_all().await;
+    if state.abort_requested.load(Ordering::SeqCst) {
+        // 先调用 Pi 原生 abort，让 SDK 落盘中断消息和统计，再回收宿主进程。
+        // 直接 kill 会导致新会话的 session_file 和已执行工具的记录来不及同步。
+        let _ = write_host_json(&mut stdin, json!({ "type": "abort" })).await;
+        let _ = timeout(Duration::from_secs(3), async {
+            loop {
+                let value = read_host_json(&mut reader).await?;
+                if let Some(session) = value.get("session").and_then(|value| serde_json::from_value::<AgentSessionSummary>(value.clone()).ok()) {
+                    state.inner.lock().await.session = session;
+                }
+                if matches!(value.get("type").and_then(Value::as_str), Some("result" | "error")) { break; }
+            }
+            Ok::<(), AppError>(())
+        }).await;
+    }
     let _ = child.kill().await;
     if let Err(AppError::Internal(message)) = &result {
         if message.starts_with("PI_HOST_UNAVAILABLE:") {
@@ -4267,10 +5267,12 @@ async fn process_pi_tool_request(
     app: &AppHandle,
     state: &AppState,
     servers: &[McpServerConfig],
+    mcp_sessions: &McpSessionRegistry,
     value: Value,
     events: &mut Vec<AgentEvent>,
     diagnostics: &mut Vec<DiagnosticItem>,
     plan_mode: bool,
+    stream: Option<&AgentStreamSender>,
 ) -> Result<Value, AppError> {
     let request_id = value
         .get("request_id")
@@ -4294,29 +5296,10 @@ async fn process_pi_tool_request(
         .to_string();
     let arguments = value.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let qualified = qualify_tool(&server_id, &tool_name);
-    if is_forbidden_tool(&tool_name) {
-        push_event(
-            app,
-            events,
-            AgentEvent::new(
-                &call_id,
-                "safety",
-                "已阻止高风险在线操作",
-                Some("下载、RUN/STOP、Force、Reset、在线写变量和脚本执行默认关闭。".to_string()),
-                "blocked",
-                Some(qualified.clone()),
-            ),
-        );
-        return Ok(json!({
-            "type": "tool_result",
-            "request_id": request_id,
-            "content": [{"type":"text","text":"这个工具被 PLC Pilot 的安全策略阻止，不能执行。"}],
-            "is_error": true,
-            "decision": "blocked",
-        }));
-    }
-    if plan_mode && is_mutating_tool(&tool_name) {
-        push_event(
+    let full_access = settings::read_preferences()?.access_mode == "full";
+    let needs_approval = is_mutating_tool(&tool_name) || is_forbidden_tool(&tool_name);
+    if plan_mode && needs_approval {
+        push_event_with_stream(
             app,
             events,
             AgentEvent::new(
@@ -4330,6 +5313,7 @@ async fn process_pi_tool_request(
                 "blocked",
                 Some(qualified.clone()),
             ),
+            stream,
         );
         return Ok(json!({
             "type": "tool_result",
@@ -4340,20 +5324,34 @@ async fn process_pi_tool_request(
         }));
     }
     if server_id == BUILTIN_SERVER_ID {
-        if tool_name == "propose_edit" {
-            match propose_builtin_edit(state, arguments).await {
+        if matches!(tool_name.as_str(), "propose_edit" | "propose_write" | "apply_patch" | "exec_command") {
+            let proposal = if tool_name == "propose_edit" { propose_builtin_edit(state, arguments).await } else { generic_tools::propose(state, &tool_name, arguments).await };
+            match proposal {
                 Ok(summary) => {
-                    push_event(
+                    if full_access {
+                        let pending = state.inner.lock().await.pending.get(&summary.id).cloned().ok_or_else(|| AppError::Mcp("完全访问模式未找到待执行动作。".into()))?;
+                        let result = if tool_name == "exec_command" {
+                            generic_tools::host_action(app, state, &pending, "execute_approved", Some(&AgentStreamSender::new(request_id.clone(), app.clone())), None).await
+                        } else {
+                            apply_builtin_pending_change(state, &pending).await
+                        };
+                        let (is_error, content) = match result { Ok(result) => (result.is_error, result.content), Err(error) => (true, vec![json!({"type":"text","text":error.to_string()})]) };
+                        if let Some(item) = state.inner.lock().await.pending.get_mut(&summary.id) { item.summary.status = if is_error { "error" } else { "approved" }.into(); }
+                        push_event_with_stream(app, events, AgentEvent::new(&call_id, "safety", if is_error { "完全访问执行未完成" } else { "完全访问已执行" }, Some(summary.title.clone()), if is_error { "error" } else { "done" }, Some(qualified.clone())), stream);
+                        return Ok(json!({"type":"tool_result","request_id":request_id,"content":content,"is_error":is_error,"decision":if is_error {"error"} else {"executed"}}));
+                    }
+                    push_event_with_stream(
                         app,
                         events,
                         AgentEvent::new(
                             &call_id,
                             "approval",
-                            "已生成工程修改 Diff，等待审批",
+                            "已生成待审批动作",
                             Some(summary.title.clone()),
                             "waiting",
                             Some(qualified),
                         ),
+                        stream,
                     );
                     return Ok(json!({
                         "type": "tool_result",
@@ -4365,7 +5363,7 @@ async fn process_pi_tool_request(
                     }));
                 }
                 Err(error) => {
-                    push_event(
+                    push_event_with_stream(
                         app,
                         events,
                         AgentEvent::new(
@@ -4376,6 +5374,7 @@ async fn process_pi_tool_request(
                             "error",
                             Some(qualified),
                         ),
+                        stream,
                     );
                     return Ok(json!({
                         "type": "tool_result",
@@ -4387,7 +5386,7 @@ async fn process_pi_tool_request(
                 }
             }
         }
-        push_event(
+        push_event_with_stream(
             app,
             events,
             AgentEvent::new(
@@ -4398,13 +5397,14 @@ async fn process_pi_tool_request(
                 "running",
                 Some(qualified.clone()),
             ),
+            stream,
         );
         match call_builtin_tool(state, &tool_name, arguments).await {
             Ok(result) => {
                 let result_text = serde_json::to_string(&result.content)
                     .map_err(|error| AppError::Internal(error.to_string()))?;
                 let status = if result.is_error { "warning" } else { "done" };
-                push_event(
+                push_event_with_stream(
                     app,
                     events,
                     AgentEvent::new(
@@ -4419,6 +5419,7 @@ async fn process_pi_tool_request(
                         status,
                         Some(qualified),
                     ),
+                    stream,
                 );
                 if looks_like_diagnostics(&result.content) {
                     diagnostics.extend(extract_diagnostics(&result.content));
@@ -4432,7 +5433,7 @@ async fn process_pi_tool_request(
                 }));
             }
             Err(error) => {
-                push_event(
+                push_event_with_stream(
                     app,
                     events,
                     AgentEvent::new(
@@ -4443,6 +5444,7 @@ async fn process_pi_tool_request(
                         "error",
                         Some(qualified),
                     ),
+                    stream,
                 );
                 return Ok(json!({
                     "type": "tool_result",
@@ -4454,12 +5456,15 @@ async fn process_pi_tool_request(
             }
         }
     }
+    if !load_runtime_state().mcp_servers.iter().any(|server| server.id == server_id && server.enabled) {
+        return Ok(json!({"type":"tool_result","request_id":request_id,"content":[{"type":"text","text":"该 MCP 服务已关闭或移除，本次调用未执行。"}],"is_error":true,"decision":"blocked"}));
+    }
     let server = servers
         .iter()
         .find(|server| server.id == server_id && server.enabled)
         .cloned()
         .ok_or_else(|| AppError::Mcp(format!("未找到已启用的 MCP 服务：{server_id}")))?;
-    if is_mutating_tool(&tool_name) {
+    if needs_approval && !full_access {
         let id = Uuid::new_v4().to_string();
         let summary = PendingChangeSummary {
             id: id.clone(),
@@ -4469,7 +5474,7 @@ async fn process_pi_tool_request(
             diff: render_change_preview(&tool_name, &arguments),
             server_id: server.id.clone(),
             tool_name: tool_name.clone(),
-            risk: "需要人工审批".to_string(),
+            risk: if is_forbidden_tool(&tool_name) { "高风险在线/进程操作，必须确认目标设备和影响范围".to_string() } else { "需要人工审批".to_string() },
             status: "pending".to_string(),
         };
         state.inner.lock().await.pending.insert(
@@ -4479,7 +5484,7 @@ async fn process_pi_tool_request(
                 arguments,
             },
         );
-        push_event(
+        push_event_with_stream(
             app,
             events,
             AgentEvent::new(
@@ -4490,6 +5495,7 @@ async fn process_pi_tool_request(
                 "waiting",
                 Some(qualified),
             ),
+            stream,
         );
         return Ok(json!({
             "type": "tool_result",
@@ -4501,7 +5507,7 @@ async fn process_pi_tool_request(
         }));
     }
 
-    push_event(
+    push_event_with_stream(
         app,
         events,
         AgentEvent::new(
@@ -4512,16 +5518,24 @@ async fn process_pi_tool_request(
             "running",
             Some(qualified.clone()),
         ),
+        stream,
     );
-    match McpClient::new(server)
-        .call_tool(&tool_name, arguments)
-        .await
+    if mcp_transport(&server) != "http" {
+        push_event_with_stream(app, events, AgentEvent::new(&call_id, "mcp", "已握手并复用本轮 CODESYS MCP 会话", Some(format!("服务：{} · 工具：{}", server.name, tool_name)), "running", Some(qualified.clone())), stream);
+    }
+    let result = if mcp_transport(&server) == "http" {
+        // Streamable HTTP 服务可能自行管理会话；保留现有 session-id 握手实现。
+        McpClient::new(server.clone()).call_tool(&tool_name, arguments).await
+    } else {
+        mcp_sessions.call_tool(&server, &tool_name, arguments).await
+    };
+    match result
     {
         Ok(result) => {
             let result_text = serde_json::to_string(&result.content)
                 .map_err(|error| AppError::Internal(error.to_string()))?;
             let status = if result.is_error { "warning" } else { "done" };
-            push_event(
+            push_event_with_stream(
                 app,
                 events,
                 AgentEvent::new(
@@ -4536,6 +5550,7 @@ async fn process_pi_tool_request(
                     status,
                     Some(qualified),
                 ),
+                stream,
             );
             if looks_like_diagnostics(&result.content) {
                 diagnostics.extend(extract_diagnostics(&result.content));
@@ -4549,7 +5564,7 @@ async fn process_pi_tool_request(
             }))
         }
         Err(error) => {
-            push_event(
+            push_event_with_stream(
                 app,
                 events,
                 AgentEvent::new(
@@ -4560,6 +5575,7 @@ async fn process_pi_tool_request(
                     "error",
                     Some(qualified),
                 ),
+                stream,
             );
             Ok(json!({
                 "type": "tool_result",
@@ -4622,35 +5638,48 @@ where
 
 async fn read_host_json_or_abort<R>(
     reader: &mut R,
-    abort_requested: &AtomicBool,
+    state: &AppState,
 ) -> Result<Value, AppError>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    if abort_requested.load(Ordering::SeqCst) {
+    if state.abort_requested.load(Ordering::SeqCst) {
         return Err(AppError::Internal("当前 Agent 任务已中止".to_string()));
     }
     tokio::select! {
         result = read_host_json(reader) => result,
-        _ = wait_for_abort_ref(abort_requested) => {
+        _ = wait_for_abort(state) => {
             Err(AppError::Internal("当前 Agent 任务已中止".to_string()))
         }
     }
 }
 
-async fn wait_for_abort_ref(abort_requested: &AtomicBool) {
-    while !abort_requested.load(Ordering::SeqCst) {
-        sleep(Duration::from_millis(50)).await;
+async fn wait_for_abort(state: &AppState) {
+    while !state.abort_requested.load(Ordering::SeqCst) {
+        state.abort_notify.notified().await;
     }
 }
 
-async fn wait_for_abort(abort_requested: Arc<AtomicBool>) {
-    wait_for_abort_ref(&abort_requested).await;
+fn push_event(_app: &AppHandle, events: &mut Vec<AgentEvent>, event: AgentEvent) {
+    // 同一个 toolCallId 的 start/update/end 是一条生命周期记录。原实现全部追加，
+    // 最终会出现重复工具并产生重复 Vue key；现在保留首次出现的位置并原位更新状态。
+    if let Some(existing) = events.iter_mut().find(|item| item.id == event.id) {
+        *existing = event;
+    } else {
+        events.push(event);
+    }
 }
 
-fn push_event(app: &AppHandle, events: &mut Vec<AgentEvent>, event: AgentEvent) {
-    emit_event(app, event.clone());
-    events.push(event);
+fn push_event_with_stream(
+    app: &AppHandle,
+    events: &mut Vec<AgentEvent>,
+    event: AgentEvent,
+    stream: Option<&AgentStreamSender>,
+) {
+    if let Some(stream) = stream {
+        stream.send_event(event.clone());
+    }
+    push_event(app, events, event);
 }
 
 fn tool_feedback(tool: &str, content: &str) -> ChatMessage {
@@ -4659,6 +5688,8 @@ fn tool_feedback(tool: &str, content: &str) -> ChatMessage {
         content: format!("[PLC Pilot 工具结果: {tool}]\n{content}"),
         images: Vec::new(),
         references: Vec::new(),
+        model_profile_id: None,
+        reasoning_effort: None,
         response_annotations: Vec::new(),
     }
 }
@@ -4676,10 +5707,9 @@ async fn discover_tools(servers: &[McpServerConfig], events: &mut Vec<AgentEvent
     for server in servers.iter().filter(|server| server.enabled) {
         match McpClient::new(server.clone()).list_tools().await {
             Ok(server_tools) => {
-                let usable = server_tools
-                    .into_iter()
-                    .filter(|tool| !is_forbidden_tool(&tool.name))
-                    .collect::<Vec<_>>();
+                // 高风险 CODESYS 工具仍要进入工具目录；默认模式由
+                // process_pi_tool_request 创建审批卡片，完全访问模式才直接执行。
+                let usable = server_tools;
                 events.push(AgentEvent::new(
                     &format!("mcp-{}", server.id),
                     "mcp",
@@ -4704,13 +5734,22 @@ async fn discover_tools(servers: &[McpServerConfig], events: &mut Vec<AgentEvent
 }
 
 fn tool_summary_from_mcp(tool: McpTool) -> ToolSummary {
+    let alias = if tool.server_id == BUILTIN_SERVER_ID { match tool.name.as_str() { "apply_patch" => Some("apply_patch"), "propose_write" => Some("write"), "exec_command" => Some("exec_command"), _ => None } } else { None };
+    let high_risk = is_forbidden_tool(&tool.name);
+    let mutating = tool.name.eq_ignore_ascii_case("propose_edit") || is_mutating_tool(&tool.name) || high_risk;
+    let risk = if high_risk { "高风险在线/进程操作" } else if mutating { "审批后修改" } else if tool.name.eq_ignore_ascii_case("exec_command") { "审批后执行" } else { "只读" };
+    let capabilities = if high_risk { vec!["online".to_string(), "write".to_string()] } else if mutating { vec!["write".to_string()] } else { vec!["read".to_string()] };
     ToolSummary {
-        qualified_name: qualify_tool(&tool.server_id, &tool.name),
+        qualified_name: alias.map(str::to_string).unwrap_or_else(|| qualify_tool(&tool.server_id, &tool.name)),
         server_id: tool.server_id.clone(),
-        name: tool.name.clone(),
+        name: alias.map(str::to_string).unwrap_or_else(|| tool.name.clone()),
         description: tool.description.clone(),
         input_schema: tool.input_schema.clone(),
-        mutating: tool.name.eq_ignore_ascii_case("propose_edit") || is_mutating_tool(&tool.name),
+        mutating,
+        source: if tool.server_id == BUILTIN_SERVER_ID { "PLC Pilot 内置".into() } else if tool.server_id == "pi" { "Pi".into() } else { format!("MCP：{}", tool.server_id) },
+        risk: risk.into(),
+        capabilities,
+        available: true,
     }
 }
 
@@ -5511,7 +6550,7 @@ fn builtin_diagnostics_result(
         "compiler_executed": false,
         "compiler_available": compiler.detected,
         "compiler": compiler.executable,
-        "target": "CODESYS 3.5.22",
+        "target": "CODESYS 3.5",
         "source_count": source_count,
         "diagnostics": diagnostics,
         "note": "当前结果是桌面层静态 IEC 61131-3 结构诊断，未执行 CODESYS 目标编译器。",
@@ -5548,11 +6587,18 @@ async fn call_builtin_tool(
             &read_builtin_source(&project, &arguments)?,
             false,
         )),
+        "read_document" => {
+            let requested = arguments["path"].as_str().ok_or_else(|| AppError::Project("read_document 需要 path。".into()))?;
+            let (path, _) = resolve_project_file(&project, requested, false)?;
+            let file = attachments::read_local_file(&path).map_err(AppError::Project)?;
+            if let Some(error) = file.error { return Err(AppError::Project(error)); }
+            Ok(json_content(&json!({"name":file.name,"size":file.size,"mime_type":file.mime_type,"text":file.text_content}), false))
+        }
         "search_project" => Ok(json_content(
             &search_builtin_project(&project, &arguments)?,
             false,
         )),
-        "compile_project" => builtin_diagnostics_result(&project, "static_compile"),
+        "compile_project" => Err(AppError::Mcp("真实 CODESYS 编译需要启用一个 CODESYS MCP 服务；请先在 MCP 设置中连接并重新发现工具。静态结构检查请使用 diagnostics。".into())),
         "diagnostics" => builtin_diagnostics_result(&project, "diagnostics"),
         "propose_edit" => Err(AppError::Mcp(
             "propose_edit 必须通过 Agent 审批流程调用，不能直接执行".to_string(),
@@ -5648,6 +6694,9 @@ async fn propose_builtin_edit(
     };
     let stored_arguments = json!({
         "path": relative,
+        "project_path": project.path,
+        "cwd": agent_cwd(&project),
+        "session_file": state.inner.lock().await.session.session_file,
         "before": before,
         "after": after,
         "thread_id": state.inner.lock().await.session.session_id,
@@ -5672,7 +6721,9 @@ async fn apply_builtin_pending_change(
     state: &AppState,
     pending: &PendingChange,
 ) -> Result<ToolCallResult, AppError> {
-    let project = state.inner.lock().await.project.clone();
+    if matches!(pending.summary.tool_name.as_str(), "apply_patch" | "propose_write") { return generic_tools::apply_patch(pending); }
+    if pending.summary.tool_name == "exec_command" { return Err(AppError::Configuration("请在桌面审批卡片中确认命令。".into())); }
+    let project = if let Some(path) = pending.arguments.get("project_path").and_then(Value::as_str) { resolve_project_path(path)? } else { state.inner.lock().await.project.clone() };
     let requested = pending
         .arguments
         .get("path")
@@ -5756,6 +6807,195 @@ async fn call_model(
         }
         ProviderKind::Ollama => call_ollama(&client, config, system, messages, tools).await,
     }
+}
+
+fn network_error_status(error: &AppError) -> Option<u16> {
+    let AppError::Network(message) = error else {
+        return None;
+    };
+    message
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|token| token.len() == 3)
+        .filter_map(|token| token.parse::<u16>().ok())
+        .find(|status| (400..=599).contains(status))
+}
+
+fn network_error_retry_after_ms(error: &AppError) -> Option<u64> {
+    let AppError::Network(message) = error else {
+        return None;
+    };
+    let lower = message.to_ascii_lowercase();
+    let (marker, multiplier) = if let Some(index) = lower.find("retry-after-ms:") {
+        (&message[index + "retry-after-ms:".len()..], 1.0)
+    } else if let Some(index) = lower.find("retry-after:") {
+        (&message[index + "retry-after:".len()..], 1_000.0)
+    } else {
+        return None;
+    };
+    let raw = marker
+        .trim_start()
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find(|value| !value.is_empty())?;
+    let value = raw.parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    Some((value * multiplier).round() as u64)
+}
+
+fn is_retryable_network_error(error: &AppError) -> bool {
+    if let Some(status) = network_error_status(error) {
+        return matches!(status, 404 | 408 | 409 | 429) || (500..=599).contains(&status);
+    }
+    let AppError::Network(message) = error else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "connection",
+        "network",
+        "dns",
+        "fetch",
+        "reset",
+        "broken pipe",
+        "connection refused",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn retry_delay_ms(error: &AppError, retry_attempt: usize) -> u64 {
+    if let Some(server_delay) = network_error_retry_after_ms(error) {
+        return server_delay.min(MAX_MODEL_RETRY_DELAY_MS);
+    }
+    let exponent = 1_u64 << retry_attempt.saturating_sub(1).min(6);
+    let raw = MODEL_RETRY_BASE_DELAY_MS
+        .saturating_mul(exponent)
+        .min(MAX_MODEL_RETRY_DELAY_MS);
+    // 90% 到 110% 的有限抖动，避免多个桌面实例在同一时刻重新请求。
+    let jitter_permille = 900
+        + SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::from(duration.subsec_millis()) % 201)
+            .unwrap_or(100);
+    raw.saturating_mul(jitter_permille) / 1_000
+}
+
+fn retry_error_reason(error: &AppError) -> String {
+    network_error_status(error)
+        .map(|status| format!("HTTP {status}"))
+        .unwrap_or_else(|| "连接或超时".to_string())
+}
+
+fn format_retry_delay(delay_ms: u64) -> String {
+    if delay_ms >= 1_000 {
+        format!("{:.1} 秒", delay_ms as f64 / 1_000.0)
+    } else {
+        format!("{delay_ms} 毫秒")
+    }
+}
+
+async fn call_model_with_retry(
+    app: &AppHandle,
+    state: &AppState,
+    config: &ModelConfig,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[McpTool],
+    events: &mut Vec<AgentEvent>,
+) -> Result<ModelResponse, AppError> {
+    for attempt in 0..=MAX_MODEL_RETRIES {
+        if state.abort_requested.load(Ordering::SeqCst) {
+            return Err(AppError::Internal("当前 Agent 任务已中止".to_string()));
+        }
+        match call_model(config, system, messages, tools).await {
+            Ok(response) => {
+                if attempt > 0 {
+                    let title = format!("模型请求重试完成（第 {attempt}/{MAX_MODEL_RETRIES} 次）");
+                    let detail = "后续模型请求已恢复。".to_string();
+                    push_event(
+                        app,
+                        events,
+                        AgentEvent::retry(
+                            title,
+                            detail,
+                            "done",
+                            attempt,
+                            MAX_MODEL_RETRIES,
+                            0,
+                            None,
+                        ),
+                    );
+                }
+                return Ok(response);
+            }
+            Err(error) if attempt < MAX_MODEL_RETRIES && is_retryable_network_error(&error) => {
+                let retry_attempt = attempt + 1;
+                let delay_ms = retry_delay_ms(&error, retry_attempt);
+                let status_code = network_error_status(&error);
+                let title = format!("模型请求重试：第 {retry_attempt}/{MAX_MODEL_RETRIES} 次");
+                let detail = format!(
+                    "{}，等待 {} 后再次请求。{}",
+                    retry_error_reason(&error),
+                    format_retry_delay(delay_ms),
+                    match &error {
+                        AppError::Network(message) => format!("原因：{}", truncate(message, 360)),
+                        _ => String::new(),
+                    }
+                );
+                push_event(
+                    app,
+                    events,
+                    AgentEvent::retry(
+                        title,
+                        detail,
+                        "running",
+                        retry_attempt,
+                        MAX_MODEL_RETRIES,
+                        delay_ms,
+                        status_code,
+                    ),
+                );
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(delay_ms)) => {}
+                    _ = wait_for_abort(state) => {
+                        return Err(AppError::Internal("当前 Agent 任务已中止，后续重试已停止".to_string()));
+                    }
+                }
+            }
+            Err(error) => {
+                if attempt > 0 {
+                    let title =
+                        format!("模型请求重试已耗尽（第 {attempt}/{MAX_MODEL_RETRIES} 次）");
+                    let detail = format!(
+                        "{}仍未恢复。{}",
+                        retry_error_reason(&error),
+                        match &error {
+                            AppError::Network(message) => truncate(message, 360),
+                            _ => error.to_string(),
+                        }
+                    );
+                    push_event(
+                        app,
+                        events,
+                        AgentEvent::retry(
+                            title,
+                            detail,
+                            "error",
+                            attempt,
+                            MAX_MODEL_RETRIES,
+                            0,
+                            network_error_status(&error),
+                        ),
+                    );
+                }
+                return Err(error);
+            }
+        }
+    }
+    Err(AppError::Internal("模型请求重试状态异常".to_string()))
 }
 
 async fn call_responses(
@@ -6397,14 +7637,27 @@ async fn send_json(
         .await
         .map_err(|error| AppError::Network(error.to_string()))?;
     let status = response.status();
+    // reqwest 会在读取 body 后丢失响应头；先把 Retry-After 复制到错误文本，
+    // 后面的统一重试策略才能在不携带响应对象的情况下优先使用服务端等待时间。
+    let retry_after = response
+        .headers()
+        .get("retry-after-ms")
+        .or_else(|| response.headers().get("retry-after"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let text = response
         .text()
         .await
         .map_err(|error| AppError::Network(error.to_string()))?;
     if !status.is_success() {
+        let retry_hint = retry_after
+            .as_deref()
+            .map(|value| format!(" [Retry-After: {value}]"))
+            .unwrap_or_default();
         return Err(AppError::Network(format!(
-            "HTTP {}：{}",
+            "HTTP {}{}：{}",
             status.as_u16(),
+            retry_hint,
             truncate(&text, 600)
         )));
     }
@@ -6568,6 +7821,8 @@ fn builtin_skill_content(id: &str) -> Option<&'static str> {
         "codesys-agent" => Some(CODESYS_SKILL),
         "plc-safety" => Some(PLC_SAFETY_SKILL),
         "iec61131-st" => Some(IEC_ST_SKILL),
+        "codesys-debugging" => Some(CODESYS_DEBUGGING_SKILL),
+        "plc-commissioning" => Some(PLC_COMMISSIONING_SKILL),
         _ => None,
     }
 }
@@ -6583,6 +7838,8 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
     state.inner.lock().await.project = synced_project;
     let guard = state.inner.lock().await;
     let model = model_summary(&guard.model);
+    let models = guard.models.iter().map(model_summary).collect::<Vec<_>>();
+    let active_model_id = guard.active_model_id.clone();
     let project = guard.project.clone();
     let projects = guard.projects.clone();
     let pending_changes = guard
@@ -6602,6 +7859,8 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
         app_version: APP_VERSION.to_string(),
         config_directory: app_data_root().to_string_lossy().into_owned(),
         model,
+        models,
+        active_model_id,
         mcp_servers,
         project,
         projects,
@@ -6622,11 +7881,31 @@ fn model_summary(config: &ModelConfig) -> ModelSummary {
         .map(str::trim)
         .is_some_and(|key| !key.is_empty());
     ModelSummary {
+        id: config.id.clone(),
+        name: if config.name.trim().is_empty() {
+            config.model.clone()
+        } else {
+            config.name.clone()
+        },
         provider: config.provider.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
         configured: api_key_configured || matches!(config.provider, ProviderKind::Ollama),
         api_key_configured,
+        context_window: config.context_window,
+        max_tokens: config.max_tokens,
+        reasoning_levels: config.reasoning_levels.clone(),
+        enabled: config.enabled,
+        is_default: config.is_default,
+        last_error: config.last_error.clone(),
+        last_checked_at: config.last_checked_at.clone(),
+        connection_status: if config.last_checked_at.is_none() {
+            "unchecked".to_string()
+        } else if config.last_error.is_some() {
+            "error".to_string()
+        } else {
+            "connected".to_string()
+        },
     }
 }
 
@@ -6648,16 +7927,26 @@ fn apply_saved_model_key(mut config: ModelConfig, current: &ModelConfig) -> Mode
 }
 
 async fn model_config_with_saved_key(config: ModelConfig, state: &AppState) -> ModelConfig {
-    let current = state.inner.lock().await.model.clone();
+    let guard = state.inner.lock().await;
+    let current = config
+        .id
+        .trim()
+        .is_empty()
+        .then(|| guard.model.clone())
+        .or_else(|| {
+            guard
+                .models
+                .iter()
+                .find(|model| model.id == config.id)
+                .cloned()
+        })
+        .unwrap_or_else(|| guard.model.clone());
     apply_saved_model_key(config, &current)
 }
 
 fn now_iso() -> String {
-    // 不额外引入时间库；对 UI 来说单调的 Unix 秒值足够用于“最近检查”排序。
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+    // Pi 会话头部需要 ISO 时间；Unix 秒字符串无法被桌面日期组件可靠解析。
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn mcp_transport(server: &McpServerConfig) -> String {
@@ -6786,6 +8075,13 @@ fn available_commands() -> Vec<CommandSummary> {
             "safety",
             true,
         ),
+        (
+            "/plan",
+            "计划模式",
+            "以只读方式整理本轮执行计划",
+            "session",
+            true,
+        ),
     ]
     .into_iter()
     .map(
@@ -6905,20 +8201,10 @@ fn scan_project_context(mut project: ProjectContext) -> ProjectContext {
 }
 
 fn parse_skill_frontmatter(content: &str, fallback_id: &str) -> (String, String) {
-    let mut name = fallback_id.replace(['-', '_'], " ");
-    let mut description = "用户提供的工程 Skill".to_string();
-    for line in content.lines().take(30) {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim().trim_matches(['"', '\'']);
-        match key.trim().to_lowercase().as_str() {
-            "name" if !value.is_empty() => name = value.to_string(),
-            "description" if !value.is_empty() => description = value.to_string(),
-            _ => {}
-        }
-    }
-    (name, description)
+    let normalized = content.replace("\r\n", "\n");
+    let header = normalized.strip_prefix("---\n").and_then(|body| body.split_once("\n---")).map(|(header, _)| header);
+    let parsed = header.and_then(|header| serde_yaml::from_str::<Value>(header).ok()).unwrap_or_default();
+    (parsed["name"].as_str().filter(|value| !value.trim().is_empty()).map(str::to_string).unwrap_or_else(|| fallback_id.replace(['-', '_'], " ")), parsed["description"].as_str().filter(|value| !value.trim().is_empty()).unwrap_or("用户提供的工程 Skill").to_string())
 }
 
 fn discover_skills(project: &ProjectContext) -> Vec<SkillSummary> {
@@ -6974,6 +8260,7 @@ fn discover_skills(project: &ProjectContext) -> Vec<SkillSummary> {
             });
         }
     }
+    settings::apply_skill_preferences(&mut result);
     result
 }
 
@@ -7001,11 +8288,14 @@ fn list_session_records() -> Vec<SessionRecord> {
         }
     }
     records.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
-    records.truncate(30);
     records
 }
 
 fn parse_session_record(path: &Path) -> Option<SessionRecord> {
+    parse_session_record_with_mode(path, true)
+}
+
+fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionRecord> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut session_id = path
         .file_stem()
@@ -7014,7 +8304,11 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
         .to_string();
     let mut name = None;
     let mut cwd = None;
+    let mut model_profile_id = None;
+    let mut reasoning_effort = None;
     let mut messages = Vec::new();
+    let mut ui_turns: Vec<Value> = Vec::new();
+    let mut activities: Vec<Value> = Vec::new();
     const RESPONSE_ANNOTATION_ENTRY: &str = "plc-pilot.response-text-annotations";
     for line in content.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -7035,6 +8329,25 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
             }
+            Some("custom")
+                if entry
+                    .get("customType")
+                    .or_else(|| entry.get("custom_type"))
+                    .and_then(Value::as_str)
+                    == Some("plc-pilot.model-profile") =>
+            {
+                model_profile_id = entry
+                    .get("data")
+                    .and_then(|data| data.get("profile_id"))
+                    .or_else(|| entry.get("data").and_then(|data| data.get("profileId")))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                reasoning_effort = entry
+                    .get("data")
+                    .and_then(|data| data.get("reasoning_effort"))
+                    .and_then(Value::as_str)
+                    .map(|value| if value == "off" { "none" } else { value }.to_string());
+            }
             Some("message") => {
                 let Some(message) = entry.get("message") else {
                     continue;
@@ -7054,19 +8367,29 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
                         serde_json::from_value::<Vec<ResponseTextAnnotation>>(value).ok()
                     })
                     .unwrap_or_default();
+                if role == "assistant" && message.get("stopReason").and_then(Value::as_str) == Some("toolUse") { continue; }
                 if text.trim().is_empty() && images.is_empty() && response_annotations.is_empty() {
                     continue;
                 }
-                if messages.len() >= MAX_SESSION_PREVIEW_MESSAGES {
+                if preview && messages.len() >= MAX_SESSION_PREVIEW_MESSAGES {
                     messages.remove(0);
                 }
                 messages.push(ChatMessage {
                     role: role.to_string(),
-                    content: truncate(&text, MAX_SESSION_PREVIEW_CHARS),
+                    content: if preview { truncate(&text, MAX_SESSION_PREVIEW_CHARS) } else { text },
                     images,
                     references: Vec::new(),
+                    model_profile_id: model_profile_id.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
                     response_annotations,
                 });
+            }
+            Some("custom") if matches!(entry.get("customType").and_then(Value::as_str), Some("plc-pilot.ui-turn" | "plc-pilot.activity")) => {
+                if !preview {
+                    let data = entry.get("data").cloned().unwrap_or_default();
+                    let target = if entry["customType"] == "plc-pilot.ui-turn" { &mut ui_turns } else { &mut activities };
+                    if let Some(existing) = target.iter_mut().find(|current| current["turn_index"] == data["turn_index"] && current["event"]["id"] == data["event"]["id"]) { *existing = data; } else { target.push(data); }
+                }
             }
             Some("custom")
                 if entry
@@ -7128,7 +8451,11 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
         path: path.to_string_lossy().to_string(),
         message_count,
         cwd,
+        model_profile_id,
+        reasoning_effort,
         messages,
+        ui_turns,
+        activities,
         modified_at,
     })
 }
@@ -7287,6 +8614,7 @@ async fn inspect_mcp_servers(servers: &[McpServerConfig]) -> (Vec<McpSummary>, V
             }),
         }
     }
+    if let Ok(tools) = serde_json::from_str::<Vec<ToolSummary>>(include_str!("../../agent-host/tool-catalog.json")) { all_tools.extend(tools); }
     (result, all_tools)
 }
 
@@ -7319,6 +8647,208 @@ fn builtin_skills() -> Vec<SkillSummary> {
             path: None,
             content_available: true,
         },
+        SkillSummary {
+            id: "codesys-debugging".to_string(),
+            name: "CODESYS 诊断与编译".to_string(),
+            description: "区分工程扫描、编译、Bridge 和运行时诊断，优先真实编译器。".to_string(),
+            enabled: true,
+            scope: "builtin".to_string(),
+            path: None,
+            content_available: true,
+        },
+        SkillSummary {
+            id: "plc-commissioning".to_string(),
+            name: "PLC 投运与交付".to_string(),
+            description: "按可回退、失效安全和人工审批约束设计投运步骤。".to_string(),
+            enabled: true,
+            scope: "builtin".to_string(),
+            path: None,
+            content_available: true,
+        },
+    ]
+}
+
+/// 免费官方/社区 MCP 目录。目录项保持为可审计的固定清单，安装时仍由本机
+/// 包管理器获取真实包；每个社区实现都标注来源、许可证和 CODESYS 运行前提。
+fn mcp_catalog_entries() -> Vec<McpCatalogEntry> {
+    let command = if cfg!(windows) { "npx.cmd" } else { "npx" };
+    vec![
+        McpCatalogEntry {
+            id: "official-filesystem".into(),
+            name: "Filesystem（官方）".into(),
+            description: "官方 MCP 文件系统服务，安装后限制在当前 PLC 工程目录。".into(),
+            source: "github.com/modelcontextprotocol/servers".into(),
+            license: "SEE LICENSE IN LICENSE".into(),
+            package: "@modelcontextprotocol/server-filesystem".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into(), ".".into()],
+            transport: "stdio".into(),
+            requires_workspace: true,
+            requires_credentials: false,
+            requires_codesys: false,
+            notes: "只读文件系统能力；安装后由当前工作区路径约束。".into(),
+        },
+        McpCatalogEntry {
+            id: "official-memory".into(),
+            name: "Memory（官方）".into(),
+            description: "官方 MCP 知识图谱记忆服务，适合保存工程术语和维护笔记。".into(),
+            source: "github.com/modelcontextprotocol/servers".into(),
+            license: "SEE LICENSE IN LICENSE".into(),
+            package: "@modelcontextprotocol/server-memory".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "@modelcontextprotocol/server-memory".into()],
+            transport: "stdio".into(),
+            requires_workspace: false,
+            requires_credentials: false,
+            requires_codesys: false,
+            notes: "本地知识图谱服务；不接触 PLC。".into(),
+        },
+        McpCatalogEntry {
+            id: "official-sequential-thinking".into(),
+            name: "Sequential Thinking（官方）".into(),
+            description: "官方 MCP 结构化推理服务，用于拆解复杂 PLC 诊断任务。".into(),
+            source: "github.com/modelcontextprotocol/servers".into(),
+            license: "SEE LICENSE IN LICENSE".into(),
+            package: "@modelcontextprotocol/server-sequential-thinking".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "@modelcontextprotocol/server-sequential-thinking".into()],
+            transport: "stdio".into(),
+            requires_workspace: false,
+            requires_credentials: false,
+            requires_codesys: false,
+            notes: "本地结构化思考辅助；不接触 PLC。".into(),
+        },
+        McpCatalogEntry {
+            id: "official-everything".into(),
+            name: "Everything（官方示例）".into(),
+            description: "官方 MCP 综合示例服务，用于验证工具发现、资源和提示词协议。".into(),
+            source: "github.com/modelcontextprotocol/servers".into(),
+            license: "SEE LICENSE IN LICENSE".into(),
+            package: "@modelcontextprotocol/server-everything".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "@modelcontextprotocol/server-everything".into()],
+            transport: "stdio".into(),
+            requires_workspace: false,
+            requires_credentials: false,
+            requires_codesys: false,
+            notes: "官方协议综合示例；用于验证 MCP 能力。".into(),
+        },
+        McpCatalogEntry {
+            id: "official-puppeteer".into(),
+            name: "Puppeteer（官方）".into(),
+            description: "官方 MCP 浏览器自动化服务；仅用于文档和本地页面验证，不直接控制 PLC。".into(),
+            source: "github.com/modelcontextprotocol/servers".into(),
+            license: "MIT".into(),
+            package: "@modelcontextprotocol/server-puppeteer".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "@modelcontextprotocol/server-puppeteer".into()],
+            transport: "stdio".into(),
+            requires_workspace: false,
+            requires_credentials: false,
+            requires_codesys: false,
+            notes: "浏览器自动化仅用于文档和页面验证；不直接控制 PLC。".into(),
+        },
+        McpCatalogEntry {
+            id: "community-context7".into(),
+            name: "Context7（社区）".into(),
+            description: "社区维护的开发文档检索 MCP，可辅助查阅 CODESYS 周边 SDK 和工程文档；不直接控制 PLC。".into(),
+            source: "github.com/upstash/context7".into(),
+            license: "MIT".into(),
+            package: "@upstash/context7-mcp".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "@upstash/context7-mcp".into()],
+            transport: "stdio".into(),
+            requires_workspace: false,
+            requires_credentials: false,
+            requires_codesys: false,
+            notes: "开发文档检索服务；不接触 PLC。".into(),
+        },
+        McpCatalogEntry {
+            id: "community-codesys-toolkit".into(),
+            name: "CODESYS MCP Toolkit（社区）".into(),
+            description: "社区 TypeScript MCP 服务，覆盖项目、POU、代码编辑和编译。".into(),
+            source: "github.com/johannesPettersson80/codesys-mcp-toolkit".into(),
+            license: "MIT".into(),
+            package: "@codesys/mcp-toolkit".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "@codesys/mcp-toolkit".into()],
+            transport: "stdio".into(),
+            requires_workspace: true,
+            requires_credentials: false,
+            requires_codesys: true,
+            notes: "需要填写 CODESYS.exe 路径和 Profile；默认只在用户审批后执行写入。".into(),
+        },
+        McpCatalogEntry {
+            id: "community-codesys-sp21".into(),
+            name: "CODESYS MCP SP21+（社区）".into(),
+            description: "面向 CODESYS SP21+ 的社区 fork，包含脚本引擎兼容修复。".into(),
+            source: "github.com/phobicdotno/Codesys-MCP-SP21-plus".into(),
+            license: "MIT".into(),
+            package: "codesys-mcp-sp21-plus".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "codesys-mcp-sp21-plus".into(), "--mode".into(), "headless".into()],
+            transport: "stdio".into(),
+            requires_workspace: true,
+            requires_credentials: false,
+            requires_codesys: true,
+            notes: "适用于 SP21+；仍需配置本机 CODESYS 路径和 Profile。".into(),
+        },
+        McpCatalogEntry {
+            id: "community-codesys-sp21-ch".into(),
+            name: "CODESYS MCP SP21+ 中文版（社区）".into(),
+            description: "社区中文友好 fork，增强 UTF-8 和中文 POU 往返处理。".into(),
+            source: "github.com/Limhslog/Codesys-MCP-SP21-plus-ch".into(),
+            license: "MIT".into(),
+            package: "codesys-mcp-sp21-plus-ch".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "codesys-mcp-sp21-plus-ch".into(), "--mode".into(), "headless".into()],
+            transport: "stdio".into(),
+            requires_workspace: true,
+            requires_credentials: false,
+            requires_codesys: true,
+            notes: "适合中文工程；与 SP21+ fork 二选一，需配置 CODESYS 路径和 Profile。".into(),
+        },
+        McpCatalogEntry {
+            id: "community-festo-codesys".into(),
+            name: "Festo CODESYS MCP（社区）".into(),
+            description: "社区维护的 PLC 工程知识、ST/PLCopen XML 校验和可选 IDE 驱动服务。".into(),
+            source: "github.com/efranceschetti/festo-codesys-mcp".into(),
+            license: "MIT".into(),
+            package: "festo-codesys-mcp".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "festo-codesys-mcp".into()],
+            transport: "stdio".into(),
+            requires_workspace: true,
+            requires_credentials: false,
+            requires_codesys: false,
+            notes: "离线知识和校验无需 CODESYS；ide_* 能力需要额外配置路径和 Profile。".into(),
+        },
+        McpCatalogEntry {
+            id: "community-codesys-persistent".into(),
+            name: "CODESYS Persistent MCP（社区）".into(),
+            description: "保持 CODESYS UI 常驻并通过文件 IPC 执行工具的社区实现。".into(),
+            source: "github.com/luke-harriman/Codesys-MCP".into(),
+            license: "MIT".into(),
+            package: "@iflow-mcp/luke-harriman-codesys-mcp".into(),
+            command: command.into(),
+            args: vec!["-y".into(), "@iflow-mcp/luke-harriman-codesys-mcp".into(), "--mode".into(), "headless".into()],
+            transport: "stdio".into(),
+            requires_workspace: true,
+            requires_credentials: false,
+            requires_codesys: true,
+            notes: "SP19/SP20 可用 persistent；SP21+ 建议 headless 或 SP21+ fork。".into(),
+        },
+    ]
+}
+
+fn skill_catalog_entries(project: &ProjectContext) -> Vec<SkillCatalogEntry> {
+    let installed = discover_skills(project).into_iter().map(|skill| skill.id).collect::<HashSet<_>>();
+    vec![
+        SkillCatalogEntry { id: "codesys-agent".into(), name: "CODESYS 工程工作流".into(), description: "先探查、再 Diff、审批后写入，最后编译诊断。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("codesys-agent"), free: true },
+        SkillCatalogEntry { id: "plc-safety".into(), name: "PLC 安全审查".into(), description: "检查扫描周期、互锁、状态机和失效安全边界。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("plc-safety"), free: true },
+        SkillCatalogEntry { id: "iec61131-st".into(), name: "IEC 61131-3 Structured Text".into(), description: "遵循 CODESYS ST 类型、库和实例生命周期约定。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("iec61131-st"), free: true },
+        SkillCatalogEntry { id: "codesys-debugging".into(), name: "CODESYS 诊断与编译".into(), description: "区分工程扫描、编译、Bridge 和运行时诊断，优先真实编译器。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("codesys-debugging"), free: true },
+        SkillCatalogEntry { id: "plc-commissioning".into(), name: "PLC 投运与交付".into(), description: "按可回退、失效安全和人工审批约束设计投运步骤。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("plc-commissioning"), free: true },
     ]
 }
 
@@ -7374,15 +8904,12 @@ fn build_system_prompt(project: &ProjectContext) -> String {
         ),
         _ => "当前没有可读取的前台 CODESYS 编辑器；不要猜测用户正在查看的 POU。".to_string(),
     };
-    let mut skill_sections = vec![
-        CODESYS_SKILL.to_string(),
-        PLC_SAFETY_SKILL.to_string(),
-        IEC_ST_SKILL.to_string(),
-    ];
+    let mut skill_sections = Vec::new();
     for skill in discover_skills(project)
         .into_iter()
-        .filter(|skill| skill.scope != "builtin")
+        .filter(|skill| skill.enabled)
     {
+        if let Some(content) = builtin_skill_content(&skill.id) { skill_sections.push(content.to_string()); continue; }
         if let Some(path) = skill.path {
             if let Ok(content) = std::fs::read_to_string(path) {
                 skill_sections.push(truncate(&content, 12000));
@@ -7390,21 +8917,51 @@ fn build_system_prompt(project: &ProjectContext) -> String {
         }
     }
     format!(
-        "你是 PLC Pilot，一个面向 CODESYS 3.5.22（SP22）的本地工程 Agent。\n\n{project_line}\n{location_line}\n{scan_line}\n{editor_line}\n\n强制边界：\n- 先读取工程上下文，再提出修改。\n- 任何写代码、删除、重命名、安装库、覆盖工程的工具调用必须等待用户审批。\n- 默认禁止 PLC 下载、RUN/STOP、在线写变量、Force/Unforce、Reset 和任意 Shell。\n- 不能把未连接的 CODESYS 或未完成的编译说成已完成。\n- 生成 Structured Text 时遵循扫描周期、互锁、状态机和失效安全要求。\n- 每次回答先给结论，再列已执行工具、证据、风险和下一步。\n\n已加载 Skills：\n{}",
+        "你是 PLC Pilot，一个面向 CODESYS 3.5 的本地工程 Agent；具体 Service Pack 以当前检测到的 Profile 为准。\n\n{project_line}\n{location_line}\n{scan_line}\n{editor_line}\n\n强制边界：\n- 先读取工程上下文，再提出修改。\n- 任何写代码、删除、重命名、安装库、覆盖工程的工具调用必须等待用户审批。\n- 默认禁止 PLC 下载、RUN/STOP、在线写变量、Force/Unforce、Reset。\n- PowerShell 命令只能通过 exec_command 或 powershell 提交，等待用户审批后执行。\n- 不能把未连接的 CODESYS 或未完成的编译说成已完成。\n- 生成 Structured Text 时遵循扫描周期、互锁、状态机和失效安全要求。\n- 每次回答先给结论，再列已执行工具、证据、风险和下一步。\n\n已加载 Skills：\n{}",
         skill_sections.join("\n\n")
     )
 }
 
 /// 将本轮输入区的临时选项合并到持久化模型配置，避免用户切换下拉框后仍悄悄使用旧模型。
-fn model_for_request(base: &ModelConfig, request: &AgentRequest) -> Result<ModelConfig, AppError> {
-    let mut model = base.clone();
-    if let Some(requested) = request
-        .model
+fn model_profile_for_request(
+    state: &RuntimeState,
+    request: &AgentRequest,
+) -> Result<ModelConfig, AppError> {
+    if let Some(profile_id) = request
+        .model_profile_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        model.model = requested.to_string();
+        return state
+            .models
+            .iter()
+            .find(|model| model.id == profile_id && model.enabled)
+            .cloned()
+            .ok_or_else(|| AppError::Configuration("所选模型不存在或已停用".to_string()));
+    }
+    Ok(state.model.clone())
+}
+
+fn model_for_request(base: &ModelConfig, request: &AgentRequest) -> Result<ModelConfig, AppError> {
+    let mut model = base.clone();
+    // profile ID 同时绑定 URL、Key、上下文和模型 ID。只有旧客户端没有发送
+    // profile ID 时才接受裸模型字符串覆盖，避免同名模型误用另一套凭据。
+    if request
+        .model_profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        if let Some(requested) = request
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            model.model = requested.to_string();
+        }
     }
     if model.model.trim().is_empty() {
         return Err(AppError::Configuration("本轮模型名称不能为空".to_string()));
@@ -7488,6 +9045,7 @@ fn build_agent_system_prompt(project: &ProjectContext, request: &AgentRequest) -
                 .trim()
                 .strip_prefix("builtin://")
                 .unwrap_or_else(|| selected_value.trim());
+            if !known_skills.iter().any(|skill| skill.enabled && (skill.id == selected_id || skill.path.as_deref() == Some(selected_value.trim()))) { continue; }
             let content = builtin_skill_content(selected_id)
                 .map(str::to_string)
                 .or_else(|| {
@@ -7558,6 +9116,7 @@ fn split_qualified_tool(value: &str) -> Option<(String, String)> {
 }
 
 fn is_mutating_tool(name: &str) -> bool {
+    if name == "exec_command" { return true; }
     let name = name.to_lowercase();
     [
         "write",
@@ -7585,16 +9144,21 @@ fn is_forbidden_tool(name: &str) -> bool {
     [
         "download",
         "deploy",
+        "connect_to_device",
+        "disconnect_from_device",
         "login",
         "logout",
         "plc_run",
         "plc_start",
         "plc_stop",
         "reset",
+        "reset_controller",
         "force",
         "unforce",
         "write_variable",
         "online_write",
+        "start_stop_application",
+        "set_credentials",
         "shell",
         "ironpython",
         "execute_script",
@@ -7644,13 +9208,40 @@ fn detect_codesys_installation() -> CodesysStatus {
         r"C:\Program Files\CODESYS 3.5.22.0\CODESYS\Common\CODESYS.exe",
     ));
     let executable = candidates.into_iter().find(|path| path.is_file());
+    let profile = executable.as_ref().and_then(|path| codesys_profile_for_executable(path));
+    let supported_version = profile.as_deref().map(codesys_version_label).unwrap_or_else(|| "CODESYS 3.5（未检测 Profile）".into());
     CodesysStatus {
         detected: executable.is_some(),
         executable: executable.and_then(|path| path.to_str().map(str::to_string)),
-        supported_version: "CODESYS SP22".to_string(),
-        note: "检测到安装目录不等于工程已连接；当前工程路径和源代码由 ScriptEngine Bridge 同步。"
+        supported_version,
+        profile,
+        note: "检测到安装目录不等于工程已连接；真实工程操作会在本轮按需启动 ScriptEngine 并完成握手。"
             .to_string(),
     }
+}
+
+fn codesys_profile_for_executable(executable: &Path) -> Option<String> {
+    let profiles = executable.parent()?.parent()?.join("Profiles");
+    let mut values = fs::read_dir(profiles).ok()?.filter_map(Result::ok).filter_map(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("xml") && path.to_string_lossy().to_ascii_lowercase().ends_with(".profile.xml") {
+            path.file_name().map(|value| value.to_string_lossy().trim_end_matches(".profile.xml").to_string())
+        } else { None }
+    }).collect::<Vec<_>>();
+    values.sort_by_key(|value| version_key(value));
+    values.pop()
+}
+
+fn version_key(value: &str) -> Vec<u64> {
+    value.split(|character: char| !character.is_ascii_digit()).filter(|part| !part.is_empty()).filter_map(|part| part.parse::<u64>().ok()).collect()
+}
+
+fn codesys_version_label(profile: &str) -> String {
+    if let Some(position) = profile.to_ascii_lowercase().find("sp") {
+        let suffix = &profile[position..];
+        return format!("CODESYS {}", suffix);
+    }
+    "CODESYS 3.5".into()
 }
 
 fn codesys_bridge_snapshot_path() -> PathBuf {
@@ -7757,7 +9348,7 @@ fn sync_project_from_codesys(current: ProjectContext) -> ProjectContext {
                 version: snapshot
                     .codesys_version
                     .clone()
-                    .or_else(|| Some("SP22（目标版本）".to_string())),
+                    .or_else(|| Some(detect_codesys_installation().supported_version)),
                 exists,
                 extension,
                 active_object: snapshot.active_object.clone(),
@@ -7805,10 +9396,6 @@ fn sync_project_from_codesys(current: ProjectContext) -> ProjectContext {
     current
 }
 
-fn emit_event(app: &AppHandle, event: AgentEvent) {
-    let _ = app.emit("agent-event", event);
-}
-
 impl AgentEvent {
     fn new(
         id: &str,
@@ -7825,12 +9412,136 @@ impl AgentEvent {
             detail,
             status: status.to_string(),
             tool,
+            retry_attempt: None,
+            retry_max_attempts: None,
+            retry_delay_ms: None,
+            retry_status: None,
         }
+    }
+
+    fn retry(
+        title: String,
+        detail: String,
+        status: &str,
+        attempt: usize,
+        max_attempts: usize,
+        delay_ms: u64,
+        status_code: Option<u16>,
+    ) -> Self {
+        let mut event = Self::new(
+            &format!("retry-{}", Uuid::new_v4()),
+            "retry",
+            &title,
+            Some(detail),
+            status,
+            None,
+        );
+        event.retry_attempt = u32::try_from(attempt).ok();
+        event.retry_max_attempts = u32::try_from(max_attempts).ok();
+        event.retry_delay_ms = Some(delay_ms);
+        event.retry_status = status_code;
+        event
     }
 }
 
 struct McpClient {
     config: McpServerConfig,
+}
+
+/// 一次 Agent 轮次内复用的 MCP 会话。
+///
+/// 旧实现每次工具调用都会重新启动 MCP、initialize、tools/call，再立即杀掉进程，
+/// 导致 CODESYS 工程状态、打开项目和 ScriptEngine 上下文全部丢失。该会话只在
+/// 当前 Agent 轮次的 registry 中存在，轮次结束由 shutdown_all 释放，不形成常驻进程。
+struct McpSession {
+    child: Mutex<Child>,
+    stdin: Mutex<ChildStdin>,
+    stdout: Mutex<BufReader<ChildStdout>>,
+    request_lock: Mutex<()>,
+    next_id: AtomicU64,
+}
+
+#[derive(Default)]
+struct McpSessionRegistry {
+    sessions: Mutex<HashMap<String, Arc<McpSession>>>,
+}
+
+impl McpSession {
+    async fn start(config: &McpServerConfig) -> Result<Self, AppError> {
+        let mut child = spawn_mcp(config).await?;
+        let stdin = child.stdin.take().ok_or_else(|| AppError::Mcp("MCP stdin 不可用".into()))?;
+        let stdout = child.stdout.take().ok_or_else(|| AppError::Mcp("MCP stdout 不可用".into()))?;
+        let session = Self { child: Mutex::new(child), stdin: Mutex::new(stdin), stdout: Mutex::new(BufReader::new(stdout)), request_lock: Mutex::new(()), next_id: AtomicU64::new(2) };
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "plc-pilot", "version": APP_VERSION} }
+        });
+        let initialized = session.request_raw(initialize, 1).await?;
+        if let Some(error) = initialized.get("error") { return Err(AppError::Mcp(format!("MCP initialize 返回错误：{error}"))); }
+        if initialized.get("result").is_none() && initialized.get("protocolVersion").is_none() { return Err(AppError::Mcp("MCP initialize 未返回有效握手结果".into())); }
+        session.send_notification(json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}})).await?;
+        Ok(session)
+    }
+
+    async fn request_raw(&self, value: Value, expected_id: u64) -> Result<Value, AppError> {
+        let _guard = self.request_lock.lock().await;
+        let mut stdin = self.stdin.lock().await;
+        write_json_stdin(&mut stdin, value).await?;
+        drop(stdin);
+        let mut stdout = self.stdout.lock().await;
+        loop {
+            let response = read_json_response(&mut *stdout).await?;
+            if response.get("id").and_then(Value::as_u64) == Some(expected_id) { return Ok(response); }
+        }
+    }
+
+    async fn send_notification(&self, value: Value) -> Result<(), AppError> {
+        let _guard = self.request_lock.lock().await;
+        let mut stdin = self.stdin.lock().await;
+        write_json_stdin(&mut stdin, value).await
+    }
+
+    async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCallResult, AppError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let response = self.request_raw(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}), id).await?;
+        if let Some(error) = response.get("error") { return Err(AppError::Mcp(error.to_string())); }
+        Ok(ToolCallResult { content: response.get("result").and_then(|result| result.get("content")).and_then(Value::as_array).cloned().unwrap_or_default(), is_error: response.get("result").and_then(|result| result.get("isError")).and_then(Value::as_bool).unwrap_or(false) })
+    }
+
+    async fn shutdown(&self) {
+        let mut child = self.child.lock().await;
+        kill_child_tree(&mut child).await;
+    }
+}
+
+impl McpSessionRegistry {
+    async fn call_tool(&self, config: &McpServerConfig, name: &str, arguments: Value) -> Result<ToolCallResult, AppError> {
+        let session = if let Some(session) = self.sessions.lock().await.get(&config.id).cloned() { session } else {
+            let created = Arc::new(McpSession::start(config).await?);
+            let mut sessions = self.sessions.lock().await;
+            if let Some(existing) = sessions.get(&config.id).cloned() {
+                drop(sessions);
+                created.shutdown().await;
+                existing
+            } else {
+                sessions.insert(config.id.clone(), created.clone());
+                created
+            }
+        };
+        match session.call_tool(name, arguments).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.sessions.lock().await.remove(&config.id);
+                session.shutdown().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn shutdown_all(&self) {
+        let sessions = std::mem::take(&mut *self.sessions.lock().await);
+        for session in sessions.into_values() { session.shutdown().await; }
+    }
 }
 
 impl McpClient {
@@ -7914,7 +9625,7 @@ impl McpClient {
         )
         .await?;
         let response = read_json_response(&mut reader).await?;
-        let _ = child.kill().await;
+        kill_child_tree(&mut child).await;
         if let Some(error) = response.get("error") {
             return Err(AppError::Mcp(error.to_string()));
         }
@@ -8026,6 +9737,11 @@ impl McpClient {
         {
             request = request.bearer_auth(token);
         }
+        for (key, value) in &self.config.headers {
+            if !is_secret_header_key(key) || !value.trim().is_empty() {
+                request = request.header(key, value);
+            }
+        }
         if let Some(session_id) = session_id {
             request = request.header("Mcp-Session-Id", session_id.clone());
         }
@@ -8059,12 +9775,22 @@ async fn spawn_mcp(config: &McpServerConfig) -> Result<Child, AppError> {
     command
         .args(&config.args)
         .envs(&config.env)
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     command
         .spawn()
         .map_err(|error| AppError::Mcp(format!("启动 {} 未完成：{error}", config.command)))
+}
+
+async fn write_json_stdin(stdin: &mut ChildStdin, value: Value) -> Result<(), AppError> {
+    let mut text = serde_json::to_vec(&value).map_err(|error| AppError::Mcp(error.to_string()))?;
+    text.push(b'\n');
+    stdin.write_all(&text).await.map_err(|error| AppError::Mcp(error.to_string()))?;
+    stdin.flush().await.map_err(|error| AppError::Mcp(error.to_string()))
 }
 
 async fn write_json(child: &mut Child, value: Value) -> Result<(), AppError> {
@@ -8072,16 +9798,21 @@ async fn write_json(child: &mut Child, value: Value) -> Result<(), AppError> {
         .stdin
         .as_mut()
         .ok_or_else(|| AppError::Mcp("MCP stdin 不可用".to_string()))?;
-    let mut text = serde_json::to_vec(&value).map_err(|error| AppError::Mcp(error.to_string()))?;
-    text.push(b'\n');
-    stdin
-        .write_all(&text)
-        .await
-        .map_err(|error| AppError::Mcp(error.to_string()))?;
-    stdin
-        .flush()
-        .await
-        .map_err(|error| AppError::Mcp(error.to_string()))
+    write_json_stdin(stdin, value).await
+}
+
+async fn kill_child_tree(child: &mut Child) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.creation_flags(CREATE_NO_WINDOW);
+        let _ = command.status().await;
+    }
+    let _ = child.kill().await;
 }
 
 async fn read_json_response<R>(reader: &mut R) -> Result<Value, AppError>
@@ -8145,13 +9876,56 @@ where
         }
     })
     .await
-    .map_err(|_| AppError::Mcp("MCP 响应超过 30 秒仍未返回".to_string()))?
+    .map_err(|_| AppError::Mcp("MCP 响应超过 120 秒仍未返回".to_string()))?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn project_tool_arguments_follow_discovered_schema() {
+        let project = ProjectContext { path: Some("C:/PLC/Machine.project".into()), ..ProjectContext::default() };
+        let tool = ToolSummary { qualified_name: "mcp__codesys__codesys_build".into(), server_id: "codesys".into(), name: "codesys_build".into(), description: None, input_schema: json!({"type":"object","properties":{"projectFilePath":{"type":"string"},"application":{"type":"string"}}}), mutating: false, source: String::new(), risk: String::new(), capabilities: Vec::new(), available: true };
+        let args = tool_arguments_for_project(&tool, &project);
+        assert_eq!(args["projectFilePath"], "C:/PLC/Machine.project");
+        assert_eq!(args["application"], "");
+    }
+
+    #[test]
+    fn codesys_profile_is_not_fixed_to_sp22() {
+        let directory = tempfile::tempdir().expect("创建临时 CODESYS 目录");
+        let common = directory.path().join("CODESYS").join("Common");
+        let profiles = directory.path().join("CODESYS").join("Profiles");
+        fs::create_dir_all(&common).expect("创建 Common");
+        fs::create_dir_all(&profiles).expect("创建 Profiles");
+        let executable = common.join("CODESYS.exe");
+        fs::write(&executable, "exe").expect("写入测试 exe");
+        fs::write(profiles.join("CODESYS V3.5 SP19.profile.xml"), "<profile/>").expect("写入 SP19 profile");
+        fs::write(profiles.join("CODESYS V3.5 SP21.profile.xml"), "<profile/>").expect("写入 SP21 profile");
+        assert_eq!(codesys_profile_for_executable(&executable).as_deref(), Some("CODESYS V3.5 SP21"));
+    }
+
+    #[test]
+    fn agent_stream_payload_serializes_stable_wire_fields() {
+        let payload = AgentStreamPayload {
+            event_type: "delta".to_string(),
+            request_id: "request-test".to_string(),
+            sequence: 3,
+            phase: None,
+            delta: Some("第一段".to_string()),
+            event: None,
+            result: None,
+            error: None,
+            session: None,
+        };
+        let value = serde_json::to_value(payload).expect("实时通知应可序列化");
+        assert_eq!(value["type"], "delta");
+        assert_eq!(value["request_id"], "request-test");
+        assert_eq!(value["sequence"], 3);
+        assert_eq!(value["delta"], "第一段");
+    }
 
     #[test]
     fn scan_project_counts_source_objects() {
@@ -8301,6 +10075,22 @@ mod tests {
     }
 
     #[test]
+    fn model_retry_policy_covers_status_retry_after_and_auth_boundary() {
+        let throttled = AppError::Network("HTTP 429 [Retry-After: 2]：服务端限流".to_string());
+        assert_eq!(network_error_status(&throttled), Some(429));
+        assert_eq!(network_error_retry_after_ms(&throttled), Some(2_000));
+        assert!(is_retryable_network_error(&throttled));
+        assert_eq!(retry_delay_ms(&throttled, 1), 2_000);
+
+        let not_found = AppError::Network("HTTP 404：路由暂时不可用".to_string());
+        assert_eq!(network_error_status(&not_found), Some(404));
+        assert!(is_retryable_network_error(&not_found));
+
+        let unauthorized = AppError::Network("HTTP 401：鉴权未通过".to_string());
+        assert!(!is_retryable_network_error(&unauthorized));
+    }
+
+    #[test]
     fn model_endpoint_candidates_cover_openai_and_ollama_routes() {
         let openai = ModelConfig {
             base_url: "https://example.test/v1".to_string(),
@@ -8358,6 +10148,69 @@ mod tests {
     }
 
     #[test]
+    fn legacy_model_migrates_to_profile_with_real_context_defaults() {
+        let legacy = serde_json::from_value::<ModelConfig>(json!({
+            "provider": "responses",
+            "base_url": "https://example.test/v1",
+            "model": "legacy-model",
+            "max_tokens": 2048
+        }))
+        .expect("旧版模型配置应可解析");
+        assert!(legacy.id.is_empty());
+        assert_eq!(legacy.context_window, DEFAULT_CONTEXT_WINDOW);
+        assert!(legacy.enabled);
+
+        let normalized = normalize_model_collection(vec![legacy]);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].id, "model-default");
+        assert_eq!(normalized[0].name, "legacy-model");
+        assert!(normalized[0].is_default);
+    }
+
+    #[test]
+    fn request_profile_selects_endpoint_context_and_reasoning_capabilities() {
+        let profile = ModelConfig {
+            id: "model-large".to_string(),
+            name: "大上下文模型".to_string(),
+            base_url: "https://large.example/v1".to_string(),
+            model: "large-model".to_string(),
+            context_window: 512_000,
+            reasoning_levels: vec!["none".to_string(), "high".to_string()],
+            enabled: true,
+            is_default: false,
+            ..ModelConfig::default()
+        };
+        let state = RuntimeState {
+            models: vec![ModelConfig::default(), profile.clone()],
+            active_model_id: "model-default".to_string(),
+            model: ModelConfig::default(),
+            ..RuntimeState::default()
+        };
+        let request = AgentRequest {
+            message: "检查工程".to_string(),
+            model_profile_id: Some("model-large".to_string()),
+            model: Some("不能覆盖 profile 的模型".to_string()),
+            ..AgentRequest::default()
+        };
+        let selected = model_profile_for_request(&state, &request).expect("应找到模型 profile");
+        let effective = model_for_request(&selected, &request).expect("应生成本轮模型");
+        assert_eq!(effective.base_url, "https://large.example/v1");
+        assert_eq!(effective.model, "large-model");
+        assert_eq!(effective.context_window, 512_000);
+        assert_eq!(effective.reasoning_levels, vec!["none", "high"]);
+    }
+
+    #[test]
+    fn model_validation_rejects_output_larger_than_context() {
+        let invalid = ModelConfig {
+            context_window: 2_048,
+            max_tokens: 4_096,
+            ..ModelConfig::default()
+        };
+        assert!(normalize_model_for_save(invalid).is_err());
+    }
+
+    #[test]
     fn runtime_config_removes_model_and_mcp_credentials() {
         let mut env = HashMap::new();
         env.insert(
@@ -8365,11 +10218,13 @@ mod tests {
             "synthetic-mcp-token".to_string(),
         );
         env.insert("PLC_MODE".to_string(), "safe".to_string());
+        let keyed_model = ModelConfig {
+            api_key: Some("synthetic-model-key".to_string()),
+            ..ModelConfig::default()
+        };
         let state = RuntimeState {
-            model: ModelConfig {
-                api_key: Some("synthetic-model-key".to_string()),
-                ..ModelConfig::default()
-            },
+            models: vec![keyed_model.clone()],
+            model: keyed_model,
             mcp_servers: vec![McpServerConfig {
                 id: "demo".to_string(),
                 name: "Demo".to_string(),
@@ -8379,6 +10234,7 @@ mod tests {
                 enabled: true,
                 transport: "stdio".to_string(),
                 url: None,
+                headers: HashMap::new(),
             }],
             ..RuntimeState::default()
         };
@@ -8520,6 +10376,7 @@ mod tests {
             concat!(
                 "{\"type\":\"session\",\"id\":\"session-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/plc\"}\n",
                 "{\"type\":\"session_info\",\"id\":\"info-1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"name\":\"泵站诊断\"}\n",
+                "{\"type\":\"custom\",\"customType\":\"plc-pilot.model-profile\",\"data\":{\"profile_id\":\"model-large\",\"reasoning_effort\":\"high\"}}\n",
                 "{\"type\":\"message\",\"id\":\"user-1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":\"检查 MAIN\"}}\n",
                 "{\"type\":\"message\",\"id\":\"assistant-1\",\"parentId\":\"user-1\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"已读取工程。\"}]}}\n",
                 "{\"type\":\"message\",\"id\":\"tool-1\",\"parentId\":\"assistant-1\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"message\":{\"role\":\"toolResult\",\"content\":\"内部结果\"}}\n"
@@ -8530,8 +10387,14 @@ mod tests {
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.name.as_deref(), Some("泵站诊断"));
         assert_eq!(record.cwd.as_deref(), Some("C:/plc"));
+        assert_eq!(record.model_profile_id.as_deref(), Some("model-large"));
+        assert_eq!(record.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(record.message_count, 2);
         assert_eq!(record.messages[0].content, "检查 MAIN");
+        assert_eq!(
+            record.messages[0].model_profile_id.as_deref(),
+            Some("model-large")
+        );
         assert_eq!(record.messages[1].content, "已读取工程。");
     }
 
@@ -8650,6 +10513,13 @@ mod tests {
     }
 
     #[test]
+    fn free_catalogs_have_at_least_five_entries() {
+        assert!(mcp_catalog_entries().len() >= 5);
+        assert!(skill_catalog_entries(&ProjectContext::default()).len() >= 5);
+        assert!(mcp_catalog_entries().iter().all(|entry| !entry.package.is_empty() && !entry.source.is_empty() && !entry.license.is_empty()));
+    }
+
+    #[test]
     fn static_diagnostics_detect_unclosed_structured_text_blocks() {
         let directory = tempfile::tempdir().expect("创建临时工程目录");
         fs::write(
@@ -8686,6 +10556,7 @@ mod tests {
             })),
             agent_runs: Arc::new(Mutex::new(())),
             abort_requested: Arc::new(AtomicBool::new(false)),
+            ..AppState::new(RuntimeState::default())
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -8788,6 +10659,7 @@ mod tests {
             })),
             agent_runs: Arc::new(Mutex::new(())),
             abort_requested: Arc::new(AtomicBool::new(false)),
+            ..AppState::new(RuntimeState::default())
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -175,7 +175,7 @@ export function useComposerAttachments(options: AttachmentOptions = {}) {
     const next: Array<{ file: File; attachment: ComposerAttachment }> = []
     for (const file of candidates) {
       const duplicateKey = `${file.name}\u0000${file.size}\u0000${file.type}`
-      if (existingFingerprints.has(duplicateKey) || next.some((attachment) => attachment.name === file.name && attachment.size === file.size && attachment.mimeType === file.type)) continue
+      if (existingFingerprints.has(duplicateKey) || next.some(({ attachment }) => attachment.name === file.name && attachment.size === file.size && attachment.mimeType === file.type)) continue
       if (source.value.length + next.length >= limits.maxFiles) break
       if (file.size > limits.maxSingleBytes) {
         next.push({

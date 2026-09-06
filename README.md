@@ -1,17 +1,18 @@
 # PLC Pilot
 
-PLC Pilot 是面向 CODESYS 3.5.22（SP22）的独立桌面 Agent 工作台。界面和会话交互复用 CodexUI 的成熟 Vue 组件，底层使用 Pi Agent 会话宿主；工程读取、修改审批、编译诊断和安全边界由本项目 Rust 运行时负责。
+PLC Pilot 是面向 CODESYS 3.5 系列的独立桌面 Agent 工作台，推荐使用 SP21/SP22。界面和会话交互复用 CodexUI 的成熟 Vue 组件，底层使用 Pi Agent 会话宿主；工程读取、修改审批、真实编译诊断和安全边界由本项目 Rust 运行时负责。
 
 ## 已接入能力
 
 - Codex 风格独立桌面布局：会话栏、聊天、工程概览、Skills、命令面板（`Ctrl/Cmd+K`）、最近会话和上下文占用；不依赖 CODESYS 内嵌侧栏。
 - 斜杠命令：`/help`、`/status`、`/new`、`/clear`、`/sessions`、`/rename`、`/compact`、`/scan`、`/compile`、`/diagnostics`、`/skills`、`/mcp`、`/tools`、`/model`、`/approve`、`/reject`。
 - Pi Agent 宿主：持久化 JSONL 会话、流式事件、自动上下文压缩、重试和会话恢复。
-- PLC Skills：内置 CODESYS 工程工作流、PLC 安全审查、IEC 61131-3 Structured Text 规则，并读取项目内用户自定义 Skills。
+- PLC Skills：内置 CODESYS 工程工作流、PLC 安全审查、IEC 61131-3 Structured Text 规则，并读取项目内用户自定义 Skills；设置页提供免费 Skill 商店和下一轮自动加载。
 - PLC 内置工具：`plc__project_snapshot`、`plc__list_pous`、`plc__read_st_source`、`plc__search_project`、`plc__propose_edit`、`plc__compile_project`、`plc__diagnostics`。常用工程读取和诊断不需要另行安装 MCP。
-- 可选 MCP：stdio JSON-RPC（JSONL、`Content-Length`）和 Streamable HTTP（JSON、SSE、Bearer Token、`Mcp-Session-Id`）工具发现与调用。
+- 可选 MCP：设置页提供至少 11 个免费 MCP 商店条目，其中包含官方 Filesystem、Memory、Sequential Thinking、Everything、Puppeteer，以及社区 Context7、CODESYS MCP Toolkit、CODESYS MCP SP21+、CODESYS MCP SP21+ 中文版、Festo CODESYS MCP、CODESYS Persistent MCP；同时支持手动配置、stdio JSON-RPC（JSONL、`Content-Length`）和 Streamable HTTP（JSON、SSE、Bearer Token、`Mcp-Session-Id`）工具发现与调用。
 - 工程闭环：选择 `.project` 文件或目录，读取源对象，生成真实 unified Diff，审批后才写盘；写入补丁可在正文未被外部修改时撤回/重做。
-- 编译诊断：优先调用已连接的外部 CODESYS 编译工具；没有编译工具时执行本地静态 IEC 61131-3 结构诊断，并明确标注“未执行 CODESYS 目标编译器”。
+- CODESYS Agent 闭环：每轮按需握手 MCP、读取工程/POU、按真实 schema 调用社区 CODESYS 工具、审批后写回并执行真实目标编译；同一轮复用 MCP 进程，轮次结束释放，不形成常驻后台。
+- 编译诊断：优先调用已连接的外部 CODESYS 编译工具并读取真实错误/警告；没有真实编译工具时明确阻止“编译通过”结论，单独使用 `diagnostics` 才执行本地静态 IEC 61131-3 结构诊断。
 - 模型接口：OpenAI Responses、Anthropic Messages、OpenAI 兼容 Chat Completions 和 Ollama。
 
 与 PLC 无关的 browser、computer-use、Telegram、Composio、自动化等 Codex 扩展不放入初版桌面包。
@@ -42,17 +43,21 @@ Windows 安装包和可执行文件会输出到 `src-tauri/target/release/bundle
 
 ## CODESYS 工程桥接
 
-PLC Pilot 不在 CODESYS 内嵌聊天窗口。已保存工程可以直接在桌面工作台的“工程概览”中选择；需要读取未保存的当前工程或当前编辑器选区时，可在 CODESYS 的 `Tools` → `Scripting` → `Execute Script File` 中执行 `codesys-bridge/Script Commands/plc_pilot_sync.py`。
+PLC Pilot 不在 CODESYS 内嵌聊天窗口。已保存工程可以直接在桌面工作台的“工程概览”中选择；需要读取未保存的当前工程或当前编辑器选区时，可在 CODESYS 的 `Tools` → `Scripting` → `Execute Script File` 中执行 `codesys-bridge/Script Commands/plc_pilot_sync.py`。CODESYS 工程/POU 的真实写回和目标编译通过设置页安装的社区 MCP 完成，按 Agent 任务按需启动，不常驻后台。
 
-该脚本只读 `projects.primary`，把工程路径、对象清单和 ST 文本导出到 `%LOCALAPPDATA%\\PLC Pilot\\codesys-bridge\\current-project.json`。桌面工作台会自动同步快照。脚本不修改 CODESYS 工程，也不创建 CODESYS 插件或聊天侧栏。
+该脚本只读 `projects.primary`，把工程路径、对象清单和 ST 文本导出到 `%LOCALAPPDATA%\\PLC Pilot\\codesys-bridge\\current-project.json`。桌面工作台会自动同步快照。脚本不修改 CODESYS 工程，也不创建 CODESYS 插件或聊天侧栏；它是只读兼容入口，不是写回和编译主链路。
 
 ## MCP 配置
 
-在设置面板填写服务名称、stdio 命令或 HTTP URL。HTTP 服务可配置 Bearer Token，内部映射为 `MCP_AUTH_TOKEN`。服务连接、工具 schema、调用结果和诊断会显示在工具目录与 Agent 时间线；PLC 内置工具始终位于 `plc__` 命名空间。
+设置面板提供免费 MCP 商店和手动配置两条路径。商店当前只收录来源、许可证和包名可核验的服务，初版包含 5 个官方条目和 6 个社区条目；其中 5 个社区条目直接面向 CODESYS。点击安装会把真实 `npx -y` 启动配置写入本机，首次连接时由 npm 获取包，不使用假安装状态。收费或未核验服务不会自动加入目录。
+
+手动配置支持 stdio、Streamable HTTP、自定义环境变量和请求头。HTTP 服务可配置 Bearer Token，内部映射为 `MCP_AUTH_TOKEN`；敏感请求头不会回显。服务连接、工具 schema、调用结果和诊断会显示在工具目录与 Agent 时间线；PLC 内置工具始终位于 `plc__` 命名空间。
+
+工具访问默认是“审批模式”：工程写入、下载、连接设备、RUN/STOP、Force、在线写变量、脚本和凭据操作都会显示批准/拒绝卡片；用户可在重试设置页主动切换“完全访问模式”，由当前已启用工具直接执行。`/plan` 计划模式始终阻止写入和在线操作。
 
 ## 安全边界
 
-下载、部署、RUN/STOP、Force/Unforce、Reset、在线写变量、Shell 和脚本执行默认阻止。修改、删除、重命名、安装库和覆盖工程等动作必须人工审批；批准后仍需重新编译并查看诊断结果。模型密钥只保存在当前桌面进程内存，不写入项目文件。
+下载、部署、RUN/STOP、Force/Unforce、Reset、在线写变量、Shell 和脚本执行默认阻止。修改、删除、重命名、安装库和覆盖工程等动作必须人工审批；批准后仍需重新编译并查看诊断结果。模型密钥、MCP Token 和敏感请求头保存在 C 盘应用目录的 Windows DPAPI 保护凭据文件，不写入项目文件、普通运行配置或会话正文。
 
 ## 本机 RPC
 

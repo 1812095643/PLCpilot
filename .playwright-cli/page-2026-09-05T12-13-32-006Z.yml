@@ -1,0 +1,168 @@
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - button "收起侧边栏" [ref=e7] [cursor=pointer]
+    - navigation "应用菜单" [ref=e10]:
+      - button "文件" [ref=e12] [cursor=pointer]
+      - button "编辑" [ref=e14] [cursor=pointer]
+      - button "视图" [ref=e16] [cursor=pointer]
+      - button "帮助" [ref=e18] [cursor=pointer]
+    - generic [ref=e20]:
+      - button "最小化" [ref=e21] [cursor=pointer]
+      - button "最大化" [ref=e23] [cursor=pointer]
+      - button "关闭" [ref=e25] [cursor=pointer]
+  - generic [ref=e27]:
+    - complementary [ref=e28]:
+      - complementary [ref=e29]:
+        - generic [ref=e30]:
+          - strong [ref=e31]: PLC Pilot
+          - button "搜索会话" [ref=e32] [cursor=pointer]
+          - button "新建临时会话" [ref=e36] [cursor=pointer]
+        - button "新对话" [ref=e39] [cursor=pointer]
+        - button "工程概览" [ref=e43] [cursor=pointer]
+        - button "Skills 与工具" [ref=e47] [cursor=pointer]
+        - generic [ref=e51]:
+          - generic [ref=e52]:
+            - generic [ref=e53]: 项目
+            - button "添加项目" [ref=e54] [cursor=pointer]
+          - generic [ref=e57]:
+            - generic [ref=e58]:
+              - button "收起 codesys测试工程" [ref=e59] [cursor=pointer]
+              - button "codesys测试工程" [ref=e62] [cursor=pointer]
+              - button "在 codesys测试工程 新建会话" [ref=e63] [cursor=pointer]
+              - button "移除项目 codesys测试工程" [ref=e66] [cursor=pointer]
+            - generic [ref=e70]:
+              - generic [ref=e71]:
+                - button "新对话" [ref=e72] [cursor=pointer]
+                - button "删除 新对话" [ref=e75] [cursor=pointer]
+              - generic [ref=e79]:
+                - button "codesys测试工程" [ref=e80] [cursor=pointer]
+                - button "重命名 codesys测试工程" [ref=e83] [cursor=pointer]
+                - button "删除 codesys测试工程" [ref=e86] [cursor=pointer]
+          - generic [ref=e90]:
+            - generic [ref=e91]: 临时会话
+            - button "添加临时会话" [ref=e92] [cursor=pointer]
+          - generic [ref=e95]:
+            - button "临时会话" [ref=e96] [cursor=pointer]
+            - button "重命名 临时会话" [ref=e99] [cursor=pointer]
+            - button "删除 临时会话" [ref=e102] [cursor=pointer]
+          - generic [ref=e106]:
+            - button "并发验证B：请用中文分8段写一份约1000字的PLC通信诊断流程。首行只" [ref=e107] [cursor=pointer]
+            - button "重命名 并发验证B：请用中文分8段写一份约1000字的PLC通信诊断流程。首行只" [ref=e110] [cursor=pointer]
+            - button "删除 并发验证B：请用中文分8段写一份约1000字的PLC通信诊断流程。首行只" [ref=e113] [cursor=pointer]
+          - generic [ref=e117]:
+            - button "本机HTTP重连验证，不读取文件。" [ref=e118] [cursor=pointer]
+            - button "重命名 本机HTTP重连验证，不读取文件。" [ref=e121] [cursor=pointer]
+            - button "删除 本机HTTP重连验证，不读取文件。" [ref=e124] [cursor=pointer]
+          - generic [ref=e128]:
+            - button "本机HTTP 429 重连验证，不读取文件。" [ref=e129] [cursor=pointer]
+            - button "重命名 本机HTTP 429 重连验证，不读取文件。" [ref=e132] [cursor=pointer]
+            - button "删除 本机HTTP 429 重连验证，不读取文件。" [ref=e135] [cursor=pointer]
+          - generic [ref=e139]:
+            - button "本机HTTP 503 重连验证，不读取文件。" [ref=e140] [cursor=pointer]
+            - button "重命名 本机HTTP 503 重连验证，不读取文件。" [ref=e143] [cursor=pointer]
+            - button "删除 本机HTTP 503 重连验证，不读取文件。" [ref=e146] [cursor=pointer]
+        - generic [ref=e150]:
+          - button "设置" [ref=e151] [cursor=pointer]
+          - button "颜色主题：明亮" [ref=e158] [cursor=pointer]
+    - button "调整侧边栏宽度" [ref=e162]
+    - generic [ref=e163]:
+      - generic [ref=e165]:
+        - heading "临时会话" [level=1] [ref=e168]
+        - button "命令面板" [ref=e170] [cursor=pointer]: ⌘K
+      - main [ref=e171]:
+        - generic [ref=e174]:
+          - complementary "会话时间轴":
+            - button "跳转到第 1 轮会话" [ref=e177] [cursor=pointer]
+          - list [ref=e179]:
+            - listitem [ref=e180]:
+              - article [ref=e183]:
+                - article [ref=e184]:
+                  - paragraph [ref=e186]: 本机HTTP 503 重连验证，不读取文件。
+                - generic [ref=e187]:
+                  - button "复制消息内容" [ref=e188] [cursor=pointer]:
+                    - generic [ref=e191]: 复制
+                  - button "编辑消息" [ref=e192] [cursor=pointer]:
+                    - generic [ref=e195]: 编辑
+                  - button "重新发送消息" [ref=e196] [cursor=pointer]:
+                    - generic [ref=e199]: 重发
+            - listitem [ref=e200]:
+              - generic [ref=e202]:
+                - 'button "▶ 5 commands · latest: 模型请求重试已耗尽（第 5/5 次） ✗ 未完成" [ref=e203] [cursor=pointer]':
+                  - generic [ref=e207]: ▶
+                  - generic [ref=e208]: "5 commands · latest: 模型请求重试已耗尽（第 5/5 次）"
+                  - generic [ref=e209]: ✗ 未完成
+                - generic [ref=e210]:
+                  - generic:
+                    - generic [ref=e211]:
+                      - button "▶ 模型请求重试：第 1/5 次 ⊘ 已停止" [ref=e212] [cursor=pointer]:
+                        - generic [ref=e216]: ▶
+                        - code [ref=e217]: 模型请求重试：第 1/5 次
+                        - generic [ref=e218]: ⊘ 已停止
+                      - generic [ref=e220]:
+                        - generic [ref=e221]: 纯文本
+                        - generic [ref=e222]: "HTTP 503，等待 1.0 秒 后再次请求。原因：OpenAI API error (503): {\"message\":\"HTTP 503 临时连接诊断\",\"type\":\"server_error\",\"code\":\"503\"}"
+                    - generic [ref=e223]:
+                      - button "▶ 模型请求重试：第 2/5 次 ⊘ 已停止" [ref=e224] [cursor=pointer]:
+                        - generic [ref=e228]: ▶
+                        - code [ref=e229]: 模型请求重试：第 2/5 次
+                        - generic [ref=e230]: ⊘ 已停止
+                      - generic [ref=e232]:
+                        - generic [ref=e233]: 纯文本
+                        - generic [ref=e234]: "HTTP 503，等待 1.0 秒 后再次请求。原因：OpenAI API error (503): {\"message\":\"HTTP 503 临时连接诊断\",\"type\":\"server_error\",\"code\":\"503\"}"
+                    - generic [ref=e235]:
+                      - button "▶ 模型请求重试：第 3/5 次 ⊘ 已停止" [ref=e236] [cursor=pointer]:
+                        - generic [ref=e240]: ▶
+                        - code [ref=e241]: 模型请求重试：第 3/5 次
+                        - generic [ref=e242]: ⊘ 已停止
+                      - generic [ref=e244]:
+                        - generic [ref=e245]: 纯文本
+                        - generic [ref=e246]: "HTTP 503，等待 1.0 秒 后再次请求。原因：OpenAI API error (503): {\"message\":\"HTTP 503 临时连接诊断\",\"type\":\"server_error\",\"code\":\"503\"}"
+                    - generic [ref=e247]:
+                      - button "▶ 模型请求重试：第 4/5 次 ⊘ 已停止" [ref=e248] [cursor=pointer]:
+                        - generic [ref=e252]: ▶
+                        - code [ref=e253]: 模型请求重试：第 4/5 次
+                        - generic [ref=e254]: ⊘ 已停止
+                      - generic [ref=e256]:
+                        - generic [ref=e257]: 纯文本
+                        - generic [ref=e258]: "HTTP 503，等待 1.0 秒 后再次请求。原因：OpenAI API error (503): {\"message\":\"HTTP 503 临时连接诊断\",\"type\":\"server_error\",\"code\":\"503\"}"
+                    - generic [ref=e259]:
+                      - button "▶ 模型请求重试已耗尽（第 5/5 次） ✗ 未完成" [ref=e260] [cursor=pointer]:
+                        - generic [ref=e264]: ▶
+                        - code [ref=e265]: 模型请求重试已耗尽（第 5/5 次）
+                        - generic [ref=e266]: ✗ 未完成
+                      - generic [ref=e268]:
+                        - generic [ref=e269]: 纯文本
+                        - generic [ref=e270]: "HTTP 503仍未恢复。OpenAI API error (503): {\"message\":\"HTTP 503 临时连接诊断\",\"type\":\"server_error\",\"code\":\"503\"}"
+            - listitem [ref=e271]:
+              - article [ref=e274]:
+                - article [ref=e275]:
+                  - paragraph [ref=e277]: "这次任务还没有完成：网络请求未完成：OpenAI API error (503): {\"message\":\"HTTP 503 临时连接诊断\",\"type\":\"server_error\",\"code\":\"503\"}"
+                  - generic [ref=e278]:
+                    - paragraph [ref=e279]: 模型服务暂时不可用（503），已完成自动重试；可稍后重试或切换模型。
+                    - button "重试本轮消息" [ref=e280] [cursor=pointer]:
+                      - generic [ref=e283]: 重试
+                - generic [ref=e284]:
+                  - button "复制消息内容" [ref=e285] [cursor=pointer]:
+                    - generic [ref=e288]: 复制
+                  - button "从这条回复 Fork 会话" [ref=e289] [cursor=pointer]:
+                    - generic [ref=e292]: Fork
+            - listitem [ref=e293]
+      - generic [ref=e296]:
+        - generic [ref=e297]:
+          - textbox "描述要检查、修改或诊断的 PLC 任务…" [ref=e298]: 本机HTTP 503 重连验证，不读取文件。
+          - generic [ref=e299]:
+            - generic [ref=e300]: Enter 发送 · Shift+Enter 换行
+            - generic [ref=e301]:
+              - code [ref=e302]: "@"
+              - text: 引用文件、文件夹或历史会话
+        - generic [ref=e303]:
+          - generic [ref=e304]:
+            - button "添加附件" [ref=e305] [cursor=pointer]
+            - button "PLC Skills" [ref=e309] [cursor=pointer]
+          - generic [ref=e313]:
+            - button "gpt-5.6-sol · 标准" [ref=e315] [cursor=pointer]:
+              - generic [ref=e316]: gpt-5.6-sol
+              - generic [ref=e317]: ·
+              - generic [ref=e318]: 标准
+            - generic "剩余 100% · 6 / 128,000 tokens" [ref=e319]
+            - button "发送任务" [ref=e322] [cursor=pointer]

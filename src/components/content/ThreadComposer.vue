@@ -10,6 +10,7 @@ import type {
 } from '../../types/codex'
 import type { ComposerAttachment, ComposerAttachmentDraft } from '../../composables/useComposerAttachments'
 import { useComposerAttachments } from '../../composables/useComposerAttachments'
+import { useComposerDraftStorage } from '../../composables/useComposerDraftStorage'
 import { readLocalAttachmentFile, searchComposerMentions, type CommandSummary, type ComposerMentionSuggestion } from '../../api/plcBridge'
 import {
   completeSlashCommand,
@@ -19,7 +20,6 @@ import {
   getSlashCommandToken,
 } from '../../utils/slashCommands'
 import ComposerCommandPopup from './ComposerCommandPopup.vue'
-import ComposerDropdown from './ComposerDropdown.vue'
 import ComposerSearchDropdown from './ComposerSearchDropdown.vue'
 import ComposerAttachmentStrip from './ComposerAttachmentStrip.vue'
 import ComposerResponseAnnotationStrip from './ComposerResponseAnnotationStrip.vue'
@@ -53,6 +53,17 @@ export type SubmitPayload = {
   references: UiMentionReference[]
   responseAnnotations: UiResponseTextAnnotation[]
   mode: 'steer' | 'queue'
+  /** 重试或恢复时固定本轮实际使用的配置；普通 Composer 提交不填写。 */
+  modelProfileId?: string
+  model?: string
+  reasoningEffort?: ReasoningEffort
+  collaborationMode?: CollaborationModeKind
+}
+
+export type ComposerModelOption = {
+  id: string
+  name: string
+  model: string
 }
 
 export type ThreadComposerExposed = {
@@ -66,9 +77,11 @@ const props = withDefaults(defineProps<{
   cwd?: string
   collaborationModes?: CollaborationModeOption[]
   selectedCollaborationMode: CollaborationModeKind
-  models: string[]
+  models: ComposerModelOption[]
+  /** 当前选择的是 profile ID，不是可能重复的供应商模型 ID。 */
   selectedModel: string
   selectedReasoningEffort: ReasoningEffort | ''
+  reasoningEfforts?: ReasoningEffort[]
   commands?: CommandSummary[]
   skills?: SkillItem[]
   threadTokenUsage?: UiThreadTokenUsage | null
@@ -91,6 +104,7 @@ const props = withDefaults(defineProps<{
   sendWithEnter: true,
   inProgressSubmitMode: 'steer',
   commands: () => [],
+  reasoningEfforts: () => ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
 })
 
 const emit = defineEmits<{
@@ -120,8 +134,12 @@ const slashCommandQuery = shallowRef('')
 const slashCommandToken = shallowRef('')
 const slashHighlightedIndex = shallowRef(0)
 const dismissedSlashCommandToken = shallowRef<string | null>(null)
+const isModelReasoningOpen = shallowRef(false)
+const modelQuery = shallowRef('')
 
 let lastActiveThreadId = ''
+const draftStorage = useComposerDraftStorage()
+let restoringDraft = false
 let mentionSearchTimer: ReturnType<typeof setTimeout> | null = null
 let mentionSearchToken = 0
 
@@ -141,21 +159,59 @@ const {
 } = useComposerAttachments()
 
 const modelOptions = computed(() => {
-  const values = Array.from(new Set(props.models.map((item) => item.trim()).filter(Boolean)))
-  if (props.selectedModel.trim() && !values.includes(props.selectedModel.trim())) {
-    values.unshift(props.selectedModel.trim())
+  const seen = new Set<string>()
+  const result: Array<{ value: string; label: string; model: string }> = []
+  for (const item of props.models) {
+    const id = item.id.trim()
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    result.push({
+      value: item.id.trim(),
+      label: item.name.trim() || modelDisplayLabel(item.model),
+      model: item.model.trim(),
+    })
   }
-  return values.map((value) => ({ value, label: value.replace(/^gpt/i, 'GPT') }))
+  return result
 })
 
-const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
-  { value: 'none', label: '不思考' },
-  { value: 'minimal', label: '轻量' },
-  { value: 'low', label: '低' },
-  { value: 'medium', label: '标准' },
-  { value: 'high', label: '高' },
-  { value: 'xhigh', label: '极高' },
-]
+const filteredModelOptions = computed(() => {
+  const query = modelQuery.value.trim().toLowerCase()
+  return query.length === 0
+    ? modelOptions.value
+    : modelOptions.value.filter((option) => `${option.value} ${option.label} ${option.model}`.toLowerCase().includes(query))
+})
+
+const selectedModelOption = computed(() => modelOptions.value.find((option) => option.value === props.selectedModel) ?? modelOptions.value[0] ?? null)
+
+function modelDisplayLabel(modelId: string): string {
+  const normalized = modelId.trim()
+  const knownLabels: Record<string, string> = {
+    'gpt-5.6-sol': '5.6 Sol',
+    'gpt-5.6-terra': '5.6 Terra',
+    'gpt-5.6-luna': '5.6 Luna',
+    'gpt-5.5': '5.5',
+    'gpt-5.2': '5.2',
+    'gpt-5.3-codex-spark': '5.3 Codex Spark',
+  }
+  return knownLabels[normalized.toLowerCase()] ?? normalized.replace(/^gpt-/iu, 'GPT ')
+}
+
+const reasoningOptionLabels: Record<ReasoningEffort, string> = {
+  none: '不思考',
+  minimal: '轻量',
+  low: '低',
+  medium: '标准',
+  high: '高',
+  xhigh: '极高',
+}
+
+const reasoningOptions = computed(() => {
+  const values = props.reasoningEfforts
+    .filter((value, index, all) => all.indexOf(value) === index)
+  const fallback: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  return (values.length > 0 ? values : fallback)
+    .map((value) => ({ value, label: reasoningOptionLabels[value] }))
+})
 
 const skillOptions = computed(() => props.skills.map((skill) => ({
   value: skill.path,
@@ -168,12 +224,17 @@ const skillOptions = computed(() => props.skills.map((skill) => ({
 )
 
 const selectedSkillPaths = computed(() => selectedSkills.value.map((skill) => skill.path))
-const modeOptions = computed(() => props.collaborationModes.length > 0
-  ? props.collaborationModes
-  : [{ value: 'default' as const, label: '执行' }, { value: 'plan' as const, label: '计划' }])
-
 const isInteractionDisabled = computed(() => props.disabled || !props.activeThreadId.trim())
-const isPlanMode = computed(() => props.selectedCollaborationMode === 'plan')
+const isPlanMode = computed(() => props.selectedCollaborationMode === 'plan' || /^\/plan(?:\s|$)/iu.test(draft.value.trim()))
+const selectedReasoningIndex = computed(() => {
+  const index = reasoningOptions.value.findIndex((option) => option.value === (props.selectedReasoningEffort || 'medium'))
+  if (index >= 0) return index
+  const mediumIndex = reasoningOptions.value.findIndex((option) => option.value === 'medium')
+  return mediumIndex >= 0 ? mediumIndex : 0
+})
+const selectedReasoningLabel = computed(() => reasoningOptions.value[selectedReasoningIndex.value]?.label ?? '标准')
+const modelReasoningLabel = computed(() => `${selectedModelOption.value?.label || '选择模型'} · ${selectedReasoningLabel.value}`)
+const reasoningRangeStyle = computed(() => ({ '--reasoning-percent': `${(selectedReasoningIndex.value / Math.max(1, reasoningOptions.value.length - 1)) * 100}%` }))
 const placeholder = computed(() => isInteractionDisabled.value
   ? '先选择一个本地 CODESYS 工程'
   : '描述要检查、修改或诊断的 PLC 任务…')
@@ -182,20 +243,30 @@ const canSubmit = computed(() => !isInteractionDisabled.value && !isAttachmentRe
 
 const contextView = computed(() => {
   const usage = props.threadTokenUsage
-  if (!usage) return { label: '上下文 —', tone: 'quiet' }
+  if (!usage) return { percent: null, tone: 'quiet' as const }
   let remaining = usage.remainingContextPercent
   if (remaining === null && usage.modelContextWindow && usage.modelContextWindow > 0) {
     remaining = Math.max(0, Math.round((1 - usage.currentContextTokens / usage.modelContextWindow) * 100))
   }
-  if (remaining === null || !Number.isFinite(remaining)) return { label: '上下文 —', tone: 'quiet' }
+  if (remaining === null || !Number.isFinite(remaining)) return { percent: null, tone: 'quiet' as const }
   const tone = remaining <= 15 ? 'danger' : remaining <= 35 ? 'warning' : 'healthy'
-  return { label: `上下文 ${Math.round(remaining)}%`, tone }
+  const percent = Math.max(0, Math.min(100, Math.round(remaining)))
+  return { percent, tone }
 })
+
+const contextRingStyle = computed(() => ({ '--context-percent': `${contextView.value.percent ?? 0}%` }))
 
 const contextTitle = computed(() => {
   const usage = props.threadTokenUsage
   if (!usage?.modelContextWindow) return '发送后会显示上下文占用'
   return `当前 ${usage.currentContextTokens.toLocaleString()} / ${usage.modelContextWindow.toLocaleString()} tokens`
+})
+
+const contextTooltip = computed(() => {
+  const usage = props.threadTokenUsage
+  const percent = contextView.value.percent
+  if (!usage?.modelContextWindow || percent === null) return '上下文用量暂不可用'
+  return `剩余 ${percent}% · ${usage.currentContextTokens.toLocaleString()} / ${usage.modelContextWindow.toLocaleString()} tokens`
 })
 
 const mentionVisible = computed(() => isFileMentionOpen.value && fileMentionSuggestions.value.length > 0)
@@ -253,12 +324,11 @@ function pruneMentionReferences(): void {
   })
 }
 
-function readDraft(threadId: string): ComposerDraftPayload | null {
+async function readDraft(threadId: string): Promise<ComposerDraftPayload | null> {
   if (typeof window === 'undefined' || !threadId.trim()) return null
   try {
-    const raw = window.localStorage.getItem(getDraftStorageKey(threadId))
-    if (!raw) return null
-    const value = JSON.parse(raw) as Partial<ComposerDraftPayload>
+    const value = await draftStorage.read(threadId)
+    if (!value) return null
     return {
       text: typeof value.text === 'string' ? value.text : '',
       skills: Array.isArray(value.skills)
@@ -278,35 +348,14 @@ function readDraft(threadId: string): ComposerDraftPayload | null {
 
 function persistDraft(threadId: string): void {
   if (typeof window === 'undefined' || !threadId.trim()) return
-  const payload: ComposerDraftPayload = {
+  const payload: Required<ComposerDraftPayload> = {
     text: draft.value,
     skills: selectedSkills.value.map((skill) => ({ name: skill.name, path: skill.path })),
     attachments: serializeAttachments(),
     references: mentionReferences.value,
     responseAnnotations: draftResponseAnnotations.value,
   }
-  try {
-    if (payload.text.trim() || payload.skills.length > 0 || payload.attachments.length > 0 || payload.references.length > 0 || payload.responseAnnotations.length > 0) {
-      try {
-        window.localStorage.setItem(getDraftStorageKey(threadId), JSON.stringify(payload))
-      } catch {
-        // 图片可能超过浏览器 localStorage 容量；至少保留名称、类型和状态，避免输入草稿整体消失。
-        const metadataOnly = {
-          ...payload,
-          attachments: payload.attachments.map(({ dataBase64: _dataBase64, textContent: _textContent, ...item }) => ({
-            ...item,
-            status: 'error' as const,
-            error: '附件内容超过本地草稿容量，重新打开后请再次添加。',
-          })),
-        }
-        window.localStorage.setItem(getDraftStorageKey(threadId), JSON.stringify(metadataOnly))
-      }
-    } else {
-      window.localStorage.removeItem(getDraftStorageKey(threadId))
-    }
-  } catch {
-    // 本地存储不可用时不阻断任务发送，当前输入仍保留在窗口内。
-  }
+  draftStorage.save(threadId, payload)
 }
 
 function replaceDraft(payload: ComposerDraftPayload): void {
@@ -509,7 +558,7 @@ async function filesFromDrop(event: DragEvent): Promise<File[]> {
   const directFiles = Array.from(event.dataTransfer?.files ?? [])
   const items = Array.from(event.dataTransfer?.items ?? [])
   const entries = items
-    .map((item) => (item as DataTransferItem & { webkitGetAsEntry?: () => FileSystemEntryLike | null }).webkitGetAsEntry?.() ?? null)
+    .map((item): FileSystemEntryLike | null => item.webkitGetAsEntry?.() ?? null)
     .filter((entry): entry is FileSystemEntryLike => entry !== null)
   if (entries.length === 0) return directFiles
   const result: File[] = [...directFiles]
@@ -821,6 +870,26 @@ function removeSkill(path: string): void {
   selectedSkills.value = selectedSkills.value.filter((item) => item.path !== path)
 }
 
+function onReasoningInput(event: Event): void {
+  const target = event.target
+  if (!(target instanceof HTMLInputElement)) return
+  const index = Number(target.value)
+  const option = reasoningOptions.value[Math.max(0, Math.min(reasoningOptions.value.length - 1, Math.trunc(index)))]
+  if (option) emit('update:selected-reasoning-effort', option.value)
+}
+
+function toggleModelReasoningPicker(): void {
+  if (isInteractionDisabled.value) return
+  isModelReasoningOpen.value = !isModelReasoningOpen.value
+  if (!isModelReasoningOpen.value) modelQuery.value = ''
+}
+
+function selectModel(modelId: string): void {
+  emit('update:selected-model', modelId)
+  isModelReasoningOpen.value = false
+  modelQuery.value = ''
+}
+
 function removeResponseAnnotation(id: string): void {
   draftResponseAnnotations.value = draftResponseAnnotations.value.filter((annotation) => annotation.id !== id)
   emit('update:response-annotations', draftResponseAnnotations.value)
@@ -831,12 +900,14 @@ function editResponseAnnotation(annotation: UiResponseTextAnnotation): void {
 }
 
 function onDocumentPointerDown(event: PointerEvent): void {
-  if (!isFileMentionOpen.value && !isSlashCommandOpen.value) return
+  if (!isFileMentionOpen.value && !isSlashCommandOpen.value && !isModelReasoningOpen.value) return
   const root = composerRootRef.value
   const target = event.target
   if (!root || !(target instanceof Node) || root.contains(target)) return
   closeFileMention()
   closeSlashCommandPopup()
+  isModelReasoningOpen.value = false
+  modelQuery.value = ''
 }
 
 watch(() => props.inProgressSubmitMode, (value) => {
@@ -850,15 +921,20 @@ watch(() => props.responseAnnotations, (value) => {
   }
 }, { deep: true, immediate: true })
 
-watch(() => props.activeThreadId, (threadId) => {
+watch(() => props.activeThreadId, async (threadId) => {
   if (lastActiveThreadId) persistDraft(lastActiveThreadId)
-  const restored = readDraft(threadId)
-  replaceDraft(restored ?? emptyPayload())
   lastActiveThreadId = threadId.trim()
+  restoringDraft = true
+  replaceDraft(emptyPayload())
+  const restored = await readDraft(threadId)
+  if (props.activeThreadId !== threadId) return
+  if (!draft.value && attachments.value.length === 0) replaceDraft(restored ?? emptyPayload())
+  await nextTick()
+  restoringDraft = false
 }, { immediate: true })
 
 watch([draft, selectedSkillPaths, attachments, mentionReferences, draftResponseAnnotations], () => {
-  if (lastActiveThreadId) persistDraft(lastActiveThreadId)
+  if (!restoringDraft && lastActiveThreadId) persistDraft(lastActiveThreadId)
 })
 
 watch(() => props.commands, () => {
@@ -948,26 +1024,6 @@ defineExpose<ThreadComposerExposed>({
             <IconTablerPaperclip aria-hidden="true" />
           </button>
           <input ref="fileInputRef" class="plc-composer-file-input" type="file" multiple accept="image/*,.c,.cc,.cpp,.css,.csv,.h,.hpp,.html,.iecst,.ini,.java,.js,.json,.log,.md,.mjs,.py,.rs,.sql,.st,.svg,.toml,.ts,.tsx,.txt,.vue,.xml,.yaml,.yml" @change="onFileInputChange" />
-          <ComposerDropdown
-            class="plc-composer-dropdown"
-            :model-value="selectedModel"
-            :options="modelOptions"
-            placeholder="模型"
-            open-direction="up"
-            :disabled="isInteractionDisabled || modelOptions.length === 0"
-            enable-search
-            search-placeholder="搜索模型"
-            @update:model-value="emit('update:selected-model', $event)"
-          />
-          <ComposerDropdown
-            class="plc-composer-dropdown"
-            :model-value="selectedCollaborationMode"
-            :options="modeOptions"
-            placeholder="模式"
-            open-direction="up"
-            :disabled="isInteractionDisabled"
-            @update:model-value="emit('update:selected-collaboration-mode', $event as CollaborationModeKind)"
-          />
           <ComposerSearchDropdown
             class="plc-composer-dropdown"
             :options="skillOptions"
@@ -978,22 +1034,102 @@ defineExpose<ThreadComposerExposed>({
             :disabled="isInteractionDisabled"
             @toggle="onSkillToggle"
           />
-          <ComposerDropdown
-            class="plc-composer-dropdown"
-            :model-value="selectedReasoningEffort || 'medium'"
-            :options="reasoningOptions"
-            placeholder="思考"
-            open-direction="up"
-            :disabled="isInteractionDisabled"
-            @update:model-value="emit('update:selected-reasoning-effort', $event as ReasoningEffort)"
-          />
         </div>
 
         <div class="plc-composer-actions">
-          <span class="plc-context-indicator" :data-tone="contextView.tone" :title="contextTitle">
-            <span class="plc-context-dot" />
-            {{ contextView.label }}
+          <div class="plc-model-reasoning-picker">
+            <button
+              type="button"
+              class="plc-model-reasoning-trigger"
+              :aria-expanded="isModelReasoningOpen"
+              aria-haspopup="dialog"
+              :disabled="isInteractionDisabled"
+              :title="`模型：${selectedModelOption?.label || '未选择'}（${selectedModelOption?.model || '未配置'}）；思考：${selectedReasoningLabel}`"
+              @click.stop="toggleModelReasoningPicker"
+            >
+              <span class="plc-model-reasoning-model">{{ selectedModelOption?.label || '模型' }}</span>
+              <span class="plc-model-reasoning-divider">·</span>
+              <span class="plc-model-reasoning-effort">{{ selectedReasoningLabel }}</span>
+            </button>
+            <div v-if="isModelReasoningOpen" class="plc-model-reasoning-popover" role="dialog" aria-label="模型和思考等级">
+              <div class="plc-model-reasoning-heading">
+                <span>模型与思考</span>
+                <strong>{{ modelReasoningLabel }}</strong>
+              </div>
+              <label class="plc-model-search">
+                <span class="sr-only">搜索模型</span>
+                <input v-model="modelQuery" type="search" placeholder="搜索模型" />
+              </label>
+              <div class="plc-model-list" role="listbox" aria-label="可用模型">
+                <button
+                  v-for="option in filteredModelOptions"
+                  :key="option.value"
+                  type="button"
+                  class="plc-model-option"
+                  :class="{ 'is-selected': option.value === props.selectedModel }"
+                  role="option"
+                  :aria-selected="option.value === props.selectedModel"
+                  @click.stop="selectModel(option.value)"
+                >
+                  <span class="plc-model-option-copy">
+                    <strong>{{ option.label }}</strong>
+                    <small>{{ option.model }}</small>
+                  </span>
+                </button>
+                <p v-if="filteredModelOptions.length === 0" class="plc-model-empty">没有匹配的模型</p>
+              </div>
+              <div class="plc-reasoning-panel">
+                <div class="plc-reasoning-panel-heading">
+                  <span>思考深度</span>
+                  <strong>{{ selectedReasoningLabel }}</strong>
+                </div>
+                <input
+                  class="plc-reasoning-range"
+                  type="range"
+                  min="0"
+                  :max="reasoningOptions.length - 1"
+                  step="1"
+                  :value="selectedReasoningIndex"
+                  :disabled="isInteractionDisabled"
+                  :style="reasoningRangeStyle"
+                  :aria-label="`思考等级：${selectedReasoningLabel}`"
+                  @input="onReasoningInput"
+                />
+                <div class="plc-reasoning-ticks" aria-hidden="true">
+                  <span v-for="(_, index) in reasoningOptions" :key="`tick-${index}`" :class="{ 'is-active': index <= selectedReasoningIndex }" />
+                </div>
+                <div class="plc-reasoning-scale" aria-hidden="true">
+                  <span v-for="option in reasoningOptions" :key="option.value">{{ option.label }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <span class="plc-context-indicator" :data-tone="contextView.tone" :title="contextTitle" :aria-label="contextTooltip" tabindex="0">
+            <span class="plc-context-ring" :style="contextRingStyle"><span /></span>
+            <span class="plc-context-tooltip" role="tooltip">{{ contextTooltip }}</span>
           </span>
+          <button
+            v-if="isTurnInProgress"
+            type="button"
+            class="plc-composer-queue"
+            :disabled="!canSubmit"
+            aria-label="排队发送任务"
+            title="排队发送任务"
+            @click="submitCurrent('queue')"
+          >
+            <IconTablerArrowUp aria-hidden="true" />
+          </button>
+          <button
+            v-if="isTurnInProgress"
+            type="button"
+            class="plc-composer-stop"
+            :disabled="!canSubmit"
+            aria-label="打断并发送"
+            title="打断当前任务并发送"
+            @click="submitCurrent('steer')"
+          >
+            <IconTablerBolt aria-hidden="true" />
+          </button>
           <button
             v-if="isTurnInProgress"
             type="button"
@@ -1030,26 +1166,26 @@ defineExpose<ThreadComposerExposed>({
 }
 
 .plc-composer-shell {
-  --composer-bg: #fbfaf7;
-  --composer-border: rgba(72, 66, 58, 0.18);
-  --composer-text: #24211e;
-  --composer-muted: #77716a;
-  --composer-soft: rgba(72, 66, 58, 0.07);
+  --composer-bg: #ffffff;
+  --composer-border: #d4d4d4;
+  --composer-text: #333333;
+  --composer-muted: #737373;
+  --composer-soft: rgba(0, 0, 0, 0.06);
   border: 1px solid var(--composer-border);
-  border-radius: 16px;
+  border-radius: 8px;
   background: var(--composer-bg);
   color: var(--composer-text);
-  box-shadow: 0 0 0 1px rgba(20, 17, 14, 0.02), 0 10px 28px rgba(35, 29, 24, 0.08);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
   transition: border-color 160ms ease, box-shadow 160ms ease;
 }
 
 .plc-composer-shell:focus-within {
-  border-color: rgba(168, 111, 34, 0.5);
-  box-shadow: 0 0 0 3px rgba(168, 111, 34, 0.1), 0 12px 30px rgba(35, 29, 24, 0.1);
+  border-color: #9b9b9b;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.05);
 }
 
 .plc-composer-shell.is-busy {
-  border-color: rgba(168, 111, 34, 0.36);
+  border-color: #a3a3a3;
 }
 
 .plc-composer-chips {
@@ -1066,8 +1202,8 @@ defineExpose<ThreadComposerExposed>({
   max-width: 100%;
   padding: 4px 7px;
   border-radius: 7px;
-  background: rgba(168, 111, 34, 0.11);
-  color: #85551c;
+  background: var(--composer-soft);
+  color: var(--composer-text);
   font-size: 11px;
   font-weight: 600;
 }
@@ -1138,20 +1274,94 @@ defineExpose<ThreadComposerExposed>({
   border-top: 1px solid var(--composer-soft);
 }
 
-.plc-composer-options { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 12px; }
+.plc-composer-options { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 10px; }
 .plc-composer-dropdown { min-width: 0; }
 .plc-composer-options :deep(.composer-dropdown-trigger), .plc-composer-options :deep(.search-dropdown-trigger) { color: var(--composer-muted); font-size: 11px; }
 .plc-composer-options :deep(.composer-dropdown-trigger:hover), .plc-composer-options :deep(.search-dropdown-trigger:hover) { color: var(--composer-text); }
 
 .plc-composer-actions { display: flex; align-items: center; gap: 9px; flex: 0 0 auto; }
 
-.plc-context-indicator { display: inline-flex; align-items: center; gap: 5px; color: var(--composer-muted); font-size: 10px; white-space: nowrap; }
-.plc-context-dot { width: 6px; height: 6px; border-radius: 50%; background: #9b958e; }
-.plc-context-indicator[data-tone="healthy"] .plc-context-dot { background: #4e9470; }
-.plc-context-indicator[data-tone="warning"] .plc-context-dot { background: #b8832f; }
-.plc-context-indicator[data-tone="danger"] .plc-context-dot { background: #b55248; }
+.plc-model-reasoning-picker { position: relative; flex: 0 0 auto; }
+.plc-model-reasoning-trigger {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 164px;
+  height: 26px;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  padding: 0 7px;
+  color: var(--composer-muted);
+  cursor: pointer;
+  font-size: 11px;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+.plc-model-reasoning-trigger:hover:not(:disabled),
+.plc-model-reasoning-trigger[aria-expanded='true'] { background: var(--composer-soft); color: var(--composer-text); }
+.plc-model-reasoning-trigger:disabled { cursor: not-allowed; opacity: 0.45; }
+.plc-model-reasoning-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.plc-model-reasoning-divider { color: var(--composer-muted); }
+.plc-model-reasoning-effort { flex: 0 0 auto; }
 
-.plc-composer-submit, .plc-composer-stop {
+.plc-model-reasoning-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 360;
+  display: flex;
+  width: min(260px, calc(100vw - 24px));
+  flex-direction: column;
+  gap: 7px;
+  border: 1px solid var(--composer-border);
+  border-radius: 12px;
+  background: var(--composer-bg);
+  padding: 9px;
+  color: var(--composer-text);
+  box-shadow: 0 16px 38px rgba(35, 29, 24, 0.18);
+}
+.plc-model-reasoning-heading,
+.plc-reasoning-panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--composer-muted); font-size: 10px; }
+.plc-model-reasoning-heading strong,
+.plc-reasoning-panel-heading strong { color: var(--composer-text); font-size: 11px; }
+.plc-model-search input { width: 100%; height: 25px; border: 1px solid var(--composer-soft); border-radius: 6px; background: var(--composer-soft); padding: 0 7px; color: var(--composer-text); font-size: 10px; outline: none; }
+.plc-model-search input:focus { border-color: rgba(0, 122, 204, 0.65); box-shadow: 0 0 0 2px rgba(0, 122, 204, 0.16); }
+.plc-model-list { display: flex; max-height: 112px; flex-direction: column; gap: 1px; overflow-y: auto; }
+.plc-model-option { display: flex; min-height: 34px; flex-direction: row; align-items: center; justify-content: flex-start; gap: 8px; border: 0; border-radius: 6px; background: transparent; padding: 5px 7px; color: var(--composer-text); text-align: left; }
+.plc-model-option:hover, .plc-model-option.is-selected { background: rgba(0, 122, 204, 0.12); }
+.plc-model-option-copy { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.plc-model-option-copy strong, .plc-model-option-copy small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plc-model-option-copy strong { font-size: 11px; font-weight: 600; }
+.plc-model-option-copy small { color: var(--composer-muted); font-size: 9px; font-weight: 400; }
+.plc-model-empty { margin: 4px 7px; color: var(--composer-muted); font-size: 10px; }
+.plc-reasoning-panel { display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--composer-soft); padding-top: 8px; }
+.plc-reasoning-range { width: 100%; height: 30px; appearance: none; background: transparent; cursor: pointer; }
+.plc-reasoning-range::-webkit-slider-runnable-track { height: 30px; border-radius: 999px; background: linear-gradient(90deg, #5e5e5e 0 var(--reasoning-percent), #383838 var(--reasoning-percent) 100%); box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.16); }
+.plc-reasoning-range::-webkit-slider-thumb { width: 26px; height: 26px; margin-top: 2px; appearance: none; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25); transition: transform 140ms ease, box-shadow 140ms ease; }
+.plc-reasoning-range:hover::-webkit-slider-thumb { transform: scale(1.06); box-shadow: 0 2px 10px rgba(0, 122, 204, 0.35); }
+.plc-reasoning-range::-moz-range-track { height: 30px; border-radius: 999px; background: #383838; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.16); }
+.plc-reasoning-range::-moz-range-progress { height: 30px; border-radius: 999px; background: #5e5e5e; }
+.plc-reasoning-range::-moz-range-thumb { width: 26px; height: 26px; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 2px 7px rgba(0, 0, 0, 0.28); }
+.plc-reasoning-range:disabled { cursor: not-allowed; opacity: 0.45; }
+.plc-reasoning-scale { display: flex; justify-content: space-between; gap: 4px; color: var(--composer-muted); font-size: 9px; }
+.plc-reasoning-scale span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plc-reasoning-ticks { display: flex; justify-content: space-between; gap: 4px; margin: -21px 12px 0; pointer-events: none; }
+.plc-reasoning-ticks span { width: 4px; height: 4px; border-radius: 50%; background: rgba(255, 255, 255, 0.28); transition: background-color 140ms ease, transform 140ms ease; }
+.plc-reasoning-ticks span.is-active { background: rgba(255, 255, 255, 0.78); transform: scale(1.15); }
+
+.plc-context-indicator { position: relative; display: inline-flex; width: 19px; height: 19px; align-items: center; justify-content: center; color: var(--composer-muted); outline: none; }
+.plc-context-ring { display: inline-flex; width: 17px; height: 17px; align-items: center; justify-content: center; border-radius: 50%; background: conic-gradient(#007acc var(--context-percent), var(--composer-soft) 0); }
+.plc-context-ring > span { width: 11px; height: 11px; border-radius: 50%; background: var(--composer-bg); }
+.plc-context-indicator[data-tone="healthy"] .plc-context-ring { background: conic-gradient(#929292 var(--context-percent), var(--composer-soft) 0); }
+.plc-context-indicator[data-tone="warning"] .plc-context-ring { background: conic-gradient(#b8832f var(--context-percent), var(--composer-soft) 0); }
+.plc-context-indicator[data-tone="danger"] .plc-context-ring { background: conic-gradient(#b55248 var(--context-percent), var(--composer-soft) 0); }
+.plc-context-tooltip { position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 20; display: none; width: max-content; max-width: 230px; border: 1px solid var(--composer-border); border-radius: 7px; background: var(--composer-bg); padding: 5px 7px; color: var(--composer-text); font-size: 10px; line-height: 1.4; white-space: nowrap; box-shadow: 0 9px 22px rgba(35, 29, 24, 0.16); pointer-events: none; }
+.plc-context-indicator:hover .plc-context-tooltip,
+.plc-context-indicator:focus-visible .plc-context-tooltip { display: block; }
+
+.plc-composer-submit, .plc-composer-stop, .plc-composer-queue {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1163,10 +1373,14 @@ defineExpose<ThreadComposerExposed>({
   transition: transform 140ms ease, background 140ms ease, opacity 140ms ease;
 }
 
-.plc-composer-submit { background: #2b2926; color: #fffaf1; }
-.plc-composer-submit:hover:not(:disabled), .plc-composer-stop:hover { transform: translateY(-1px); background: #a86f22; }
+.plc-composer-submit { background: #333; color: #fff; }
+.plc-composer-submit:hover:not(:disabled), .plc-composer-stop:hover { transform: translateY(-1px); background: #525252; color: #fff; }
 .plc-composer-submit:disabled { cursor: not-allowed; opacity: 0.35; }
-.plc-composer-stop { background: #ebe5dc; color: #655e56; }
+.plc-composer-stop { background: #e5e5e5; color: #525252; }
+.plc-composer-queue { width: 27px; height: 27px; border: 1px solid var(--composer-soft); border-radius: 50%; background: transparent; color: var(--composer-muted); }
+.plc-composer-queue:hover:not(:disabled) { border-color: rgba(0, 122, 204, 0.55); background: rgba(0, 122, 204, 0.1); color: #007acc; transform: translateY(-1px); }
+.plc-composer-queue:disabled { cursor: not-allowed; opacity: 0.35; }
+.plc-composer-queue svg { width: 13px; height: 13px; }
 .plc-composer-submit svg, .plc-composer-stop svg { width: 15px; height: 15px; }
 
 .plc-plan-note { margin: 0 2px; color: #8a6a3c; font-size: 10px; }
@@ -1174,7 +1388,8 @@ defineExpose<ThreadComposerExposed>({
 @media (max-width: 720px) {
   .plc-composer-toolbar { align-items: flex-end; }
   .plc-composer-options { gap: 8px; }
-  .plc-context-indicator { display: none; }
+  .plc-context-indicator { flex-shrink: 0; }
+  .plc-model-reasoning-trigger { min-width: 126px; max-width: 170px; }
 }
 
 :global(:root.dark) .plc-composer-shell {
@@ -1190,5 +1405,7 @@ defineExpose<ThreadComposerExposed>({
 :global(:root.dark) .plc-composer-submit { background: #0e639c; color: #ffffff; }
 :global(:root.dark) .plc-composer-submit:hover:not(:disabled), :global(:root.dark) .plc-composer-stop:hover { background: var(--plc-dark-accent-hover); color: #ffffff; }
 :global(:root.dark) .plc-composer-stop { background: var(--plc-dark-control); color: var(--plc-dark-text); }
+:global(:root.dark) .plc-composer-queue { border-color: var(--plc-dark-border); color: var(--plc-dark-muted); }
+:global(:root.dark) .plc-composer-queue:hover:not(:disabled) { border-color: rgba(0, 122, 204, 0.65); background: rgba(0, 122, 204, 0.18); color: #4fc1ff; }
 :global(:root.dark) .plc-plan-note { color: var(--plc-dark-link); }
 </style>

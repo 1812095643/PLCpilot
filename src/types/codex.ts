@@ -11,8 +11,12 @@ export type CollaborationModeOption = {
 
 export type CommandExecutionData = {
   command: string
+  /** 原始工具名，用于区分终端命令与 read/grep/MCP 等 Agent 工具。 */
+  tool?: string | null
+  /** 后端活动分类；只用于图标和展示，不参与工具执行。 */
+  kind?: string
   cwd: string | null
-  status: 'inProgress' | 'completed' | 'failed' | 'declined' | 'interrupted'
+  status: 'inProgress' | 'completed' | 'failed' | 'declined' | 'interrupted' | 'waiting'
   aggregatedOutput: string
   exitCode: number | null
 }
@@ -89,6 +93,24 @@ export type UiResponseTextAnnotation = {
   createdAt: string
 }
 
+/**
+ * 可恢复的失败轮次请求参数。
+ *
+ * 失败消息只保存本轮用户输入及其实际配置，手动重试时从失败轮次之前
+ * 的会话分支重新发送，避免把失败用户消息或已完成工具再次写入上下文。
+ */
+export type UiRetryPayload = {
+  text: string
+  modelProfileId: string
+  model: string
+  reasoningEffort: ReasoningEffort
+  collaborationMode: CollaborationModeKind
+  skills: Array<{ name: string; path: string }>
+  attachments: UiAttachment[]
+  references: UiMentionReference[]
+  responseAnnotations: UiResponseTextAnnotation[]
+}
+
 export type UiMessage = {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -105,10 +127,26 @@ export type UiMessage = {
   turnIndex?: number
   /** 仅由本地会话恢复/分支使用的稳定消息序号，不参与 Agent 提示内容。 */
   sessionMessageIndex?: number
+  /** Pi 原始用户轮次；null 表示本地命令或尚未进入 Pi 的请求。 */
+  sessionTurnIndex?: number | null
+  /** 发送该用户消息时选择的模型 profile。 */
+  modelProfileId?: string
+  /** 发送该用户消息时使用的模型 ID。 */
+  model?: string
+  /** 发送该用户消息时使用的思考等级。 */
+  reasoningEffort?: ReasoningEffort
+  /** 发送该用户消息时使用的协作模式。 */
+  collaborationMode?: CollaborationModeKind
   /** 用于在会话恢复后重新绑定本地评论。 */
   messageKey?: string
   /** Codex 风格的 AI 回复选区批注标记。 */
   responseAnnotations?: UiResponseTextAnnotation[]
+  /** 活动汇总消息引用的后台事件消息 ID；用于三层时间线折叠。 */
+  activityEventIds?: string[]
+  /** 本轮后台活动的实际耗时，单位为毫秒。 */
+  activityDurationMs?: number
+  /** 失败轮次的原始请求参数，仅 turnError 消息使用。 */
+  retryPayload?: UiRetryPayload
 }
 
 export type UiLiveOverlay = {
@@ -116,6 +154,7 @@ export type UiLiveOverlay = {
   activityDetails: string[]
   reasoningText: string
   errorText: string
+  status?: 'working' | 'streaming' | 'reconnecting' | 'error'
 }
 
 export type UiTokenUsageBreakdown = {

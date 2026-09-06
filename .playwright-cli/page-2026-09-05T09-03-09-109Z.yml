@@ -1,0 +1,72 @@
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - button "收起侧边栏" [ref=e7] [cursor=pointer]
+      - button "P codesys测试工程" [ref=e10] [cursor=pointer]:
+        - generic [ref=e11]: P
+        - generic [ref=e12]: codesys测试工程
+    - navigation "应用菜单" [ref=e13]:
+      - button "文件" [ref=e15] [cursor=pointer]
+      - button "编辑" [ref=e17] [cursor=pointer]
+      - button "视图" [ref=e19] [cursor=pointer]
+      - button "帮助" [ref=e21] [cursor=pointer]
+    - generic [ref=e23]:
+      - button "最小化" [ref=e24] [cursor=pointer]
+      - button "最大化" [ref=e26] [cursor=pointer]
+      - button "关闭" [ref=e28] [cursor=pointer]
+  - generic [ref=e30]:
+    - complementary [ref=e31]:
+      - complementary [ref=e32]:
+        - generic [ref=e33]:
+          - button "搜索线程" [ref=e34] [cursor=pointer]
+          - button "Start new thread" [ref=e38] [cursor=pointer]
+        - button "P PLC Pilot CODESYS 3.5.22" [ref=e41] [cursor=pointer]:
+          - generic [ref=e42]: P
+          - generic [ref=e43]:
+            - strong [ref=e44]: PLC Pilot
+            - generic [ref=e45]: CODESYS 3.5.22
+        - generic [ref=e47]:
+          - generic [ref=e48]: 项目
+          - button "添加项目" [ref=e49] [cursor=pointer]
+        - button "codesys测试工程 E:\\codesys测试工程" [ref=e52] [cursor=pointer]:
+          - generic [ref=e54]:
+            - strong [ref=e55]: codesys测试工程
+            - generic [ref=e56]: E:\codesys测试工程
+        - paragraph [ref=e57]: 会话
+        - paragraph [ref=e59]: 发送第一条任务后，会话会自动保留。
+        - button "PLC Skills 工程规范与安全审查" [ref=e61] [cursor=pointer]:
+          - generic [ref=e64]:
+            - strong [ref=e65]: PLC Skills
+            - generic [ref=e66]: 工程规范与安全审查
+        - button "设置 模型、MCP 和主题" [ref=e67] [cursor=pointer]:
+          - generic [ref=e72]:
+            - strong [ref=e73]: 设置
+            - generic [ref=e74]: 模型、MCP 和主题
+    - button "调整侧边栏宽度" [ref=e75]
+    - generic [ref=e76]:
+      - generic [ref=e78]:
+        - heading "codesys测试工程" [level=1] [ref=e81]
+        - generic [ref=e82]:
+          - button "命令面板" [ref=e83] [cursor=pointer]: ⌘K
+          - button "切换主题" [ref=e84] [cursor=pointer]: ●
+      - main [ref=e85]:
+        - paragraph [ref=e89]: No messages in this thread yet.
+      - generic [ref=e92]:
+        - generic [ref=e93]:
+          - textbox "描述要检查、修改或诊断的 PLC 任务…" [ref=e94]
+          - generic [ref=e95]:
+            - generic [ref=e96]: Enter 发送 · Shift+Enter 换行
+            - generic [ref=e97]:
+              - code [ref=e98]: "@"
+              - text: 引用文件、文件夹或历史会话
+        - generic [ref=e99]:
+          - generic [ref=e100]:
+            - button "添加附件" [ref=e101] [cursor=pointer]
+            - button "PLC Skills" [ref=e105] [cursor=pointer]
+          - generic [ref=e109]:
+            - button "gpt-5.6-sol · 标准" [ref=e111] [cursor=pointer]:
+              - generic [ref=e112]: gpt-5.6-sol
+              - generic [ref=e113]: ·
+              - generic [ref=e114]: 标准
+            - generic "剩余 100% · 0 / 128,000 tokens" [ref=e115]
+            - button "发送任务" [disabled] [ref=e118]

@@ -1,6 +1,7 @@
 <template>
   <div class="sidebar-thread-controls">
     <button
+      v-if="showToggleButton"
       class="sidebar-thread-controls-button"
       type="button"
       :aria-label="isSidebarCollapsed ? t('Expand sidebar') : t('Collapse sidebar')"
@@ -32,10 +33,14 @@ import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
 import IconTablerLayoutSidebar from '../icons/IconTablerLayoutSidebar.vue'
 import IconTablerLayoutSidebarFilled from '../icons/IconTablerLayoutSidebarFilled.vue'
 
-defineProps<{
+withDefaults(defineProps<{
   isSidebarCollapsed: boolean
   showNewThreadButton?: boolean
-}>()
+  showToggleButton?: boolean
+}>(), {
+  showNewThreadButton: false,
+  showToggleButton: true,
+})
 
 defineEmits<{
   'toggle-sidebar': []

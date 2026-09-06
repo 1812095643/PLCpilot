@@ -1,0 +1,23 @@
+[workspace]
+members = ["apply-patch"]
+resolver = "2"
+
+[workspace.package]
+version = "0.65.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+similar = "2.7.0"
+thiserror = "2.0.17"
+tree-sitter = "0.25.10"
+tree-sitter-bash = "0.25"
+assert_cmd = "2"
+assert_matches = "1.5.0"
+pretty_assertions = "1.4.1"
+tempfile = "3.23.0"
+
+[workspace.lints.rust]
+
+[workspace.lints.clippy]

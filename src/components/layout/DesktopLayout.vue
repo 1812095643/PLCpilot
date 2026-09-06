@@ -1,6 +1,11 @@
 <template>
-  <div class="desktop-layout" :class="{ 'is-mobile': isMobile }" :style="layoutStyle" @dragover="$emit('dragover', $event)" @dragleave="$emit('dragleave', $event)" @drop="$emit('drop', $event)">
-    <Teleport v-if="isMobile" to="body">
+  <div class="desktop-layout" :class="{ 'is-mobile': isMobile }" @dragover="$emit('dragover', $event)" @dragleave="$emit('dragleave', $event)" @drop="$emit('drop', $event)">
+    <div v-if="$slots.topbar" class="desktop-topbar">
+      <slot name="topbar" />
+    </div>
+
+    <div class="desktop-workspace" :style="layoutStyle">
+    <Teleport v-if="isMobile && !isSettingsMode" to="body">
       <Transition name="drawer">
         <div v-if="!isSidebarCollapsed" class="mobile-drawer-backdrop" @click="$emit('close-sidebar')">
           <aside class="mobile-drawer" @click.stop>
@@ -10,7 +15,7 @@
       </Transition>
     </Teleport>
 
-    <template v-if="!isMobile">
+    <template v-if="!isMobile && !isSettingsMode">
       <aside v-if="!isSidebarCollapsed" class="desktop-sidebar">
         <slot name="sidebar" />
       </aside>
@@ -18,13 +23,13 @@
         v-if="!isSidebarCollapsed"
         class="desktop-resize-handle"
         type="button"
-        aria-label="Resize sidebar"
+        aria-label="调整侧边栏宽度"
         @mousedown="onResizeHandleMouseDown"
       />
     </template>
 
     <section class="desktop-main">
-      <header v-if="$slots.header" class="desktop-header">
+      <header v-if="$slots.header && !isSettingsMode" class="desktop-header">
         <slot name="header" />
       </header>
 
@@ -32,10 +37,11 @@
         <slot name="content" />
       </main>
 
-      <footer v-if="$slots.composer" class="desktop-composer">
+      <footer v-if="$slots.composer && !isSettingsMode" class="desktop-composer">
         <slot name="composer" />
       </footer>
     </section>
+    </div>
 
     <slot name="overlays" />
   </div>
@@ -48,9 +54,11 @@ import { useMobile } from '../../composables/useMobile'
 const props = withDefaults(
   defineProps<{
     isSidebarCollapsed?: boolean
+    isSettingsMode?: boolean
   }>(),
   {
     isSidebarCollapsed: false,
+    isSettingsMode: false,
   },
 )
 
@@ -62,6 +70,7 @@ defineEmits<{
 }>()
 
 defineSlots<{
+  topbar?: () => unknown
   sidebar?: () => unknown
   header?: () => unknown
   content?: () => unknown
@@ -91,7 +100,7 @@ function loadSidebarWidth(): number {
 const sidebarWidth = ref(loadSidebarWidth())
 
 const layoutStyle = computed(() => {
-  if (isMobile.value || props.isSidebarCollapsed) {
+  if (isMobile.value || props.isSidebarCollapsed || props.isSettingsMode) {
     return {
       '--sidebar-width': '0px',
       '--layout-columns': 'minmax(0, 1fr)',
@@ -136,6 +145,20 @@ function onResizeHandleMouseDown(event: MouseEvent): void {
   @apply isolate grid bg-slate-100 text-slate-900 overflow-hidden;
   height: 100vh;
   height: 100dvh;
+  grid-template-rows: auto minmax(0, 1fr);
+  position: relative;
+}
+
+.desktop-topbar {
+  @apply relative z-[400] min-w-0;
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.desktop-workspace {
+  @apply isolate grid min-h-0 min-w-0 overflow-hidden;
+  grid-column: 1;
+  grid-row: 2;
   grid-template-columns: var(--layout-columns);
 }
 
@@ -144,7 +167,7 @@ function onResizeHandleMouseDown(event: MouseEvent): void {
 }
 
 .desktop-resize-handle {
-  @apply relative w-px cursor-col-resize bg-slate-300 hover:bg-slate-400 transition;
+  @apply relative z-[320] w-px cursor-col-resize bg-slate-300 transition hover:bg-slate-400;
 }
 
 .desktop-resize-handle::before {

@@ -5,8 +5,9 @@
 :root {
   color-scheme: light;
   font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #f7f6f2;
-  color: #24211e;
+  background: #ffffff;
+  color: #333333;
+  letter-spacing: 0;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -21,7 +22,10 @@
 *::before,
 *::after {
   box-sizing: border-box;
+  scrollbar-width: none;
 }
+
+*::-webkit-scrollbar { width: 0; height: 0; }
 
 html,
 body,
@@ -38,7 +42,7 @@ body {
 
 body {
   min-width: 320px;
-  background: #f7f6f2;
+  background: #ffffff;
 }
 
 :root.dark body {
@@ -60,6 +64,11 @@ button:disabled {
   cursor: not-allowed;
 }
 
+html:not(.dark) .message-text-flow,
+html:not(.dark) .message-text-flow :where(p, li, h1, h2, h3, h4, blockquote) {
+  color: #333333;
+}
+
 @media (max-width: 768px) {
   input,
   textarea,
@@ -78,10 +87,10 @@ button:disabled {
  */
 
 :root {
-  --plc-light-bg: #f7f6f2;
-  --plc-light-surface: #fffdf9;
-  --plc-light-text: #24211e;
-  --plc-light-muted: #77716a;
+  --plc-light-bg: #ffffff;
+  --plc-light-surface: #f3f3f3;
+  --plc-light-text: #333333;
+  --plc-light-muted: #737373;
   /* VS Code Dark+ 中性色：黑色编辑区、深灰侧栏、浅灰层级和文字。 */
   --plc-dark-bg: #1e1e1e;
   --plc-dark-sidebar: #252526;
@@ -116,6 +125,8 @@ html:root.dark #app {
 
 /* 桌面壳层、侧栏和主内容 */
 html:root.dark .desktop-layout,
+html:root.dark .desktop-topbar,
+html:root.dark .desktop-workspace,
 html:root.dark .desktop-main,
 html:root.dark .desktop-header,
 html:root.dark .desktop-content,
@@ -123,6 +134,25 @@ html:root.dark .desktop-composer,
 html:root.dark .plc-content {
   background-color: var(--plc-dark-bg) !important;
   color: var(--plc-dark-text) !important;
+}
+
+html:not(.dark) .desktop-topbar {
+  background-color: #f3f3f3;
+  color: #333333;
+}
+
+html:not(.dark) .desktop-workspace {
+  background-color: var(--plc-light-bg);
+}
+
+html:root.dark .desktop-topbar {
+  background-color: #181818 !important;
+  color: var(--plc-dark-text) !important;
+  border-bottom-color: var(--plc-dark-divider) !important;
+}
+
+html:root.dark .desktop-workspace {
+  background-color: var(--plc-dark-bg) !important;
 }
 
 html:root.dark .desktop-sidebar,
@@ -139,6 +169,10 @@ html:root.dark .desktop-resize-handle {
 html:root.dark .content-header {
   background-color: var(--plc-dark-bg) !important;
   border-color: var(--plc-dark-divider) !important;
+}
+
+html:root.dark .desktop-resize-handle {
+  background-color: #3e3e42 !important;
 }
 
 html:root.dark .content-title,

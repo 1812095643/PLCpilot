@@ -1,0 +1,10 @@
+PLC Pilot 便携版
+
+运行：双击 plc-pilot.exe
+
+说明：
+1. 这是免安装目录版，不写入开始菜单或卸载项。
+2. 仍需要 Windows WebView2 Runtime。
+3. Agent 实时宿主默认需要 Node.js 22.19+；也可以通过 PLC_PILOT_NODE 指定 node.exe。
+4. 模型 Key、MCP Token 和会话数据保存在当前用户的 C 盘 PLC Pilot 应用数据目录。
+5. 请保持 plc-pilot.exe 与 pi-agent-host.bundle.mjs 位于同一目录。

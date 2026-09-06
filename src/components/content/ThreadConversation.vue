@@ -6,10 +6,12 @@
       v-else-if="messages.length === 0 && !liveOverlay"
       class="conversation-empty"
     >
-      No messages in this thread yet.
+      暂无消息
     </p>
 
-    <ul v-else ref="conversationListRef" class="conversation-list" @scroll="onConversationScroll">
+    <SessionTimeline v-if="timelineTurns.length > 0" :turns="timelineTurns" @jump="jumpToTimelineMessage" />
+
+    <ul v-if="messages.length > 0 || liveOverlay" ref="conversationListRef" class="conversation-list" @scroll="onConversationScroll">
       <li v-if="hasMoreAbove" class="conversation-load-more">
         <button
           type="button"
@@ -21,13 +23,13 @@
         </button>
       </li>
       <template v-for="message in visibleMessages" :key="message.id">
-      <li
-        v-if="!hiddenGroupedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
+       <li
+         v-if="!hiddenGroupedCommandIds.has(message.id) && !hiddenWorkedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
          class="conversation-item"
          :data-role="message.role"
          :data-message-type="message.messageType || ''"
          :data-message-id="message.id"
-       >
+        >
         <div v-if="isCommandMessage(message)" class="message-row" data-role="system">
           <div class="message-stack" data-role="system">
             <button
@@ -278,16 +280,25 @@
               </div>
 
               <article v-if="message.text.length > 0" class="message-card" :data-role="message.role">
+                <span v-if="message.messageType === 'queued'" class="message-queued-badge">排队中</span>
                 <div v-if="message.messageType === 'worked'" class="worked-separator-wrap" aria-live="polite">
-                  <button type="button" class="worked-separator" @click="toggleWorkedExpand(message)">
+                  <button
+                    type="button"
+                    class="worked-separator"
+                    :disabled="(message.activityEventIds?.length ?? 0) === 0"
+                    :aria-expanded="isWorkedExpanded(message)"
+                    :aria-controls="workedDetailsId(message)"
+                    @click="toggleWorkedExpand(message)"
+                  >
                     <span class="worked-separator-line" aria-hidden="true" />
-                    <span class="worked-chevron" :class="{ 'worked-chevron-open': isWorkedExpanded(message) }">▶</span>
-                    <p class="worked-separator-text">{{ message.text }}</p>
+                    <span v-if="message.activityEventIds?.length" class="worked-chevron" :class="{ 'worked-chevron-open': isWorkedExpanded(message) }">▶</span>
+                    <span class="worked-separator-text">{{ message.text }}</span>
+                    <span v-if="message.activityDurationMs" class="worked-duration">{{ formatWorkedDuration(message.activityDurationMs) }}</span>
                     <span class="worked-separator-line" aria-hidden="true" />
                   </button>
-                  <div v-if="isWorkedExpanded(message)" class="worked-details">
+                  <div v-if="isWorkedExpanded(message)" :id="workedDetailsId(message)" class="worked-details" role="region" :aria-label="`${message.text}详情`">
                     <div
-                      v-for="cmd in getCommandsForWorked(messages, messages.indexOf(message))"
+                      v-for="cmd in getCommandsForWorked(message)"
                       :key="`worked-cmd-${cmd.id}`"
                       class="worked-cmd-item"
                     >
@@ -587,9 +598,21 @@
                     <hr v-else-if="block.kind === 'thematicBreak'" class="message-divider" />
                   </template>
                 </div>
-                <p v-if="isTurnErrorMessage(message)" class="turn-error-guidance">
-                  可以先检查模型接口、工程快照和上方工具时间线，再重试本轮任务。
-                </p>
+                <div v-if="isTurnErrorMessage(message)" class="turn-error-actions">
+                  <p class="turn-error-guidance">{{ turnErrorGuidance(message) }}</p>
+                  <button
+                    v-if="message.retryPayload"
+                    type="button"
+                    class="message-action-button turn-error-retry"
+                    :disabled="props.isTurnInProgress"
+                    aria-label="重试本轮消息"
+                    title="保留原配置重试本轮消息"
+                    @click="emit('retry-message', message)"
+                  >
+                    <IconTablerRefresh class="icon-svg" />
+                    <span>重试</span>
+                  </button>
+                </div>
               </article>
 
               <section v-if="readAnchoredFileChangeSummary(message)" class="file-change-summary-block file-change-summary-block-inline">
@@ -735,7 +758,7 @@
                   </button>
                 </template>
                 <button
-                  v-if="message.role === 'assistant'"
+                  v-if="message.role === 'assistant' && !['localCommand', 'turnError', 'turnInterrupted'].includes(message.messageType || '')"
                   type="button"
                   class="message-action-button"
                   :disabled="props.isTurnInProgress"
@@ -755,8 +778,15 @@
       <li v-if="liveOverlay" class="conversation-item conversation-item-overlay">
         <div class="message-row">
           <div class="message-stack">
-            <article class="live-overlay-inline" aria-live="polite">
-              <p class="live-overlay-label">{{ liveOverlay.activityLabel }}</p>
+            <article class="live-overlay-inline" :data-status="liveOverlay.status || 'working'" aria-live="polite">
+              <div class="live-overlay-heading">
+                <span v-if="liveOverlay.status === 'reconnecting'" class="live-overlay-reconnect-spinner" aria-hidden="true" />
+                <span v-else class="live-overlay-pulse" aria-hidden="true" />
+                <p class="live-overlay-label">{{ liveOverlay.activityLabel }}</p>
+              </div>
+              <p v-if="liveOverlay.activityDetails.length > 0" class="live-overlay-detail">
+                {{ liveOverlay.activityDetails.join(' · ') }}
+              </p>
               <p
                 v-if="liveOverlay.reasoningText"
                 class="live-overlay-reasoning"
@@ -1006,6 +1036,7 @@ import IconTablerRefresh from '../icons/IconTablerRefresh.vue'
 import IconTablerTerminal from '../icons/IconTablerTerminal.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
+import SessionTimeline, { type SessionTimelineTurn } from './SessionTimeline.vue'
 
 type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
 
@@ -1083,6 +1114,18 @@ function isTurnErrorMessage(message: UiMessage): boolean {
   return message.messageType === 'turnError'
 }
 
+function turnErrorGuidance(message: UiMessage): string {
+  const errorText = message.text
+  const status = errorText.match(/\b([45]\d{2})\b/u)?.[1]
+  if (status === '404') return '接口路由（404）未找到，请检查模型地址及接口路径。'
+  if (status === '429') return '服务端限流（429），已完成自动重试；可稍后重试或检查限流配额。'
+  if (status && Number(status) >= 500) return `模型服务暂时不可用（${status}），已完成自动重试；可稍后重试或切换模型。`
+  if (/timeout|timed out|超时|connection|连接|network|网络/iu.test(errorText)) {
+    return '模型连接或超时未完成，请检查网络、代理和接口地址后重试。'
+  }
+  return '请检查模型接口、工程快照和上方工具时间线，再重试本轮任务。'
+}
+
 function buildPlanMessageText(explanation: string, steps: UiPlanStep[]): string {
   const lines: string[] = []
   if (explanation.trim()) {
@@ -1146,7 +1189,9 @@ const groupedCommandsByLatestId = computed<Record<string, UiMessage[]>>(() => {
       index += 1
     }
 
-    if (block.length <= 1) continue
+    // 运行中必须逐项展示每个真实工具；本轮结束后才交给 worked 三层折叠。
+    // 否则第二个工具一出现，现有连续命令分组会立刻吞掉第一条状态。
+    if (block.length <= 1 || isLiveTurnRuntime.value) continue
     const latest = block[block.length - 1]
     next[latest.id] = block.slice(0, -1)
   }
@@ -1159,6 +1204,15 @@ const hiddenGroupedCommandIds = computed(() => {
     for (const command of commands) {
       next.add(command.id)
     }
+  }
+  return next
+})
+
+const hiddenWorkedCommandIds = computed(() => {
+  const next = new Set<string>()
+  for (const message of props.messages) {
+    if (message.messageType !== 'worked') continue
+    for (const command of getCommandsForWorked(message)) next.add(command.id)
   }
   return next
 })
@@ -1248,8 +1302,7 @@ function commandGroupSummaryLabel(message: UiMessage): string {
   const commands = getCommandBlockForLatest(message)
   const count = commands.length
   const latestCommand = message.commandExecution?.command?.trim() || '(command)'
-  const countLabel = count === 1 ? '1 command' : `${count} commands`
-  return `${countLabel} · latest: ${latestCommand}`
+  return `${count} 项操作 · 最近：${latestCommand}`
 }
 
 function commandGroupSummaryStatus(message: UiMessage): string {
@@ -1282,11 +1335,12 @@ function mentionKindLabel(reference: UiMentionReference): string {
  * 这里从已有事件命名空间推导图标，不改变后端事件契约。
  */
 function commandUsesMcp(message: UiMessage): boolean {
-  const command = message.commandExecution?.command?.trim().toLowerCase() ?? ''
-  return command.startsWith('plc__')
-    || command.startsWith('mcp__')
-    || command.includes('mcp')
-    || command.includes('tool')
+  const execution = message.commandExecution
+  const tool = execution?.tool?.trim().toLowerCase() ?? ''
+  const kind = execution?.kind?.trim().toLowerCase() ?? ''
+  const terminalTool = /(^|__|[.:/\\])(bash|shell|exec|execute|command|cmd|powershell|pwsh)$/iu.test(tool)
+  if (kind === 'command' || terminalTool) return false
+  return true
 }
 
 function commandOutputFormat(message: UiMessage): string {
@@ -1309,6 +1363,22 @@ function toggleWorkedExpand(message: UiMessage): void {
 
 function isWorkedExpanded(message: UiMessage): boolean {
   return expandedWorkedIds.value.has(message.id)
+}
+
+function workedDetailsId(message: UiMessage): string {
+  return `worked-details-${message.id.replace(/[^a-zA-Z0-9_-]/gu, '-')}`
+}
+
+function formatWorkedDuration(durationMs: number): string {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  const parts: string[] = []
+  if (hours > 0) parts.push(`${hours} 小时`)
+  if (minutes > 0 || hours > 0) parts.push(`${minutes} 分`)
+  parts.push(`${seconds} 秒`)
+  return `处理 ${parts.join(' ')}`
 }
 
 function toggleFileChangeSummary(message: UiMessage): void {
@@ -1359,11 +1429,12 @@ function commandStatusLabel(message: UiMessage): string {
   if (!ce) return ''
   const compact = isCommandCompact(message)
   switch (ce.status) {
-    case 'inProgress': return compact ? 'Running' : '⟳ Running'
-    case 'completed': return ce.exitCode === 0 ? (compact ? 'Done' : '✓ Completed') : `Exit ${ce.exitCode ?? '?'}`
-    case 'failed': return compact ? 'Failed' : '✗ Failed'
-    case 'declined': return compact ? 'Declined' : '⊘ Declined'
-    case 'interrupted': return compact ? 'Stopped' : '⊘ Interrupted'
+    case 'inProgress': return compact ? '运行中' : '⟳ 运行中'
+    case 'completed': return ce.exitCode === 0 ? (compact ? '完成' : '✓ 已完成') : `退出 ${ce.exitCode ?? '?'}`
+    case 'failed': return compact ? '未完成' : '✗ 未完成'
+    case 'declined': return compact ? '已拒绝' : '⊘ 已拒绝'
+    case 'interrupted': return compact ? '已停止' : '⊘ 已停止'
+    case 'waiting': return '等待审批'
     default: return ''
   }
 }
@@ -1371,6 +1442,7 @@ function commandStatusLabel(message: UiMessage): string {
 function commandStatusClass(message: UiMessage): string {
   const s = message.commandExecution?.status
   if (s === 'inProgress') return 'cmd-status-running'
+  if (s === 'waiting') return 'cmd-status-waiting'
   if (s === 'completed' && message.commandExecution?.exitCode === 0) return 'cmd-status-ok'
   return 'cmd-status-error'
 }
@@ -1384,10 +1456,16 @@ function pruneCommandIdSet(source: Set<string>, validIds: Set<string>): Set<stri
   return next.size === source.size ? source : next
 }
 
-function getCommandsForWorked(messages: UiMessage[], workedIndex: number): UiMessage[] {
+function getCommandsForWorked(workedMessage: UiMessage): UiMessage[] {
+  const eventIds = new Set(workedMessage.activityEventIds ?? [])
+  if (eventIds.size > 0) {
+    return props.messages.filter((message) => eventIds.has(message.id) && isCommandMessage(message))
+  }
+
+  const workedIndex = props.messages.indexOf(workedMessage)
   const result: UiMessage[] = []
   for (let i = workedIndex - 1; i >= 0; i--) {
-    const m = messages[i]
+    const m = props.messages[i]
     if (m.messageType === 'commandExecution') result.unshift(m)
     else if (m.role === 'user' || m.messageType === 'worked') break
   }
@@ -1406,9 +1484,40 @@ const props = defineProps<{
   loadEarlierMessages?: (threadId: string) => Promise<void>
 }>()
 
+/**
+ * 每条已发送的用户消息建立一个刻度，预览随回复增量更新；尚未发送的队列不占刻度。
+ * 工具、思考和 worked 汇总属于同一轮的后台轨迹，不再各自占用导轨刻度。
+ */
+const timelineAssistantByUserId = computed<Record<string, UiMessage>>(() => {
+  const next: Record<string, UiMessage> = {}
+  for (let index = 0; index < props.messages.length; index += 1) {
+    const userMessage = props.messages[index]
+    if (userMessage.role !== 'user' || userMessage.messageType === 'queued') continue
+    let assistantMessage: UiMessage | undefined
+    for (let cursor = index + 1; cursor < props.messages.length; cursor += 1) {
+      const candidate = props.messages[cursor]
+      if (candidate.role === 'user') break
+      if (
+        candidate.role === 'assistant'
+        && candidate.messageType !== 'turnError'
+        && candidate.text.trim().length > 0
+      ) {
+        assistantMessage = candidate
+      }
+    }
+    if (assistantMessage) next[userMessage.id] = assistantMessage
+  }
+  return next
+})
+
+const timelineTurns = computed<SessionTimelineTurn[]>(() => props.messages
+  .filter((message) => message.role === 'user' && message.messageType !== 'queued')
+  .map((userMessage) => ({ userMessage, assistantMessage: timelineAssistantByUserId.value[userMessage.id] })))
+
 const emit = defineEmits<{
   'edit-message': [message: UiMessage]
   'resend-message': [message: UiMessage]
+  'retry-message': [message: UiMessage]
   'fork-message': [message: UiMessage]
   'add-response-annotation': [annotation: UiResponseTextAnnotation]
   'update-response-annotation': [annotation: UiResponseTextAnnotation]
@@ -1980,7 +2089,7 @@ function showMessageCopyButton(message: UiMessage): boolean {
 }
 
 function showMessageToolbar(message: UiMessage): boolean {
-  return message.role === 'user' || message.role === 'assistant'
+  return message.role === 'user' || (message.role === 'assistant' && message.text.trim().length > 0)
 }
 
 function isMessageCopied(message: UiMessage): boolean {
@@ -4044,6 +4153,26 @@ function jumpToLatest(): void {
   scheduleBottomLock(4)
 }
 
+async function jumpToTimelineMessage(messageId: string): Promise<void> {
+  const targetIndex = props.messages.findIndex((message) => message.id === messageId)
+  if (targetIndex < 0) return
+  if (targetIndex < renderWindowStart.value) {
+    renderWindowStart.value = Math.max(0, targetIndex - 6)
+  }
+  await nextTick()
+  const container = conversationListRef.value
+  if (!container) return
+  const target = Array.from(container.querySelectorAll<HTMLElement>('[data-message-id]'))
+    .find((element) => element.dataset.messageId === messageId)
+  if (!target) return
+  autoFollowOutput.value = false
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  target.dataset.timelineJump = 'true'
+  window.setTimeout(() => {
+    if (target.isConnected) delete target.dataset.timelineJump
+  }, 900)
+}
+
 async function loadMoreAbove(): Promise<void> {
   const container = conversationListRef.value
   if (!container || !hasMoreAbove.value || isLoadingMore.value || props.isLoadingPersistedAbove === true) return
@@ -4271,7 +4400,7 @@ onBeforeUnmount(() => {
 }
 
 .conversation-list {
-  @apply h-full min-h-0 list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-visible flex flex-col gap-2 sm:gap-3;
+  @apply relative h-full min-h-0 list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-visible flex flex-col gap-2 sm:gap-3;
 }
 
 .conversation-load-more {
@@ -4287,7 +4416,17 @@ onBeforeUnmount(() => {
 }
 
 .conversation-item {
-  @apply m-0 w-full min-w-0 flex;
+  @apply relative m-0 w-full min-w-0 flex;
+}
+
+.conversation-item[data-timeline-jump='true'] .message-card {
+  animation: timeline-jump-highlight 900ms ease both;
+}
+
+@keyframes timeline-jump-highlight {
+  0% { filter: drop-shadow(0 0 0 rgba(0, 122, 204, 0)); }
+  28% { filter: drop-shadow(0 0 8px rgba(0, 122, 204, 0.42)); }
+  100% { filter: drop-shadow(0 0 0 rgba(0, 122, 204, 0)); }
 }
 
 .conversation-item-overlay {
@@ -4327,8 +4466,76 @@ onBeforeUnmount(() => {
   @apply w-full max-w-[min(var(--chat-column-max,45rem),100%)] px-0 py-1 flex flex-col gap-1;
 }
 
+.live-overlay-heading {
+  @apply flex min-w-0 items-center gap-2;
+}
+
+.live-overlay-pulse {
+  @apply h-1.5 w-1.5 shrink-0 rounded-full bg-zinc-400;
+  animation: live-overlay-pulse 1.15s ease-in-out infinite;
+}
+
+.live-overlay-reconnect-spinner {
+  @apply h-3.5 w-3.5 shrink-0 rounded-full border-2 border-zinc-300 border-t-zinc-700;
+  animation: live-overlay-spin 720ms linear infinite;
+}
+
 .live-overlay-label {
   @apply m-0 text-sm leading-5 font-medium text-zinc-600;
+}
+
+.live-overlay-detail {
+  @apply m-0 pl-[22px] text-xs leading-5 text-zinc-500;
+}
+
+.live-overlay-inline[data-status='reconnecting'] .live-overlay-label {
+  @apply text-zinc-800;
+}
+
+@keyframes live-overlay-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes live-overlay-pulse {
+  0%, 100% { opacity: .35; transform: scale(.82); }
+  50% { opacity: 1; transform: scale(1.18); }
+}
+
+.conversation-item[data-message-type='agentMessage.live'] .message-text-flow::after {
+  display: inline-block;
+  width: 1.5px;
+  height: .95em;
+  margin-left: 3px;
+  background: currentColor;
+  content: '';
+  vertical-align: -.08em;
+  animation: live-message-caret 760ms steps(1, end) infinite;
+}
+
+@keyframes live-message-caret {
+  0%, 46% { opacity: 1; }
+  47%, 100% { opacity: 0; }
+}
+
+:global(.dark) .live-overlay-label,
+:global(.dark) .live-overlay-inline[data-status='reconnecting'] .live-overlay-label {
+  @apply text-zinc-200;
+}
+
+:global(.dark) .live-overlay-detail {
+  @apply text-zinc-400;
+}
+
+:global(.dark) .live-overlay-reconnect-spinner {
+  @apply border-zinc-700 border-t-zinc-100;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-overlay-pulse,
+  .live-overlay-reconnect-spinner,
+  .conversation-item[data-message-type='agentMessage.live'] .message-text-flow::after {
+    animation: none;
+  }
 }
 
 .live-overlay-reasoning {
@@ -4354,8 +4561,28 @@ onBeforeUnmount(() => {
   @apply shrink-0 text-xs leading-5 text-rose-600;
 }
 
+.turn-error-actions {
+  @apply mt-3 flex flex-wrap items-center gap-2;
+}
+
 .turn-error-guidance {
-  @apply mt-3 text-xs leading-5 text-rose-600;
+  @apply m-0 min-w-0 flex-1 text-xs leading-5 text-rose-600;
+}
+
+.turn-error-retry {
+  @apply border-rose-200 bg-rose-50 text-rose-700 opacity-100;
+}
+
+.turn-error-retry:hover:not(:disabled) {
+  @apply border-rose-300 bg-rose-100 text-rose-900;
+}
+
+:global(.dark) .turn-error-retry {
+  @apply border-rose-900/70 bg-rose-950/40 text-rose-300;
+}
+
+:global(.dark) .turn-error-retry:hover:not(:disabled) {
+  @apply border-rose-800 bg-rose-950/70 text-rose-100;
 }
 
 .message-body {
@@ -5084,6 +5311,14 @@ onBeforeUnmount(() => {
   @apply px-0 py-0 bg-transparent border-none rounded-none;
 }
 
+.message-queued-badge {
+  @apply mb-1 inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-medium text-sky-700;
+}
+
+:global(.dark) .message-queued-badge {
+  @apply border-sky-800/70 bg-sky-950/40 text-sky-300;
+}
+
 :global(.dark) .message-skill-chip {
   @apply border-emerald-800/70 bg-emerald-950/50 text-emerald-100;
 }
@@ -5126,7 +5361,11 @@ onBeforeUnmount(() => {
 }
 
 .worked-separator-text {
-  @apply m-0 text-sm leading-relaxed font-normal text-slate-800;
+  @apply m-0 min-w-0 truncate text-sm leading-relaxed font-normal text-slate-800;
+}
+
+.worked-duration {
+  @apply shrink-0 text-xs text-zinc-400;
 }
 
 .worked-details {
@@ -5202,6 +5441,55 @@ onBeforeUnmount(() => {
 
 .cmd-status-error .cmd-status {
   @apply text-rose-600;
+}
+
+/* Codex 风格的运行中文字扫光：状态完成后类名变化，扫光会立即停止。 */
+.cmd-status-running .cmd-label,
+.cmd-status-running .cmd-status,
+.live-overlay-inline[data-status='working'] .live-overlay-label,
+.live-overlay-inline[data-status='streaming'] .live-overlay-label {
+  color: transparent;
+  background-image: linear-gradient(
+    100deg,
+    #71717a 8%,
+    #71717a 34%,
+    #18181b 48%,
+    #71717a 62%,
+    #71717a 92%
+  );
+  background-position: 120% 0;
+  background-size: 240% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  animation: command-text-sweep 3.2s ease-in-out infinite;
+}
+
+:global(.dark) .cmd-status-running .cmd-label,
+:global(.dark) .cmd-status-running .cmd-status,
+:global(.dark) .live-overlay-inline[data-status='working'] .live-overlay-label,
+:global(.dark) .live-overlay-inline[data-status='streaming'] .live-overlay-label {
+  background-image: linear-gradient(
+    100deg,
+    #a1a1aa 8%,
+    #a1a1aa 34%,
+    #ffffff 48%,
+    #a1a1aa 62%,
+    #a1a1aa 92%
+  );
+}
+
+@keyframes command-text-sweep {
+  from { background-position: 120% 0; }
+  to { background-position: -120% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cmd-status-running .cmd-label,
+  .cmd-status-running .cmd-status,
+  .live-overlay-inline[data-status='working'] .live-overlay-label,
+  .live-overlay-inline[data-status='streaming'] .live-overlay-label {
+    animation: none;
+  }
 }
 
 .cmd-output-wrap {

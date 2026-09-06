@@ -1,0 +1,135 @@
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - button "收起侧边栏" [ref=e7] [cursor=pointer]
+      - button "P codesys测试工程" [ref=e10] [cursor=pointer]:
+        - generic [ref=e11]: P
+        - generic [ref=e12]: codesys测试工程
+    - navigation "应用菜单" [ref=e13]:
+      - button "文件" [ref=e15] [cursor=pointer]
+      - button "编辑" [ref=e17] [cursor=pointer]
+      - button "视图" [ref=e19] [cursor=pointer]
+      - button "帮助" [ref=e21] [cursor=pointer]
+    - generic [ref=e23]:
+      - button "最小化" [ref=e24] [cursor=pointer]
+      - button "最大化" [ref=e26] [cursor=pointer]
+      - button "关闭" [ref=e28] [cursor=pointer]
+  - generic [ref=e30]:
+    - complementary [ref=e31]:
+      - complementary [ref=e32]:
+        - generic [ref=e33]:
+          - button "搜索线程" [ref=e34] [cursor=pointer]
+          - button "Start new thread" [ref=e38] [cursor=pointer]
+        - button "P PLC Pilot CODESYS 3.5.22" [ref=e41] [cursor=pointer]:
+          - generic [ref=e42]: P
+          - generic [ref=e43]:
+            - strong [ref=e44]: PLC Pilot
+            - generic [ref=e45]: CODESYS 3.5.22
+        - generic [ref=e47]:
+          - generic [ref=e48]: 项目
+          - button "添加项目" [ref=e49] [cursor=pointer]
+        - button "codesys测试工程 E:\\codesys测试工程" [ref=e52] [cursor=pointer]:
+          - generic [ref=e54]:
+            - strong [ref=e55]: codesys测试工程
+            - generic [ref=e56]: E:\codesys测试工程
+        - paragraph [ref=e57]: 会话
+        - generic [ref=e167]:
+          - button "codesys测试工程 2 条消息 · E:\\codesys测试工程" [ref=e168] [cursor=pointer]:
+            - generic [ref=e170]:
+              - strong [ref=e171]: codesys测试工程
+              - generic [ref=e172]: 2 条消息 · E:\codesys测试工程
+          - button "重命名会话 codesys测试工程" [ref=e173] [cursor=pointer]
+          - button "清理会话 codesys测试工程" [ref=e176] [cursor=pointer]
+        - button "PLC Skills 工程规范与安全审查" [ref=e61] [cursor=pointer]:
+          - generic [ref=e64]:
+            - strong [ref=e65]: PLC Skills
+            - generic [ref=e66]: 工程规范与安全审查
+        - button "设置 模型、MCP 和主题" [ref=e67] [cursor=pointer]:
+          - generic [ref=e72]:
+            - strong [ref=e73]: 设置
+            - generic [ref=e74]: 模型、MCP 和主题
+    - button "调整侧边栏宽度" [ref=e75]
+    - generic [ref=e76]:
+      - generic [ref=e78]:
+        - heading "codesys测试工程" [level=1] [ref=e81]
+        - generic [ref=e82]:
+          - button "命令面板" [ref=e83] [cursor=pointer]: ⌘K
+          - button "切换主题" [ref=e84] [cursor=pointer]: ●
+      - main [ref=e85]:
+        - generic [ref=e88]:
+          - complementary "会话时间轴" [ref=e180]:
+            - button "跳转到第 1 轮会话" [ref=e183] [cursor=pointer]
+          - list [ref=e121]:
+            - listitem [ref=e185]:
+              - article [ref=e188]:
+                - article [ref=e189]:
+                  - paragraph [ref=e191]: 请直接用中文写一份约600字的PLC代码审查要点，按6个小节展开。只输出正文，不读取文件，不调用工具，不执行命令。
+                - generic [ref=e192]:
+                  - button "复制消息内容" [ref=e193] [cursor=pointer]:
+                    - generic [ref=e196]: 复制
+                  - button "编辑消息" [disabled] [ref=e197]:
+                    - generic [ref=e200]: 编辑
+                  - button "重新发送消息" [disabled] [ref=e201]:
+                    - generic [ref=e204]: 重发
+            - listitem [ref=e205]:
+              - article [ref=e208]:
+                - article [ref=e209]:
+                  - generic [ref=e210]:
+                    - heading "一、程序结构与责任边界" [level=3] [ref=e211]
+                    - paragraph [ref=e212]: 审查前先确认任务周期、程序调用顺序以及 POU、功能块、全局变量表之间的关系。每个物理输出应只有一个最终写入者，避免多个程序重复赋值造成结果依赖执行顺序。状态、命令、反馈和输出应分层表达，变量命名、数据类型与注释应符合工程既有规范。
+                    - heading "二、扫描周期与时序逻辑" [level=3] [ref=e213]
+                    - paragraph [ref=e214]: PLC 逻辑必须按循环扫描模型分析。检查瞬时信号能否被可靠捕获，边沿检测实例是否持久化，定时器和计数器是否会被重复初始化。确认 TON、TOF、TP 的时间单位、预置值和复位条件，并结合任务周期评估响应延迟。不得把跨周期动作误写成一次性顺序脚本。
+                    - heading "三、状态机与流程控制" [level=3] [ref=e215]
+                    - paragraph [ref=e216]: 状态机应具有明确的初始态、运行态、停止态、故障态和必要的恢复态。每个转换条件应互斥、可追踪，并设置合理超时；未知状态必须回退到安全状态。检查启动、暂停、停止、故障和复位是否分别处理，避免使用一个布尔量承担多个语义。复位不应直接绕过安全条件。
+                    - heading "四、安全互锁与失效处理" [level=3] [ref=e217]
+                    - paragraph [ref=e218]: 重点检查急停、防护门、限位、过载、压力及通信状态等互锁。危险输出应采用失效安全逻辑，传感器断线、数据越界、通信超时或模块故障时不得保持危险动作。自动与手动模式都必须受核心安全条件约束，手动点动和维护旁路还应具备权限、超时及明确指示。
+                    - heading "五、数据质量与异常边界" [level=3] [ref=e219]
+                    - paragraph [ref=e220]: 审查数组下标、字符串长度、类型转换、除零、溢出和量程换算。模拟量应验证有效范围、质量位及滤波策略，不能将异常值直接用于控制。报警应明确触发、锁存、确认和恢复条件，避免瞬时故障被漏报。通信数据需要新鲜度判断，并为丢包或设备离线提供确定的降级行为。
+                    - heading "六、验证、诊断与变更控制" [level=3] [ref=e221]
+                    - paragraph [ref=e222]: 代码修改前应读取现有实现和库依赖，通过差异预览确认影响范围。验证时覆盖正常启动、连续运行、停机、故障注入、通信中断、断电重启及边界值场景。必须使用目标版本的 CODESYS 编译器检查错误和警告；通用 ST 语法通过不能替代目标工程编译。下载、启停、复位和变量强制应单独审批并保留记录。
+                - generic [ref=e223]:
+                  - button "复制消息内容" [ref=e224] [cursor=pointer]:
+                    - generic [ref=e227]: 复制
+                  - button "从这条回复 Fork 会话" [disabled] [ref=e228]:
+                    - generic [ref=e231]: Fork
+            - listitem [ref=e236]:
+              - article [ref=e239]:
+                - article [ref=e240]:
+                  - paragraph [ref=e242]: 请先调用 ls 工具列出当前工作目录，再调用 find 查找其中的 ST 文件，最后调用 read 读取其中一个文件并总结。每个步骤都需要真实调用工具，全程只读，不修改任何文件。
+                - generic [ref=e243]:
+                  - button "复制消息内容" [ref=e244] [cursor=pointer]:
+                    - generic [ref=e247]: 复制
+                  - button "编辑消息" [disabled] [ref=e248]:
+                    - generic [ref=e251]: 编辑
+                  - button "重新发送消息" [disabled] [ref=e252]:
+                    - generic [ref=e255]: 重发
+            - listitem [ref=e256]:
+              - article [ref=e259]:
+                - button "从这条回复 Fork 会话" [disabled] [ref=e261]:
+                  - generic [ref=e264]: Fork
+            - listitem [ref=e265]:
+              - article [ref=e268]:
+                - paragraph [ref=e271]: 正在思考…
+                - paragraph [ref=e272]: 已持续 1 秒
+            - listitem
+          - button "Jump to latest output" [ref=e273] [cursor=pointer]
+      - generic [ref=e92]:
+        - generic [ref=e93]:
+          - textbox "描述要检查、修改或诊断的 PLC 任务…" [active] [ref=e94]
+          - generic [ref=e95]:
+            - generic [ref=e96]: Enter 发送 · Shift+Enter 换行
+            - generic [ref=e97]:
+              - code [ref=e98]: "@"
+              - text: 引用文件、文件夹或历史会话
+        - generic [ref=e99]:
+          - generic [ref=e100]:
+            - button "添加附件" [ref=e101] [cursor=pointer]
+            - button "PLC Skills" [ref=e105] [cursor=pointer]
+          - generic [ref=e109]:
+            - button "gpt-5.6-sol · 标准" [ref=e111] [cursor=pointer]:
+              - generic [ref=e112]: gpt-5.6-sol
+              - generic [ref=e113]: ·
+              - generic [ref=e114]: 标准
+            - generic "剩余 94% · 7,110 / 128,000 tokens" [ref=e232]
+            - button "排队发送任务" [disabled] [ref=e276]
+            - button "停止当前任务" [ref=e279] [cursor=pointer]

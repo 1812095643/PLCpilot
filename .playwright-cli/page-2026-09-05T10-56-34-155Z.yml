@@ -1,0 +1,124 @@
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - button "收起侧边栏" [ref=e7] [cursor=pointer]
+      - button "P 临时会话" [ref=e151] [cursor=pointer]:
+        - generic [ref=e11]: P
+        - generic [ref=e12]: 临时会话
+    - navigation "应用菜单" [ref=e13]:
+      - button "文件" [ref=e15] [cursor=pointer]
+      - button "编辑" [ref=e17] [cursor=pointer]
+      - button "视图" [ref=e19] [cursor=pointer]
+      - button "帮助" [ref=e21] [cursor=pointer]
+    - generic [ref=e23]:
+      - button "最小化" [ref=e24] [cursor=pointer]
+      - button "最大化" [ref=e26] [cursor=pointer]
+      - button "关闭" [ref=e28] [cursor=pointer]
+  - generic [ref=e30]:
+    - complementary [ref=e31]:
+      - complementary [ref=e32]:
+        - generic [ref=e33]:
+          - strong [ref=e34]: PLC Pilot
+          - button "搜索会话" [ref=e35] [cursor=pointer]
+          - button "新建临时会话" [ref=e39] [cursor=pointer]
+        - button "新对话" [ref=e42] [cursor=pointer]
+        - button "工程概览" [ref=e46] [cursor=pointer]
+        - generic [ref=e50]:
+          - generic [ref=e51]:
+            - generic [ref=e52]: 项目
+            - button "添加项目" [ref=e53] [cursor=pointer]
+          - generic [ref=e56]:
+            - generic [ref=e57]:
+              - button "收起 codesys测试工程" [ref=e58] [cursor=pointer]
+              - button "codesys测试工程" [ref=e61] [cursor=pointer]
+              - button "在 codesys测试工程 新建会话" [ref=e62] [cursor=pointer]
+              - button "移除项目 codesys测试工程" [ref=e65] [cursor=pointer]
+            - generic [ref=e69]:
+              - generic [ref=e70]:
+                - button "新对话" [ref=e71] [cursor=pointer]
+                - button "删除 新对话" [ref=e74] [cursor=pointer]
+              - generic [ref=e78]:
+                - button "codesys测试工程" [ref=e79] [cursor=pointer]
+                - button "重命名 codesys测试工程" [ref=e82] [cursor=pointer]
+                - button "删除 codesys测试工程" [ref=e85] [cursor=pointer]
+          - generic [ref=e89]:
+            - generic [ref=e90]: 临时会话
+            - button "添加临时会话" [ref=e91] [cursor=pointer]
+          - generic [ref=e152]:
+            - button "并发验证A：请用中文分8段写一份约1000字的PLC代码审查流程。首行只" [active] [ref=e162] [cursor=pointer]
+            - button "重命名 并发验证A：请用中文分8段写一份约1000字的PLC代码审查流程。首行只" [ref=e163] [cursor=pointer]
+            - button "删除 并发验证A：请用中文分8段写一份约1000字的PLC代码审查流程。首行只" [ref=e166] [cursor=pointer]
+          - generic [ref=e170]:
+            - button "并发验证B：请用中文分8段写一份约1000字的PLC通信诊断流程。首行只" [ref=e171] [cursor=pointer]
+            - button "重命名 并发验证B：请用中文分8段写一份约1000字的PLC通信诊断流程。首行只" [ref=e174] [cursor=pointer]
+            - button "删除 并发验证B：请用中文分8段写一份约1000字的PLC通信诊断流程。首行只" [ref=e177] [cursor=pointer]
+        - generic [ref=e94]:
+          - button "Skills 与工具" [ref=e95] [cursor=pointer]
+          - button "设置" [ref=e99] [cursor=pointer]
+    - button "调整侧边栏宽度" [ref=e105]
+    - generic [ref=e106]:
+      - generic [ref=e108]:
+        - heading "临时会话" [level=1] [ref=e160]
+        - generic [ref=e112]:
+          - button "命令面板" [ref=e113] [cursor=pointer]: ⌘K
+          - button "切换主题" [ref=e114] [cursor=pointer]: ●
+      - main [ref=e115]:
+        - generic [ref=e118]:
+          - complementary "会话时间轴":
+            - button "跳转到第 1 轮会话" [ref=e246] [cursor=pointer]
+          - list [ref=e185]:
+            - listitem [ref=e248]:
+              - article [ref=e251]:
+                - article [ref=e252]:
+                  - paragraph [ref=e254]: 并发验证A：请用中文分8段写一份约1000字的PLC代码审查流程。首行只写验证A，只写正文，不调用工具，不访问任何文件。
+                - generic [ref=e255]:
+                  - button "复制消息内容" [ref=e256] [cursor=pointer]:
+                    - generic [ref=e259]: 复制
+                  - button "编辑消息" [ref=e260] [cursor=pointer]:
+                    - generic [ref=e263]: 编辑
+                  - button "重新发送消息" [ref=e264] [cursor=pointer]:
+                    - generic [ref=e267]: 重发
+            - listitem [ref=e268]:
+              - article [ref=e271]:
+                - article [ref=e272]:
+                  - button "处理完成 处理 32 秒" [disabled] [ref=e274] [cursor=pointer]:
+                    - generic [ref=e276]: 处理完成
+                    - generic [ref=e277]: 处理 32 秒
+            - listitem [ref=e279]:
+              - article [ref=e282]:
+                - article [ref=e283]:
+                  - generic [ref=e284]:
+                    - paragraph [ref=e285]: 验证A
+                    - paragraph [ref=e286]: PLC代码审查首先确认审查边界和运行背景，包括控制器型号、CODESYS版本、任务配置、扫描周期、现场设备、通信关系及安全等级。审查人员应明确本次对象是新增功能、故障修复还是整机变更，并取得对应的程序版本、需求说明、I/O表和测试记录。未确认工程版本、目标设备或代码来源时，不应直接提出写入、下载或上线结论，避免基于错误基线开展审查。
+                    - paragraph [ref=e287]: 第二步检查工程结构和责任边界。逐项定位PROGRAM、FUNCTION_BLOCK、FUNCTION、GVL、DUT、接口、库管理器和任务配置，梳理调用关系与数据流。重点确认每个物理输出和关键状态只有一个最终写入者，避免多个POU在同一扫描周期内竞争赋值。还要检查全局变量是否被过度使用，以及输入采集、逻辑判断、状态处理和输出执行是否保持清晰分层。
+                    - paragraph [ref=e288]: 第三步按照PLC循环扫描模型审查程序语义。需要分析变量在连续扫描周期中的保持、覆盖和更新顺序，不能把Structured Text当作只执行一次的脚本。对于R_TRIG、F_TRIG、TON、TOF、TP及计数器，应确认实例具有持久生命周期，调用条件完整，时间单位正确。还应结合任务周期检查定时精度、抖动、漏脉冲和单周期信号是否可能影响控制结果。
+                    - paragraph [ref=e289]: 第四步审查启动、停止、急停、故障和复位逻辑。启动条件应包含必要的设备就绪、模式许可和安全互锁；停止请求应具有确定的优先级；急停或安全链断开时，危险输出必须进入失效安全状态。故障复位不能直接重新启动设备，应先确认故障条件已经消失，并要求独立的复位动作。通信中断、传感器断线和数值越界也必须有明确处理路径。
+                    - paragraph [ref=e290]: 第五步重点检查状态机。状态机应具有明确的初始态、正常运行态、停止态和故障态，并为每个转换定义唯一、可追踪的条件。执行机构动作应设置合理超时，超时后进入安全故障处理，而不是无限等待。对于异常状态值，应提供默认分支并回退至安全状态。状态进入动作、持续动作和退出动作应区分清楚，避免同一指令在每个扫描周期被重复触发。
+                    - paragraph [ref=e291]: 第六步审查数据类型、边界和通信数据。检查整数溢出、符号转换、浮点比较、除零、数组下标、字符串长度及单位换算，避免隐式类型转换掩盖错误。模拟量应验证量程、工程单位和异常值范围，通信数据应检查新鲜度、有效位、心跳和超时。来自HMI或上位机的设定值不能直接驱动危险动作，必须经过范围限制、权限判断、模式确认和本地互锁。
+                    - paragraph [ref=e292]: 第七步进行变更差异和可测试性审查。将修改内容与已知基线比较，确认没有无关格式化、对象删除、变量重命名或I/O映射变化。测试应覆盖正常流程、边界值、互锁冲突、急停、断电恢复、通信丢失、传感器故障、执行器不到位和重复复位等场景。关键逻辑应记录输入条件、预期状态转换、输出结果和报警行为，使测试可以复现，而不是只依赖现场观察。
+                    - paragraph [ref=e293]: 第八步完成编译、诊断和发布判定。代码写入前应先生成可审阅的差异，获得批准后再应用修改，并使用目标版本的CODESYS编译器执行完整编译。所有错误必须清零，警告应逐条判断是否可接受；通用语法检查不能替代目标工程编译。审查结论应列明证据、遗留风险和回退方案。下载、RUN、STOP、Reset、Force及在线写变量必须单独审批，未经验证不得宣称修改已经上线。
+                - generic [ref=e294]:
+                  - button "复制消息内容" [ref=e295] [cursor=pointer]:
+                    - generic [ref=e298]: 复制
+                  - button "从这条回复 Fork 会话" [ref=e299] [cursor=pointer]:
+                    - generic [ref=e302]: Fork
+            - listitem
+      - generic [ref=e122]:
+        - generic [ref=e123]:
+          - textbox "描述要检查、修改或诊断的 PLC 任务…" [ref=e124]
+          - generic [ref=e125]:
+            - generic [ref=e126]: Enter 发送 · Shift+Enter 换行
+            - generic [ref=e127]:
+              - code [ref=e128]: "@"
+              - text: 引用文件、文件夹或历史会话
+        - generic [ref=e129]:
+          - generic [ref=e130]:
+            - button "添加附件" [ref=e131] [cursor=pointer]
+            - button "PLC Skills" [ref=e135] [cursor=pointer]
+          - generic [ref=e139]:
+            - button "gpt-5.6-sol · 标准" [ref=e141] [cursor=pointer]:
+              - generic [ref=e142]: gpt-5.6-sol
+              - generic [ref=e143]: ·
+              - generic [ref=e144]: 标准
+            - generic "剩余 93% · 8,966 / 128,000 tokens" [ref=e303]
+            - button "发送任务" [disabled] [ref=e242]
