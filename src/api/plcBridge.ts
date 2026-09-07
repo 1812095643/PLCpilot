@@ -87,7 +87,7 @@ export type ModelForm = {
 }
 
 export function modelFormFromSummary(model: ModelSummary): ModelForm {
-  const allowed = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  const allowed = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
   const levels = model.reasoning_levels.filter((level): level is ReasoningEffort => allowed.includes(level))
   return { id: model.id, name: model.name, provider: model.provider, baseUrl: model.base_url, model: model.model, apiKey: '', contextWindow: model.context_window, maxTokens: model.max_tokens, reasoningLevels: levels.length ? levels : ['none'], enabled: model.enabled, isDefault: model.is_default }
 }
@@ -310,7 +310,7 @@ export type AgentRunOptions = {
   /** 本轮选择的模型 profile ID；用于绑定接口、Key、上下文长度和能力。 */
   modelProfileId?: string
   /** Pi 使用的思考级别；none 会在桥接层映射为 off。 */
-  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   /** default 允许按安全策略执行，plan 只允许读取和分析。 */
   collaborationMode?: 'default' | 'plan'
   /** 本轮重点 Skill 的 id 或路径。 */
@@ -406,7 +406,7 @@ export const EMPTY_SNAPSHOT: Snapshot = {
     api_key_configured: false,
     context_window: 128000,
     max_tokens: 4096,
-    reasoning_levels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
+    reasoning_levels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     enabled: true,
     is_default: true,
     last_error: null,

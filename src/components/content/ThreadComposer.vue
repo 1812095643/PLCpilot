@@ -24,6 +24,7 @@ import ComposerSearchDropdown from './ComposerSearchDropdown.vue'
 import ComposerAttachmentStrip from './ComposerAttachmentStrip.vue'
 import ComposerResponseAnnotationStrip from './ComposerResponseAnnotationStrip.vue'
 import ComposerMentionPopup from './ComposerMentionPopup.vue'
+import ComposerModelPicker from './ComposerModelPicker.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
 import IconTablerPaperclip from '../icons/IconTablerPaperclip.vue'
@@ -104,7 +105,7 @@ const props = withDefaults(defineProps<{
   sendWithEnter: true,
   inProgressSubmitMode: 'steer',
   commands: () => [],
-  reasoningEfforts: () => ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
+  reasoningEfforts: () => ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
 })
 
 const emit = defineEmits<{
@@ -134,8 +135,6 @@ const slashCommandQuery = shallowRef('')
 const slashCommandToken = shallowRef('')
 const slashHighlightedIndex = shallowRef(0)
 const dismissedSlashCommandToken = shallowRef<string | null>(null)
-const isModelReasoningOpen = shallowRef(false)
-const modelQuery = shallowRef('')
 
 let lastActiveThreadId = ''
 const draftStorage = useComposerDraftStorage()
@@ -158,61 +157,6 @@ const {
   restoreAttachments,
 } = useComposerAttachments()
 
-const modelOptions = computed(() => {
-  const seen = new Set<string>()
-  const result: Array<{ value: string; label: string; model: string }> = []
-  for (const item of props.models) {
-    const id = item.id.trim()
-    if (!id || seen.has(id)) continue
-    seen.add(id)
-    result.push({
-      value: item.id.trim(),
-      label: item.name.trim() || modelDisplayLabel(item.model),
-      model: item.model.trim(),
-    })
-  }
-  return result
-})
-
-const filteredModelOptions = computed(() => {
-  const query = modelQuery.value.trim().toLowerCase()
-  return query.length === 0
-    ? modelOptions.value
-    : modelOptions.value.filter((option) => `${option.value} ${option.label} ${option.model}`.toLowerCase().includes(query))
-})
-
-const selectedModelOption = computed(() => modelOptions.value.find((option) => option.value === props.selectedModel) ?? modelOptions.value[0] ?? null)
-
-function modelDisplayLabel(modelId: string): string {
-  const normalized = modelId.trim()
-  const knownLabels: Record<string, string> = {
-    'gpt-5.6-sol': '5.6 Sol',
-    'gpt-5.6-terra': '5.6 Terra',
-    'gpt-5.6-luna': '5.6 Luna',
-    'gpt-5.5': '5.5',
-    'gpt-5.2': '5.2',
-    'gpt-5.3-codex-spark': '5.3 Codex Spark',
-  }
-  return knownLabels[normalized.toLowerCase()] ?? normalized.replace(/^gpt-/iu, 'GPT ')
-}
-
-const reasoningOptionLabels: Record<ReasoningEffort, string> = {
-  none: '不思考',
-  minimal: '轻量',
-  low: '低',
-  medium: '标准',
-  high: '高',
-  xhigh: '极高',
-}
-
-const reasoningOptions = computed(() => {
-  const values = props.reasoningEfforts
-    .filter((value, index, all) => all.indexOf(value) === index)
-  const fallback: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
-  return (values.length > 0 ? values : fallback)
-    .map((value) => ({ value, label: reasoningOptionLabels[value] }))
-})
-
 const skillOptions = computed(() => props.skills.map((skill) => ({
   value: skill.path,
   label: skill.displayName || skill.name,
@@ -226,15 +170,6 @@ const skillOptions = computed(() => props.skills.map((skill) => ({
 const selectedSkillPaths = computed(() => selectedSkills.value.map((skill) => skill.path))
 const isInteractionDisabled = computed(() => props.disabled || !props.activeThreadId.trim())
 const isPlanMode = computed(() => props.selectedCollaborationMode === 'plan' || /^\/plan(?:\s|$)/iu.test(draft.value.trim()))
-const selectedReasoningIndex = computed(() => {
-  const index = reasoningOptions.value.findIndex((option) => option.value === (props.selectedReasoningEffort || 'medium'))
-  if (index >= 0) return index
-  const mediumIndex = reasoningOptions.value.findIndex((option) => option.value === 'medium')
-  return mediumIndex >= 0 ? mediumIndex : 0
-})
-const selectedReasoningLabel = computed(() => reasoningOptions.value[selectedReasoningIndex.value]?.label ?? '标准')
-const modelReasoningLabel = computed(() => `${selectedModelOption.value?.label || '选择模型'} · ${selectedReasoningLabel.value}`)
-const reasoningRangeStyle = computed(() => ({ '--reasoning-percent': `${(selectedReasoningIndex.value / Math.max(1, reasoningOptions.value.length - 1)) * 100}%` }))
 const placeholder = computed(() => isInteractionDisabled.value
   ? '先选择一个本地 CODESYS 工程'
   : '描述要检查、修改或诊断的 PLC 任务…')
@@ -870,26 +805,6 @@ function removeSkill(path: string): void {
   selectedSkills.value = selectedSkills.value.filter((item) => item.path !== path)
 }
 
-function onReasoningInput(event: Event): void {
-  const target = event.target
-  if (!(target instanceof HTMLInputElement)) return
-  const index = Number(target.value)
-  const option = reasoningOptions.value[Math.max(0, Math.min(reasoningOptions.value.length - 1, Math.trunc(index)))]
-  if (option) emit('update:selected-reasoning-effort', option.value)
-}
-
-function toggleModelReasoningPicker(): void {
-  if (isInteractionDisabled.value) return
-  isModelReasoningOpen.value = !isModelReasoningOpen.value
-  if (!isModelReasoningOpen.value) modelQuery.value = ''
-}
-
-function selectModel(modelId: string): void {
-  emit('update:selected-model', modelId)
-  isModelReasoningOpen.value = false
-  modelQuery.value = ''
-}
-
 function removeResponseAnnotation(id: string): void {
   draftResponseAnnotations.value = draftResponseAnnotations.value.filter((annotation) => annotation.id !== id)
   emit('update:response-annotations', draftResponseAnnotations.value)
@@ -900,14 +815,12 @@ function editResponseAnnotation(annotation: UiResponseTextAnnotation): void {
 }
 
 function onDocumentPointerDown(event: PointerEvent): void {
-  if (!isFileMentionOpen.value && !isSlashCommandOpen.value && !isModelReasoningOpen.value) return
+  if (!isFileMentionOpen.value && !isSlashCommandOpen.value) return
   const root = composerRootRef.value
   const target = event.target
   if (!root || !(target instanceof Node) || root.contains(target)) return
   closeFileMention()
   closeSlashCommandPopup()
-  isModelReasoningOpen.value = false
-  modelQuery.value = ''
 }
 
 watch(() => props.inProgressSubmitMode, (value) => {
@@ -1037,73 +950,16 @@ defineExpose<ThreadComposerExposed>({
         </div>
 
         <div class="plc-composer-actions">
-          <div class="plc-model-reasoning-picker">
-            <button
-              type="button"
-              class="plc-model-reasoning-trigger"
-              :aria-expanded="isModelReasoningOpen"
-              aria-haspopup="dialog"
-              :disabled="isInteractionDisabled"
-              :title="`模型：${selectedModelOption?.label || '未选择'}（${selectedModelOption?.model || '未配置'}）；思考：${selectedReasoningLabel}`"
-              @click.stop="toggleModelReasoningPicker"
-            >
-              <span class="plc-model-reasoning-model">{{ selectedModelOption?.label || '模型' }}</span>
-              <span class="plc-model-reasoning-divider">·</span>
-              <span class="plc-model-reasoning-effort">{{ selectedReasoningLabel }}</span>
-            </button>
-            <div v-if="isModelReasoningOpen" class="plc-model-reasoning-popover" role="dialog" aria-label="模型和思考等级">
-              <div class="plc-model-reasoning-heading">
-                <span>模型与思考</span>
-                <strong>{{ modelReasoningLabel }}</strong>
-              </div>
-              <label class="plc-model-search">
-                <span class="sr-only">搜索模型</span>
-                <input v-model="modelQuery" type="search" placeholder="搜索模型" />
-              </label>
-              <div class="plc-model-list" role="listbox" aria-label="可用模型">
-                <button
-                  v-for="option in filteredModelOptions"
-                  :key="option.value"
-                  type="button"
-                  class="plc-model-option"
-                  :class="{ 'is-selected': option.value === props.selectedModel }"
-                  role="option"
-                  :aria-selected="option.value === props.selectedModel"
-                  @click.stop="selectModel(option.value)"
-                >
-                  <span class="plc-model-option-copy">
-                    <strong>{{ option.label }}</strong>
-                    <small>{{ option.model }}</small>
-                  </span>
-                </button>
-                <p v-if="filteredModelOptions.length === 0" class="plc-model-empty">没有匹配的模型</p>
-              </div>
-              <div class="plc-reasoning-panel">
-                <div class="plc-reasoning-panel-heading">
-                  <span>思考深度</span>
-                  <strong>{{ selectedReasoningLabel }}</strong>
-                </div>
-                <input
-                  class="plc-reasoning-range"
-                  type="range"
-                  min="0"
-                  :max="reasoningOptions.length - 1"
-                  step="1"
-                  :value="selectedReasoningIndex"
-                  :disabled="isInteractionDisabled"
-                  :style="reasoningRangeStyle"
-                  :aria-label="`思考等级：${selectedReasoningLabel}`"
-                  @input="onReasoningInput"
-                />
-                <div class="plc-reasoning-ticks" aria-hidden="true">
-                  <span v-for="(_, index) in reasoningOptions" :key="`tick-${index}`" :class="{ 'is-active': index <= selectedReasoningIndex }" />
-                </div>
-                <div class="plc-reasoning-scale" aria-hidden="true">
-                  <span v-for="option in reasoningOptions" :key="option.value">{{ option.label }}</span>
-                </div>
-              </div>
-            </div>
-          </div>
+          <ComposerModelPicker
+            :key="props.activeThreadId"
+            :models="props.models"
+            :selected-model="props.selectedModel"
+            :selected-reasoning-effort="props.selectedReasoningEffort"
+            :reasoning-efforts="props.reasoningEfforts"
+            :disabled="isInteractionDisabled"
+            @update:selected-model="emit('update:selected-model', $event)"
+            @update:selected-reasoning-effort="emit('update:selected-reasoning-effort', $event)"
+          />
           <span class="plc-context-indicator" :data-tone="contextView.tone" :title="contextTitle" :aria-label="contextTooltip" tabindex="0">
             <span class="plc-context-ring" :style="contextRingStyle"><span /></span>
             <span class="plc-context-tooltip" role="tooltip">{{ contextTooltip }}</span>
@@ -1281,76 +1137,6 @@ defineExpose<ThreadComposerExposed>({
 
 .plc-composer-actions { display: flex; align-items: center; gap: 9px; flex: 0 0 auto; }
 
-.plc-model-reasoning-picker { position: relative; flex: 0 0 auto; }
-.plc-model-reasoning-trigger {
-  display: inline-flex;
-  min-width: 0;
-  max-width: 164px;
-  height: 26px;
-  align-items: center;
-  gap: 4px;
-  overflow: hidden;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  padding: 0 7px;
-  color: var(--composer-muted);
-  cursor: pointer;
-  font-size: 11px;
-  transition: background-color 140ms ease, color 140ms ease;
-}
-.plc-model-reasoning-trigger:hover:not(:disabled),
-.plc-model-reasoning-trigger[aria-expanded='true'] { background: var(--composer-soft); color: var(--composer-text); }
-.plc-model-reasoning-trigger:disabled { cursor: not-allowed; opacity: 0.45; }
-.plc-model-reasoning-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
-.plc-model-reasoning-divider { color: var(--composer-muted); }
-.plc-model-reasoning-effort { flex: 0 0 auto; }
-
-.plc-model-reasoning-popover {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 8px);
-  z-index: 360;
-  display: flex;
-  width: min(260px, calc(100vw - 24px));
-  flex-direction: column;
-  gap: 7px;
-  border: 1px solid var(--composer-border);
-  border-radius: 12px;
-  background: var(--composer-bg);
-  padding: 9px;
-  color: var(--composer-text);
-  box-shadow: 0 16px 38px rgba(35, 29, 24, 0.18);
-}
-.plc-model-reasoning-heading,
-.plc-reasoning-panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--composer-muted); font-size: 10px; }
-.plc-model-reasoning-heading strong,
-.plc-reasoning-panel-heading strong { color: var(--composer-text); font-size: 11px; }
-.plc-model-search input { width: 100%; height: 25px; border: 1px solid var(--composer-soft); border-radius: 6px; background: var(--composer-soft); padding: 0 7px; color: var(--composer-text); font-size: 10px; outline: none; }
-.plc-model-search input:focus { border-color: rgba(0, 122, 204, 0.65); box-shadow: 0 0 0 2px rgba(0, 122, 204, 0.16); }
-.plc-model-list { display: flex; max-height: 112px; flex-direction: column; gap: 1px; overflow-y: auto; }
-.plc-model-option { display: flex; min-height: 34px; flex-direction: row; align-items: center; justify-content: flex-start; gap: 8px; border: 0; border-radius: 6px; background: transparent; padding: 5px 7px; color: var(--composer-text); text-align: left; }
-.plc-model-option:hover, .plc-model-option.is-selected { background: rgba(0, 122, 204, 0.12); }
-.plc-model-option-copy { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
-.plc-model-option-copy strong, .plc-model-option-copy small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.plc-model-option-copy strong { font-size: 11px; font-weight: 600; }
-.plc-model-option-copy small { color: var(--composer-muted); font-size: 9px; font-weight: 400; }
-.plc-model-empty { margin: 4px 7px; color: var(--composer-muted); font-size: 10px; }
-.plc-reasoning-panel { display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--composer-soft); padding-top: 8px; }
-.plc-reasoning-range { width: 100%; height: 30px; appearance: none; background: transparent; cursor: pointer; }
-.plc-reasoning-range::-webkit-slider-runnable-track { height: 30px; border-radius: 999px; background: linear-gradient(90deg, #5e5e5e 0 var(--reasoning-percent), #383838 var(--reasoning-percent) 100%); box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.16); }
-.plc-reasoning-range::-webkit-slider-thumb { width: 26px; height: 26px; margin-top: 2px; appearance: none; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25); transition: transform 140ms ease, box-shadow 140ms ease; }
-.plc-reasoning-range:hover::-webkit-slider-thumb { transform: scale(1.06); box-shadow: 0 2px 10px rgba(0, 122, 204, 0.35); }
-.plc-reasoning-range::-moz-range-track { height: 30px; border-radius: 999px; background: #383838; box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.16); }
-.plc-reasoning-range::-moz-range-progress { height: 30px; border-radius: 999px; background: #5e5e5e; }
-.plc-reasoning-range::-moz-range-thumb { width: 26px; height: 26px; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 2px 7px rgba(0, 0, 0, 0.28); }
-.plc-reasoning-range:disabled { cursor: not-allowed; opacity: 0.45; }
-.plc-reasoning-scale { display: flex; justify-content: space-between; gap: 4px; color: var(--composer-muted); font-size: 9px; }
-.plc-reasoning-scale span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.plc-reasoning-ticks { display: flex; justify-content: space-between; gap: 4px; margin: -21px 12px 0; pointer-events: none; }
-.plc-reasoning-ticks span { width: 4px; height: 4px; border-radius: 50%; background: rgba(255, 255, 255, 0.28); transition: background-color 140ms ease, transform 140ms ease; }
-.plc-reasoning-ticks span.is-active { background: rgba(255, 255, 255, 0.78); transform: scale(1.15); }
-
 .plc-context-indicator { position: relative; display: inline-flex; width: 19px; height: 19px; align-items: center; justify-content: center; color: var(--composer-muted); outline: none; }
 .plc-context-ring { display: inline-flex; width: 17px; height: 17px; align-items: center; justify-content: center; border-radius: 50%; background: conic-gradient(#007acc var(--context-percent), var(--composer-soft) 0); }
 .plc-context-ring > span { width: 11px; height: 11px; border-radius: 50%; background: var(--composer-bg); }
@@ -1389,7 +1175,6 @@ defineExpose<ThreadComposerExposed>({
   .plc-composer-toolbar { align-items: flex-end; }
   .plc-composer-options { gap: 8px; }
   .plc-context-indicator { flex-shrink: 0; }
-  .plc-model-reasoning-trigger { min-width: 126px; max-width: 170px; }
 }
 
 :global(:root.dark) .plc-composer-shell {

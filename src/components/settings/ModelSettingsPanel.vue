@@ -34,6 +34,7 @@ const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
   { value: 'medium', label: '标准' },
   { value: 'high', label: '高' },
   { value: 'xhigh', label: '极高' },
+  { value: 'max', label: 'Max（最高）' },
 ]
 
 function emptyForm(isDefault = false): ModelForm {

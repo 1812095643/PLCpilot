@@ -106,7 +106,7 @@ fn default_context_window() -> u64 {
 }
 
 fn default_reasoning_levels() -> Vec<String> {
-    ["none", "minimal", "low", "medium", "high", "xhigh"]
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -889,6 +889,8 @@ pub struct RuntimeState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedRuntimeConfig {
     #[serde(default)]
+    reasoning_levels_version: u32,
+    #[serde(default)]
     model: Option<ModelConfig>,
     #[serde(default)]
     models: Vec<ModelConfig>,
@@ -1007,7 +1009,7 @@ fn normalize_model_profile(mut model: ModelConfig, index: usize) -> ModelConfig 
         .filter(|level| {
             matches!(
                 level.as_str(),
-                "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
             )
         })
         .collect();
@@ -1015,6 +1017,22 @@ fn normalize_model_profile(mut model: ModelConfig, index: usize) -> ModelConfig 
         model.reasoning_levels = default_reasoning_levels();
     }
     model
+}
+
+fn migrate_reasoning_levels(config: &mut PersistedRuntimeConfig) -> bool {
+    if config.reasoning_levels_version >= 1 { return false; }
+    // 只在旧配置首次加载时补全默认档位，不能在每次保存时重加 Max，
+    // 否则用户在设置里取消 Max 后会被再次启用。自定义子集不扩展。
+    let legacy = ["none", "minimal", "low", "medium", "high", "xhigh"];
+    for model in config.models.iter_mut().chain(config.model.iter_mut()) {
+        if model.reasoning_levels.len() == legacy.len()
+            && legacy.iter().all(|level| model.reasoning_levels.iter().any(|item| item == level))
+        {
+            model.reasoning_levels.push("max".to_string());
+        }
+    }
+    config.reasoning_levels_version = 1;
+    true
 }
 
 fn normalize_model_collection(models: Vec<ModelConfig>) -> Vec<ModelConfig> {
@@ -1147,7 +1165,8 @@ fn load_runtime_state() -> RuntimeState {
             needs_config_migration =
                 content.contains("\"api_key\"") || !content.contains("\"models\"");
             match serde_json::from_str::<PersistedRuntimeConfig>(&content) {
-                Ok(config) => {
+                Ok(mut config) => {
+                    needs_config_migration |= migrate_reasoning_levels(&mut config);
                     if config.models.is_empty() {
                         if let Some(model) = config.model {
                             state.models = vec![model];
@@ -1268,6 +1287,7 @@ fn runtime_config_without_secrets(state: &RuntimeState) -> PersistedRuntimeConfi
         })
         .collect::<Vec<_>>();
     PersistedRuntimeConfig {
+        reasoning_levels_version: 1,
         model: Some(ModelConfig {
             api_key: None,
             ..state.model.clone()
@@ -8991,6 +9011,7 @@ fn request_thinking_level(request: &AgentRequest) -> &'static str {
         "low" => "low",
         "high" => "high",
         "xhigh" => "xhigh",
+        "max" => "max",
         // 未传或传入未知值时使用稳定的中等级别，避免把非法字符串交给 Pi。
         _ => "medium",
     }
@@ -10335,6 +10356,36 @@ mod tests {
         assert_eq!(model.model, "local-st");
         assert!(request_is_plan_mode(&request));
         assert_eq!(request_thinking_level(&request), "off");
+    }
+
+    #[test]
+    fn max_reasoning_survives_profile_and_request_normalization() {
+        let profile = normalize_model_profile(ModelConfig {
+            reasoning_levels: vec!["xhigh".into(), "max".into()],
+            ..ModelConfig::default()
+        }, 0);
+        let restored: ModelConfig = serde_json::from_str(
+            &serde_json::to_string(&profile).expect("序列化模型档位")
+        ).expect("恢复模型档位");
+        assert_eq!(restored.reasoning_levels, vec!["xhigh", "max"]);
+        let request = AgentRequest { reasoning_effort: Some("max".into()), ..AgentRequest::default() };
+        assert_eq!(request_thinking_level(&request), "max");
+
+        let legacy_levels: Vec<String> = ["none", "minimal", "low", "medium", "high", "xhigh"].into_iter().map(str::to_string).collect();
+        let mut legacy = PersistedRuntimeConfig {
+            models: vec![ModelConfig { reasoning_levels: legacy_levels.clone(), ..ModelConfig::default() }],
+            ..PersistedRuntimeConfig::default()
+        };
+        assert!(migrate_reasoning_levels(&mut legacy));
+        assert_eq!(legacy.models[0].reasoning_levels, default_reasoning_levels());
+        legacy.models[0].reasoning_levels = legacy_levels.clone();
+        assert!(!migrate_reasoning_levels(&mut legacy));
+        assert_eq!(normalize_model_for_save(legacy.models[0].clone()).expect("保存已关闭 Max 的模型").reasoning_levels, legacy_levels);
+        let limited = normalize_model_profile(ModelConfig {
+            reasoning_levels: vec!["none".into(), "high".into()],
+            ..ModelConfig::default()
+        }, 0);
+        assert_eq!(limited.reasoning_levels, vec!["none", "high"]);
     }
 
     #[test]

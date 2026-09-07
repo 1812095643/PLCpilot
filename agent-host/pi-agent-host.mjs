@@ -251,6 +251,11 @@ function modelDescriptor(modelConfig) {
     id: modelId,
     name: modelId,
     reasoning: reasoningLevels.some((level) => level !== "none"),
+    // Pi 对 xhigh/max 要求显式能力映射，否则会把已选择的档位降为 high。
+    // 使用用户的模型配置声明原值，不修改 SDK，也不把 max 假装成 xhigh。
+    thinkingLevelMap: Object.fromEntries(["xhigh", "max"].map((level) => [
+      level, reasoningLevels.includes(level) ? level : null,
+    ])),
     // Codex 的用户输入协议将图片作为独立 input_image；Pi 这里只做边界适配，
     // 不改变图片的 data URL 和 MIME，避免把二进制内容拼成普通文字。
     input: ["text", "image"],
@@ -651,7 +656,7 @@ function normalizeThinkingLevel(value, modelConfig = {}) {
     : [];
   const supported = configured.length > 0
     ? configured
-    : ["none", "minimal", "low", "medium", "high", "xhigh"];
+    : ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
   const requested = normalized === "off" ? "none" : normalized;
   if (supported.includes(requested)) return requested === "none" ? "off" : requested;
   if (supported.includes("medium")) return "medium";

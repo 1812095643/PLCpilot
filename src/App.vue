@@ -180,7 +180,7 @@ const selectedModelProfile = computed<ModelSummary | null>(() => (
 ))
 const selectedReasoningEfforts = computed(() => {
   const supported = selectedModelProfile.value?.reasoning_levels ?? []
-  const allowed = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
+  const allowed = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
   const values = allowed.filter((value) => supported.includes(value))
   return values.length > 0 ? values : [...allowed]
 })
@@ -473,13 +473,13 @@ function showNotice(message: string): void {
 }
 
 function normalizeReasoningEffort(
-  value: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh',
+  value: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max',
   profile: ModelSummary | null,
-): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
+): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' {
   const supported = profile?.reasoning_levels ?? []
   if (supported.includes(value)) return value
   if (supported.includes('medium')) return 'medium'
-  return (['high', 'low', 'minimal', 'none'] as const).find((level) => supported.includes(level)) ?? 'none'
+  return (['high', 'low', 'minimal', 'none', 'xhigh', 'max'] as const).find((level) => supported.includes(level)) ?? 'none'
 }
 
 async function refresh(): Promise<void> {
@@ -581,7 +581,7 @@ function appendAgentResult(
   activityDurationMs = 0,
   modelProfileId = '',
   modelId = '',
-  reasoningEffortId: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' = 'medium',
+  reasoningEffortId: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' = 'medium',
   collaborationModeId: CollaborationModeKind = 'default',
   thread = workspace.active.value,
   sessionTurnIndex?: number,

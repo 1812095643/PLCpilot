@@ -1,5 +1,5 @@
 /** Agent 思考级别，保持与 Pi 运行时的配置契约一致。 */
-export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
 /** PLC 工作台只保留执行和计划两种协作模式。 */
 export type CollaborationModeKind = 'default' | 'plan'
