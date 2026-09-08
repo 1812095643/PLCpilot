@@ -2,6 +2,6 @@
 
 安装版与便携版均包含 Node.js、npm/npx、Python 和 pip。更新会先保存草稿与会话，等待任务结束，再校验签名并替换程序。便携版替换遇到问题时恢复旧程序；模型、密钥、项目、MCP/Skills 配置和聊天记录保留。
 
-推荐一般用户下载安装包 `PLC-Pilot-0.1.1-x64-setup.exe`；便携用户下载 ZIP 后完整解压。便携版需要 Windows 已安装 WebView2，安装版可联网补装。
+推荐一般用户下载安装包 `PLC-Pilot-0.1.2-x64-setup.exe`；便携用户下载 ZIP 后完整解压。便携版需要 Windows 已安装 WebView2，安装版可联网补装。
 
 0.1.0 尚未内置更新功能，需要先手动安装一次本版本。之后可直接在软件内更新。更新签名用于校验发布文件；Windows SmartScreen 仍可能提示未签署 Windows 代码签名。

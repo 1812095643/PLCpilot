@@ -50,7 +50,7 @@ npm run tauri:build
 
 维护者同步修改 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 的版本和 `release-notes.md`，更新锁文件后推送 `v版本号` 标签。GitHub Actions 自动测试、构建 NSIS/MSI/便携包、签名并生成 `latest.json`，全部上传成功后才公开 Release。首次须在仓库 Actions Secret 配置 `TAURI_SIGNING_PRIVATE_KEY`；私钥保持在仓库外并妥善保存，不要更换已发布的公钥或提交私钥。安装本地构建的签名发布包时也需提供该环境变量。
 
-0.1.0 没有更新入口，用户需先手动安装一次 0.1.1 或更高版本。程序更新签名与 Windows Authenticode 代码签名相互独立。
+0.1.0 没有更新入口，用户需先手动安装一次 0.1.2 或更高版本。程序更新签名与 Windows Authenticode 代码签名相互独立。
 
 ## CODESYS 工程桥接
 
