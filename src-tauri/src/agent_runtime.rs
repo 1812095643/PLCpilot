@@ -22,11 +22,6 @@ pub async fn isolate_run(root: &AppState, request: &AgentRequest) -> Result<AppS
     if request.client_thread_id.is_some() {
         runtime.session = if let Some(path) = request.session_file.as_deref() {
             let record = session_record_for_path(path)?;
-            if let Some(cwd) = record.cwd.as_deref() {
-                if !session_paths_equal(cwd, &agent_cwd(&runtime.project).to_string_lossy()) {
-                    return Err(AppError::Project("会话与工作目录不一致，请重新打开该会话。".into()));
-                }
-            }
             AgentSessionSummary {
                 session_id: Some(record.session_id), session_file: Some(record.path),
                 name: record.name, message_count: record.message_count,
@@ -48,12 +43,23 @@ pub async fn isolate_run(root: &AppState, request: &AgentRequest) -> Result<AppS
 }
 
 pub fn session_record_for_path(path: &str) -> Result<SessionRecord, AppError> {
-    let resolved = fs::canonicalize(path).map_err(|error| AppError::Configuration(format!("无法读取会话：{error}")))?;
-    let root = fs::canonicalize(agent_session_dir()).map_err(|error| AppError::Configuration(format!("会话目录不可读：{error}")))?;
-    if !resolved.starts_with(root) || resolved.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-        return Err(AppError::Configuration("会话文件不在 PLC Pilot 会话目录中。".into()));
+    let resolved = canonical_session_path(path).map_err(|error| AppError::Configuration(format!("无法读取会话：{error}")))?;
+    // 会话可以来自用户选择的任意目录；只验证文件类型与可解析内容，不再限制
+    // 到应用目录或当前工程。工具实际执行的工作目录仍由本轮 request 固定。
+    if !resolved.is_file() || resolved.extension().and_then(|value| value.to_str()).map(|value| !value.eq_ignore_ascii_case("jsonl")).unwrap_or(true) {
+        return Err(AppError::Configuration("请选择可读取的 JSONL 会话文件。".into()));
     }
     parse_session_record(&resolved).ok_or_else(|| AppError::Configuration("会话内容无法解析。".into()))
+}
+
+/// Windows 的桌面 WebView、Rust 和 JSONL 恢复链会交替产生 `\\?\` 长路径前缀。
+/// 两种写法指向同一文件，校验前统一去掉前缀，避免第二轮消息被误判为外部会话。
+fn canonical_session_path(value: &str) -> std::io::Result<PathBuf> {
+    let trimmed = value.trim();
+    let normalized = trimmed.strip_prefix(r"\\?\UNC\").map(|path| format!(r"\\{path}"))
+        .or_else(|| trimmed.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| trimmed.to_string());
+    dunce::canonicalize(normalized)
 }
 
 pub async fn project_for_cwd(state: &AppState, cwd: &str) -> Result<ProjectContext, AppError> {
@@ -87,10 +93,14 @@ pub async fn start_temporary_workspace(state: State<'_, AppState>) -> Result<Pro
     let path = root.join(stamp.format("%Y-%m-%d").to_string()).join(format!("{}-{}", stamp.format("%H-%M-%S"), &Uuid::new_v4().to_string()[..8]));
     fs::create_dir_all(&path).map_err(|error| AppError::Project(format!("创建临时会话目录未完成：{error}")))?;
     let mut project = resolve_project_path(&path.to_string_lossy())?;
-    project.name = Some("临时会话".into());
+    project.name = Some(path.file_name().and_then(|value| value.to_str()).map(|name| format!("临时会话 · {name}")).unwrap_or_else(|| "临时会话".into()));
     let mut guard = state.inner.lock().await;
     guard.project = project.clone();
     guard.session = AgentSessionSummary::default();
+    super::upsert_project(&mut guard.projects, &project, true);
+    let snapshot = guard.clone();
+    drop(guard);
+    super::persist_runtime_state(&snapshot)?;
     Ok(project)
 }
 

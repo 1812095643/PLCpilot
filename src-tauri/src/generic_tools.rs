@@ -111,6 +111,9 @@ pub fn apply_patch(pending: &PendingChange) -> Result<ToolCallResult, AppError> 
 pub async fn host_action(app: &AppHandle, state: &AppState, pending: &PendingChange, action: &str, stream: Option<&AgentStreamSender>, context: Option<&Vec<Value>>) -> Result<ToolCallResult, AppError> {
     let host_path = agent_host_path(app);
     let mut command = Command::new(agent_node_command(app));
+    // 审批后使用独立宿主；必须和主 Agent 一起继承内置运行时，否则批准后
+    // 的 python/npm 命令仍会依赖开发机 PATH，在空电脑上出现“找不到命令”。
+    configure_bundled_runtime(&mut command, None);
     command.arg(dunce::simplified(&host_path)).current_dir(pending.arguments["cwd"].as_str().unwrap_or(".")).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
     #[cfg(windows)] command.creation_flags(CREATE_NO_WINDOW);
     let mut child = command.spawn().map_err(|error| AppError::Internal(format!("启动 Pi 工具宿主未完成：{error}")))?;

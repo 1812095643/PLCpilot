@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, shallowRef } from 'vue'
 import type { WorkspaceProject } from '../../api/plcBridge'
-import { normalizePathForComparison, normalizePathForUi } from '../../pathUtils'
+import { getPathParent, normalizePathForComparison, normalizePathForUi } from '../../pathUtils'
 import IconTablerFolder from '../icons/IconTablerFolder.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
 import IconTablerSettings from '../icons/IconTablerSettings.vue'
@@ -25,8 +25,14 @@ const searchOpen = shallowRef(false)
 const collapsed = shallowRef(new Set<string>())
 const visibleLimit = shallowRef(40)
 const filtered = computed(() => props.threads.filter((thread) => `${thread.name} ${thread.cwd}`.toLowerCase().includes(search.value.toLowerCase())))
-const groups = computed(() => props.projects.map((project) => ({ project, threads: filtered.value.filter((thread) => normalizePathForComparison(thread.cwd) === normalizePathForComparison(project.path)) })))
-const ungrouped = computed(() => filtered.value.filter((thread) => !props.projects.some((project) => normalizePathForComparison(thread.cwd) === normalizePathForComparison(project.path))))
+function projectDirectory(project: WorkspaceProject): string {
+  return /\.(project|projectarchive)$/iu.test(project.path) ? getPathParent(project.path) : project.path
+}
+function belongsToProject(thread: SidebarThread, project: WorkspaceProject): boolean {
+  return normalizePathForComparison(thread.cwd) === normalizePathForComparison(projectDirectory(project))
+}
+const groups = computed(() => props.projects.map((project) => ({ project, threads: filtered.value.filter((thread) => belongsToProject(thread, project)) })))
+const ungrouped = computed(() => filtered.value.filter((thread) => !props.projects.some((project) => belongsToProject(thread, project))))
 function toggle(id: string): void { const next = new Set(collapsed.value); if (next.has(id)) next.delete(id); else next.add(id); collapsed.value = next }
 </script>
 
@@ -48,7 +54,7 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
           </div>
         </div>
       </section>
-      <div class="group-heading"><span>临时会话</span><button title="新建临时会话" aria-label="添加临时会话" @click="emit('new-thread')"><IconTablerFilePencil /></button></div>
+      <div v-if="ungrouped.length > 0" class="group-heading"><span>其他会话</span><button title="新建临时会话" aria-label="添加临时会话" @click="emit('new-thread')"><IconTablerFilePencil /></button></div>
       <div v-for="thread in ungrouped.slice(0, visibleLimit)" :key="thread.id" class="thread-row" :class="{ active: activeId === thread.id }">
         <button class="thread-main" :title="`${thread.status || thread.name}\n${normalizePathForUi(thread.cwd)}`" @click="emit('select-thread', thread.id)"><span class="thread-state" :class="{ running: thread.busy }" /><span>{{ thread.name }}</span></button><button v-if="thread.persisted && !thread.busy" class="row-action" title="重命名会话" :aria-label="`重命名 ${thread.name}`" @click="emit('rename-thread', thread.id)"><IconTablerFilePencil /></button><button v-if="!thread.busy" class="row-action" title="删除会话" :aria-label="`删除 ${thread.name}`" @click="emit('delete-thread', thread.id)"><IconTablerTrash /></button>
       </div>

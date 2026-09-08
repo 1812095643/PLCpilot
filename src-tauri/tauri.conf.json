@@ -29,7 +29,10 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../agent-host/pi-agent-host.bundle.mjs": "pi-agent-host.bundle.mjs"
+      "../agent-host/pi-agent-host.bundle.mjs": "pi-agent-host.bundle.mjs",
+      "../runtime-stage/node": "runtime/node",
+      "../runtime-stage/python": "runtime/python",
+      "../runtime-stage/runtime-manifest.json": "runtime/runtime-manifest.json"
     },
     "icon": [
       "icons/32x32.png",
@@ -37,6 +40,12 @@
       "icons/128x128.png",
       "icons/icon.ico",
       "icons/icon.icns"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    }
   }
 }

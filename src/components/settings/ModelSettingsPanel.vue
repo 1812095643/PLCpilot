@@ -5,6 +5,7 @@ import type { ReasoningEffort } from '../../types/codex'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
 import IconTablerRefresh from '../icons/IconTablerRefresh.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
+import ModelDiscoveryList from './ModelDiscoveryList.vue'
 
 const props = defineProps<{
   models: ModelSummary[]
@@ -13,6 +14,7 @@ const props = defineProps<{
   discovery: ModelDiscoveryResult | null
   discoveryError: string
   isDiscovering: boolean
+  isSaving: boolean
   currentContextTokens: number
   remainingContextPercent: number | null
   autoCompactionEnabled: boolean
@@ -21,6 +23,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   save: [form: ModelForm]
   discover: [form: ModelForm]
+  import: [form: ModelForm, ids: string[]]
   'set-active': [id: string]
   'toggle-enabled': [id: string, enabled: boolean]
   duplicate: [id: string]
@@ -55,11 +58,35 @@ function emptyForm(isDefault = false): ModelForm {
 
 const editingId = shallowRef('')
 const form = reactive<ModelForm>(emptyForm())
+const intentionalNew = shallowRef(false)
+let syncedForm = ''
+const addedModelIds = computed(() => props.models.filter((model) => model.provider === form.provider && model.base_url.replace(/\/+$/u, '') === form.baseUrl.trim().replace(/\/+$/u, '')).map((model) => model.model))
 
 const selectedModel = computed(() => props.models.find((model) => model.id === editingId.value) ?? null)
 const isCreating = computed(() => editingId.value.length === 0)
+type ProviderGroup = { key: string; url: string; provider: ProviderKind; models: ModelSummary[] }
+const providerGroups = computed<ProviderGroup[]>(() => {
+  const groups = new Map<string, ProviderGroup>()
+  for (const model of props.models) {
+    const url = model.base_url.trim().replace(/\/+$/u, '')
+    const group = groups.get(url) ?? { key: url, url, provider: model.provider, models: [] }
+    group.models.push(model)
+    groups.set(url, group)
+  }
+  return [...groups.values()]
+})
+const selectedProvider = computed(() => providerGroups.value.find((group) => group.key === (selectedModel.value?.base_url.trim().replace(/\/+$/u, '') || form.baseUrl.trim().replace(/\/+$/u, ''))) ?? providerGroups.value[0] ?? null)
+const providerModels = computed(() => selectedProvider.value?.models ?? [])
+function providerTitle(group: ProviderGroup): string {
+  try { return new URL(group.url).hostname || group.url }
+  catch { return group.url || '未命名服务商' }
+}
+function providerTypeLabel(provider: ProviderKind): string {
+  return providerLabel(provider)
+}
 
 function copySummaryToForm(model: ModelSummary): void {
+  intentionalNew.value = false
   editingId.value = model.id
   Object.assign(form, {
     id: model.id,
@@ -77,6 +104,7 @@ function copySummaryToForm(model: ModelSummary): void {
   if (form.reasoningLevels.length === 0) {
     form.reasoningLevels = ['none']
   }
+  syncedForm = JSON.stringify(form)
 }
 
 function selectModel(id: string): void {
@@ -85,8 +113,20 @@ function selectModel(id: string): void {
 }
 
 function startNewModel(): void {
+  intentionalNew.value = true
   editingId.value = ''
   Object.assign(form, emptyForm(props.models.length === 0))
+}
+
+function startNewModelForProvider(group: ProviderGroup): void {
+  intentionalNew.value = true
+  editingId.value = ''
+  Object.assign(form, { ...emptyForm(false), provider: group.provider, baseUrl: group.url, model: '' })
+}
+
+function selectProvider(key: string): void {
+  const model = providerGroups.value.find((group) => group.key === key)?.models[0]
+  if (model) selectModel(model.id)
 }
 
 function toggleReasoning(level: ReasoningEffort): void {
@@ -117,11 +157,6 @@ function onDiscover(): void {
   })
 }
 
-function selectDiscoveredModel(modelId: string): void {
-  form.model = modelId
-  if (!form.name.trim()) form.name = modelId
-}
-
 function providerLabel(provider: ProviderKind): string {
   if (provider === 'chatcompletions') return 'Chat Completions'
   if (provider === 'responses') return 'Responses'
@@ -135,30 +170,18 @@ function formatContextWindow(tokens: number): string {
   return String(tokens)
 }
 
-watch(
-  () => props.activeModelId,
-  (id) => {
-    if (!editingId.value && id) selectModel(id)
-  },
-  { immediate: true },
-)
-
-watch(
-  () => props.selectedModelId,
-  (id) => {
-    if (id) selectModel(id)
-  },
-  { immediate: true },
-)
-
-watch(
-  () => props.models.map((model) => model.id).join('|'),
-  () => {
-    if (editingId.value && !props.models.some((model) => model.id === editingId.value)) {
-      startNewModel()
-    }
-  },
-)
+// 异步快照更新时 model-default 的 ID 往往不变。旧监听只比较 ID，导致本机
+// 已保存的 URL 没有填回表单。监听真实模型集合，并仅在未编辑或保存完成时同步。
+watch(() => [props.models, props.selectedModelId, props.activeModelId, props.isSaving] as const, (next, previous) => {
+  const selectionChanged = previous && next[1] !== previous[1]
+  const saved = previous?.[3] && !next[3]
+  if (intentionalNew.value && !selectionChanged) return
+  const target = props.models.find((model) => model.id === (selectionChanged ? props.selectedModelId : editingId.value))
+    ?? props.models.find((model) => model.id === props.selectedModelId)
+    ?? props.models.find((model) => model.id === props.activeModelId)
+    ?? props.models[0]
+  if (target && (!editingId.value || selectionChanged || saved || JSON.stringify(form) === syncedForm)) copySummaryToForm(target)
+}, { immediate: true })
 </script>
 
 <template>
@@ -175,23 +198,22 @@ watch(
     <div class="model-settings-layout">
       <div class="model-settings-list" role="listbox" aria-label="模型配置列表">
         <button
-          v-for="model in props.models"
-          :key="model.id"
+          v-for="group in providerGroups"
+          :key="group.key"
           type="button"
           class="model-settings-row"
-          :class="{ 'is-selected': model.id === editingId, 'is-active': model.id === props.activeModelId, 'is-session': model.id === props.selectedModelId }"
-          :title="model.last_error || (model.last_checked_at ? `最近检查：${model.last_checked_at}` : '尚未检查连接')"
+          :class="{ 'is-selected': group.key === selectedProvider?.key }"
+          :title="group.url"
           role="option"
-          :aria-selected="model.id === editingId"
-          @click="selectModel(model.id)"
+          :aria-selected="group.key === selectedProvider?.key"
+          @click="selectProvider(group.key)"
         >
-          <span class="model-settings-status" :data-state="model.enabled ? model.connection_status : 'disabled'" />
+          <span class="model-settings-status" :data-state="group.models.some((model) => model.enabled) ? group.models[0]?.connection_status : 'disabled'" />
           <span class="model-settings-row-copy">
-            <strong>{{ model.name || model.model }}</strong>
-            <small>{{ providerLabel(model.provider) }} · {{ formatContextWindow(model.context_window) }} · {{ model.connection_status === 'connected' ? '已连接' : model.connection_status === 'error' ? '连接异常' : '未检查' }}</small>
+            <strong>{{ providerTitle(group) }}</strong>
+            <small>{{ providerTypeLabel(group.provider) }} · {{ group.models.length }} 个模型 · {{ group.models.filter((model) => model.enabled).length }} 个已启用</small>
           </span>
-          <span v-if="model.id === props.selectedModelId" class="model-settings-current">会话</span>
-          <span v-if="model.id === props.activeModelId" class="model-settings-current model-settings-default">默认</span>
+          <span v-if="group.models.some((model) => model.id === props.selectedModelId)" class="model-settings-current">会话</span>
         </button>
         <p v-if="props.models.length === 0" class="model-settings-empty">还没有模型配置，请新增一个。</p>
       </div>
@@ -200,15 +222,23 @@ watch(
         <div class="model-settings-editor-heading">
           <div>
             <p class="model-settings-eyebrow">{{ isCreating ? '新增模型' : '编辑模型' }}</p>
-            <h4>{{ selectedModel?.name || form.name || form.model }}</h4>
+          <h4>{{ selectedProvider ? providerTitle(selectedProvider) : '新服务商' }}</h4>
           </div>
           <span v-if="selectedModel" class="model-settings-editor-state" :data-enabled="selectedModel.enabled">
             {{ selectedModel.enabled ? '已启用' : '已停用' }}
           </span>
         </div>
 
+        <div v-if="selectedProvider" class="provider-model-list">
+          <div class="provider-model-list-heading"><span>此服务商的模型</span><button type="button" @click="startNewModelForProvider(selectedProvider)">添加模型</button></div>
+          <button v-for="model in providerModels" :key="`provider-model:${model.id}`" type="button" class="provider-model-row" :class="{ selected: model.id === editingId }" @click="selectModel(model.id)">
+            <span class="model-settings-status" :data-state="model.enabled ? model.connection_status : 'disabled'" />
+            <span class="provider-model-name"><strong>{{ model.name || model.model }}</strong><small>{{ model.model }} · {{ formatContextWindow(model.context_window) }} · {{ model.enabled ? '对话中可用' : '已停用' }}</small></span>
+            <input type="checkbox" :checked="model.enabled" :disabled="props.isSaving || (model.enabled && providerModels.filter((item) => item.enabled).length === 1)" aria-label="在对话选择器中显示" @click.stop @change="emit('toggle-enabled', model.id, ($event.target as HTMLInputElement).checked)" />
+          </button>
+        </div>
         <div class="model-settings-fields">
-          <label>显示名称<input v-model="form.name" type="text" maxlength="80" placeholder="例如：生产网关 GPT-5" /></label>
+          <label>模型显示名称<input v-model="form.name" type="text" maxlength="80" placeholder="例如：生产网关 GPT-5" /></label>
           <label>接口类型
             <select v-model="form.provider">
               <option value="responses">Responses</option>
@@ -217,10 +247,10 @@ watch(
               <option value="ollama">Ollama</option>
             </select>
           </label>
-          <label class="model-settings-wide">接口地址<input v-model="form.baseUrl" type="url" placeholder="https://api.example.com/v1" /></label>
+          <label class="model-settings-wide">服务商接口地址<input v-model="form.baseUrl" type="url" placeholder="https://api.example.com/v1" /></label>
           <div class="model-settings-model-row">
             <label>模型 ID<input v-model="form.model" type="text" list="plc-discovered-models" placeholder="gpt-5" /></label>
-            <button type="button" class="model-settings-discover" :disabled="props.isDiscovering" @click="onDiscover">
+            <button type="button" class="model-settings-discover" :disabled="props.isDiscovering || props.isSaving" @click="onDiscover">
               <IconTablerRefresh />
               {{ props.isDiscovering ? '获取中' : '获取模型' }}
             </button>
@@ -229,7 +259,7 @@ watch(
           <label>最大输出 Token<input v-model.number="form.maxTokens" type="number" min="1" :max="form.contextWindow" step="256" /></label>
           <label class="model-settings-wide">API Key
             <small>{{ selectedModel?.api_key_configured ? '相同接口留空保持原 Key；修改接口时请重新填写。' : '只写入本机 auth.json，不进入项目配置。' }}</small>
-            <input v-model="form.apiKey" type="password" autocomplete="new-password" />
+            <input v-model="form.apiKey" type="password" autocomplete="new-password" :placeholder="selectedModel?.api_key_configured ? 'Key 已安全保存，留空继续使用' : '输入 API Key'" />
           </label>
         </div>
 
@@ -242,24 +272,15 @@ watch(
         </fieldset>
 
         <div class="model-settings-flags">
-          <label class="model-settings-switch"><input v-model="form.enabled" type="checkbox" /><span>允许在 Composer 中选择</span></label>
           <label class="model-settings-switch"><input v-model="form.isDefault" type="checkbox" /><span>保存为当前默认模型</span></label>
         </div>
 
         <div v-if="props.discoveryError" class="model-settings-error" role="alert">{{ props.discoveryError }}</div>
-        <div v-else-if="props.discovery" class="model-settings-discovery" aria-live="polite">
-          <div class="model-settings-discovery-meta"><span>HTTP {{ props.discovery.status }} · {{ props.discovery.models.length }} 个模型</span><code>{{ props.discovery.endpoint }}</code></div>
-          <div v-if="props.discovery.models.length > 0" class="model-settings-discovery-list">
-            <button v-for="model in props.discovery.models" :key="model.id" type="button" @click="selectDiscoveredModel(model.id)">
-              <span>{{ model.name }}</span><code>{{ model.id }}</code>
-            </button>
-          </div>
-          <p v-else>接口已响应，但没有返回模型。</p>
-        </div>
+        <ModelDiscoveryList v-else-if="props.discovery" :discovery="props.discovery" :added-model-ids="addedModelIds" :saving="props.isSaving" @add="emit('import', { ...form, reasoningLevels: [...form.reasoningLevels] }, $event)" />
         <p v-if="selectedModel?.last_error" class="model-settings-last-error">最近一次检查未完成：{{ selectedModel.last_error }}</p>
 
         <div class="model-settings-actions">
-          <button type="button" class="model-settings-save" @click="onSave">保存模型</button>
+          <button type="button" class="model-settings-save" :disabled="props.isSaving || props.isDiscovering" @click="onSave">{{ props.isSaving ? '保存中…' : '保存模型' }}</button>
           <button v-if="selectedModel && selectedModel.id !== props.activeModelId" type="button" class="model-settings-quiet" @click="emit('set-active', selectedModel.id)">设为当前</button>
           <button v-if="selectedModel" type="button" class="model-settings-icon-button" title="复制模型" aria-label="复制模型" @click="emit('duplicate', selectedModel.id)"><IconTablerCopy /></button>
           <button v-if="selectedModel && props.models.length > 1" type="button" class="model-settings-icon-button model-settings-delete" title="删除模型" aria-label="删除模型" @click="emit('remove', selectedModel.id)"><IconTablerTrash /></button>
@@ -297,6 +318,12 @@ watch(
 .model-settings-row-copy small { overflow: hidden; color: var(--settings-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .model-settings-current, .model-settings-editor-state { flex: 0 0 auto; color: var(--settings-muted); font-size: 10px; }
 .model-settings-empty { margin: 12px 6px; color: var(--settings-muted); font-size: 12px; line-height: 1.5; }
+.provider-model-list { display:flex; flex-direction:column; gap:4px; border-top:1px solid var(--settings-line); border-bottom:1px solid var(--settings-line); padding:13px 0; }
+.provider-model-list-heading { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--settings-muted); font-size:11px; padding:0 2px 5px; }
+.provider-model-list-heading button { border:0; background:transparent; color:#007acc; font-size:11px; cursor:pointer; }.provider-model-list-heading button:hover { text-decoration:underline; }
+.provider-model-row { display:flex; min-width:0; align-items:center; gap:9px; border:1px solid transparent; border-radius:6px; background:transparent; color:var(--settings-text); padding:7px 8px; text-align:left; cursor:pointer; }
+.provider-model-row:hover,.provider-model-row.selected { border-color:var(--settings-line); background:var(--settings-field); }.provider-model-row input { width:15px; height:15px; margin-left:auto; accent-color:#007acc; }
+.provider-model-name { display:flex; min-width:0; flex:1; flex-direction:column; gap:3px; }.provider-model-name strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:550; }.provider-model-name small { color:var(--settings-muted); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .model-settings-editor { display: flex; min-width: 0; flex-direction: column; gap: 22px; }
 .model-settings-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 16px; }
 .model-settings-fields label { display: grid; min-width: 0; gap: 7px; font-size: 12px; font-weight: 500; }

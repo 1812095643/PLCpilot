@@ -4,7 +4,9 @@ PLC Pilot 便携版
 
 说明：
 1. 这是免安装目录版，不写入开始菜单或卸载项。
-2. 仍需要 Windows WebView2 Runtime。
-3. Agent 实时宿主默认需要 Node.js 22.19+；也可以通过 PLC_PILOT_NODE 指定 node.exe。
-4. 模型 Key、MCP Token 和会话数据保存在当前用户的 C 盘 PLC Pilot 应用数据目录。
-5. 请保持 plc-pilot.exe 与 pi-agent-host.bundle.mjs 位于同一目录。
+2. 目录内已包含精简 Node.js（npm/npx）和 Python 3.12（pip）运行时，不需要另装 Node.js 或 Python。
+3. Windows WebView2 Runtime 由安装包按需使用官方 bootstrapper 安装；便携版需要目标电脑已有 WebView2。
+4. MCP 商店只在安装或首次启动时按需下载具体 MCP 包，首次使用需要网络，不预装全部 MCP。
+5. Agent 和 MCP 可直接使用内置 Python。通过应用执行 python -m pip install 包名，会安装到当前用户的 PLC Pilot 目录，无需管理员权限。需要原生编译器的第三方包仍须满足其自身要求。
+6. 模型 Key、MCP Token 和会话数据保存在当前用户的 C 盘 PLC Pilot 应用数据目录。
+7. 请保持 `plc-pilot.exe`、`pi-agent-host.bundle.mjs` 和 `runtime` 文件夹位于同一目录。

@@ -44,6 +44,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 mod attachments;
 mod agent_runtime;
+mod agent_control;
 mod settings;
 mod generic_tools;
 use attachments::{prepare_attachments, read_local_file, AttachmentInput, CodexImageInput};
@@ -951,9 +952,15 @@ impl Default for RuntimeState {
 }
 
 fn app_data_root() -> PathBuf {
-    // Windows 下 dirs::data_local_dir() 指向当前用户的 C 盘本地应用数据目录，
-    // 与 CODESYS Bridge 共用该根目录，避免两套路径导致工程快照断开。
-    dirs::data_local_dir()
+    // Node/Pi 通过 LOCALAPPDATA 计算会话目录。Windows 打包应用调用
+    // dirs::data_local_dir() 时可能被当前宿主的 MSIX 沙箱重定向到
+    // Packages\\...\\LocalCache\\Local，导致 Rust 与 Node 各自看到不同的
+    // PLC Pilot 目录。统一读取显式环境变量，保证模型、Key、会话始终落在
+    // 同一个 C:\\Users\\<用户>\\AppData\\Local\\PLC Pilot 目录。
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| dirs::data_local_dir())
         .unwrap_or_else(std::env::temp_dir)
         .join("PLC Pilot")
 }
@@ -1162,10 +1169,11 @@ fn load_runtime_state() -> RuntimeState {
     let mut needs_config_migration = false;
     match fs::read_to_string(&path) {
         Ok(content) => {
-            needs_config_migration =
-                content.contains("\"api_key\"") || !content.contains("\"models\"");
             match serde_json::from_str::<PersistedRuntimeConfig>(&content) {
                 Ok(mut config) => {
+                    // 只有完整读出旧配置才能迁移。解析异常时绝不能把默认模型
+                    // 当成已恢复配置写回，避免临时读取问题覆盖用户 URL 和模型列表。
+                    needs_config_migration = content.contains("\"api_key\"") || !content.contains("\"models\"");
                     needs_config_migration |= migrate_reasoning_levels(&mut config);
                     if config.models.is_empty() {
                         if let Some(model) = config.model {
@@ -2333,6 +2341,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            get_model_settings,
+            import_models,
+            agent_control::steer_agent,
             configure_model,
             set_active_model,
             set_model_enabled,
@@ -2410,6 +2421,58 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, AppErro
     snapshot_from_app_state(&state).await
 }
 
+/// 模型设置是本机数据，不能等待 MCP 握手或网络工具探测后才恢复到界面。
+#[tauri::command]
+async fn get_model_settings(state: State<'_, AppState>) -> Result<Value, AppError> {
+    let guard = state.inner.lock().await;
+    Ok(json!({ "models": model_summaries(&guard.models), "model": model_summary(&guard.model),
+        "active_model_id": guard.active_model_id, "config_directory": app_data_root().to_string_lossy() }))
+}
+
+/// 按接口范围合并所选模型；同名的其他供应商配置不能被覆盖，密钥不返回前端。
+fn merge_discovered_models(state: &mut RuntimeState, config: ModelConfig, model_ids: Vec<String>) -> Result<Vec<ModelSummary>, AppError> {
+    if model_ids.is_empty() || model_ids.len() > 500 {
+        return Err(AppError::Configuration("请选择 1 到 500 个模型。".into()));
+    }
+    let mut source = config;
+    if let Some(existing) = state.models.iter().find(|model| model.id == source.id && same_model_scope(model, &source))
+        .or_else(|| state.models.iter().find(|model| same_model_scope(model, &source) && model.api_key.is_some())) {
+        source = apply_saved_model_key(source, existing);
+    }
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for id in model_ids {
+        let id = id.trim().to_string();
+        if id.is_empty() || id.len() > 512 { return Err(AppError::Configuration("模型 ID 不能为空或超过 512 字节。".into())); }
+        if !seen.insert(id.clone()) { continue; }
+        let mut model = normalize_model_for_save(ModelConfig { id: String::new(), name: id.clone(), model: id.clone(), enabled: true, is_default: false, ..source.clone() })?;
+        if let Some(existing) = state.models.iter_mut().find(|existing| existing.model == id && same_model_scope(existing, &model)) {
+            // 再次添加只启用原配置、更新明确提供的连接凭据，保留其专属上下文设置。
+            existing.enabled = true;
+            if model.api_key.is_some() { existing.api_key = model.api_key; }
+            selected.push(existing.id.clone());
+        } else {
+            model.last_checked_at = Some(now_iso());
+            model.last_error = None;
+            selected.push(model.id.clone());
+            state.models.push(model);
+        }
+    }
+    sync_active_model(state);
+    Ok(state.models.iter().filter(|model| selected.contains(&model.id)).map(model_summary).collect())
+}
+
+#[tauri::command]
+async fn import_models(config: ModelConfig, model_ids: Vec<String>, state: State<'_, AppState>) -> Result<Vec<ModelSummary>, AppError> {
+    let mut guard = state.inner.lock().await;
+    let mut next = guard.clone();
+    let summaries = merge_discovered_models(&mut next, config, model_ids)?;
+    // 整批持久化成功后才发布内存状态，防止界面显示已添加、重启后却丢失。
+    persist_runtime_state(&next)?;
+    *guard = next;
+    Ok(summaries)
+}
+
 fn normalize_model_for_save(mut config: ModelConfig) -> Result<ModelConfig, AppError> {
     config.id = config.id.trim().to_string();
     if config.id.is_empty() {
@@ -2471,7 +2534,9 @@ async fn configure_model_inner(
 ) -> Result<ModelSummary, AppError> {
     let requested_id = config.id.trim().to_string();
     let mut config = normalize_model_for_save(config)?;
-    let mut guard = state.inner.lock().await;
+    let mut stored = state.inner.lock().await;
+    let mut guard = stored.clone();
+    let previous_scope = guard.models.iter().find(|model| model.id == requested_id).cloned();
     if !config.enabled
         && !guard
             .models
@@ -2493,6 +2558,18 @@ async fn configure_model_inner(
             config.last_checked_at = existing.last_checked_at.clone();
             config.last_error = existing.last_error.clone();
         }
+    }
+    if let Some(previous) = previous_scope.as_ref() {
+      if previous.provider != config.provider || previous.base_url != config.base_url || config.api_key.is_some() {
+        // 一个 URL 就是一个服务商：修改服务商地址、协议或 Key 时同步同组模型，
+        // 防止列表里出现“同一服务商一半能用、一半仍指向旧地址”的隐性配置。
+        for model in &mut guard.models {
+            if model.id == requested_id || !same_model_scope(model, previous) { continue; }
+            model.provider = config.provider.clone();
+            model.base_url = config.base_url.clone();
+            if let Some(key) = config.api_key.clone() { model.api_key = Some(key); }
+        }
+      }
     }
     let config_id = config.id.clone();
     if let Some(index) = guard.models.iter().position(|model| model.id == config_id) {
@@ -2519,8 +2596,8 @@ async fn configure_model_inner(
         .map(model_summary)
         .ok_or_else(|| AppError::Internal("保存模型后找不到 profile".to_string()))?;
     let persisted = guard.clone();
-    drop(guard);
     persist_runtime_state(&persisted)?;
+    *stored = persisted;
     Ok(summary)
 }
 
@@ -2796,15 +2873,23 @@ fn project_record_from_context(project: &ProjectContext) -> Option<WorkspaceProj
     if path.is_empty() {
         return None;
     }
+    let temporary_root = dirs::document_dir().map(|directory| directory.join("PLCpilot"));
+    let path_key = project_identity(Path::new(path));
+    let is_temporary = temporary_root.as_ref().is_some_and(|root| {
+        let root_key = project_identity(root);
+        path_key == root_key || path_key.starts_with(&(root_key + "/"))
+    });
     Some(WorkspaceProject {
         id: project_identity(Path::new(path)),
-        name: project.name.clone().unwrap_or_else(|| {
+        name: if is_temporary {
+            Path::new(path).file_name().and_then(|value| value.to_str()).map(|name| format!("临时会话 · {name}")).unwrap_or_else(|| "临时会话".into())
+        } else { project.name.clone().unwrap_or_else(|| {
             Path::new(path)
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or(path)
                 .to_string()
-        }),
+        }) },
         path: path.to_string(),
         exists: project.exists,
         last_opened_at: now_iso(),
@@ -2990,12 +3075,7 @@ async fn rename_session_inner(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let target = if let Some(requested_path) = requested_path {
-        list_session_records()
-            .into_iter()
-            .find(|item| session_paths_equal(&item.path, requested_path))
-            .ok_or_else(|| {
-                AppError::Configuration("会话文件不在 PLC Pilot 会话目录中".to_string())
-            })?
+        agent_runtime::session_record_for_path(requested_path)?
     } else {
         let guard = state.inner.lock().await;
         SessionRecord {
@@ -3057,25 +3137,9 @@ async fn delete_session_inner(
         ));
     }
     let requested = path.trim();
-    let record = list_session_records()
-        .into_iter()
-        .find(|item| session_paths_equal(&item.path, requested))
-        .ok_or_else(|| AppError::Configuration("会话文件不在 PLC Pilot 会话目录中".to_string()))?;
+    let record = agent_runtime::session_record_for_path(requested)?;
     let record = parse_session_record_with_mode(Path::new(&record.path), false).ok_or_else(|| AppError::Configuration("完整会话内容无法解析。".into()))?;
-    let root = fs::canonicalize(agent_session_dir())
-        .map_err(|error| AppError::Configuration(format!("会话目录不可用：{error}")))?;
-    let target = fs::canonicalize(&record.path)
-        .map_err(|error| AppError::Configuration(format!("会话文件不可用：{error}")))?;
-    if !target.starts_with(&root)
-        || !target
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
-    {
-        return Err(AppError::Configuration(
-            "只能清理 PLC Pilot 自己创建的会话文件".to_string(),
-        ));
-    }
+    let target = PathBuf::from(&record.path);
     fs::remove_file(&target)
         .map_err(|error| AppError::Configuration(format!("清理会话未完成：{error}")))?;
     let mut guard = state.inner.lock().await;
@@ -3137,11 +3201,8 @@ async fn resume_session_inner(path: String, state: &AppState) -> Result<SessionR
     if requested.is_empty() {
         return Err(AppError::Configuration("请选择一个会话文件".to_string()));
     }
-    // 只允许恢复由本应用会话目录发现出来的 JSONL，避免把任意本机文件交给 Pi 解析。
-    let record = list_session_records()
-        .into_iter()
-        .find(|item| session_paths_equal(&item.path, requested))
-        .ok_or_else(|| AppError::Configuration("会话文件不在 PLC Pilot 会话目录中".to_string()))?;
+    // 直接读取用户选择的 JSONL，会话恢复不依赖当前项目和应用目录中的索引。
+    let record = agent_runtime::session_record_for_path(requested)?;
     state.inner.lock().await.session = AgentSessionSummary {
         session_id: Some(record.session_id.clone()),
         session_file: Some(record.path.clone()),
@@ -3283,25 +3344,8 @@ async fn fork_session_inner(
             "请选择一个要分支的会话".to_string(),
         ));
     }
-    let record = list_session_records()
-        .into_iter()
-        .find(|item| session_paths_equal(&item.path, requested))
-        .ok_or_else(|| AppError::Configuration("会话文件不在 PLC Pilot 会话目录中".to_string()))?;
-    let root = fs::canonicalize(agent_session_dir())
-        .map_err(|error| AppError::Configuration(format!("会话目录不可用：{error}")))?;
-    let source_path = fs::canonicalize(&record.path)
-        .map_err(|error| AppError::Configuration(format!("会话文件不可用：{error}")))?;
-    if !source_path.starts_with(&root)
-        || source_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| !value.eq_ignore_ascii_case("jsonl"))
-            .unwrap_or(true)
-    {
-        return Err(AppError::Configuration(
-            "只能从 PLC Pilot 自己创建的会话文件建立分支".to_string(),
-        ));
-    }
+    let record = agent_runtime::session_record_for_path(requested)?;
+    let source_path = PathBuf::from(&record.path);
     if request
         .name
         .as_deref()
@@ -3325,6 +3369,7 @@ async fn fork_session_inner(
         &timestamp,
     )?;
 
+    let root = agent_session_dir();
     fs::create_dir_all(&root)
         .map_err(|error| AppError::Configuration(format!("创建会话目录未完成：{error}")))?;
     let filename = format!(
@@ -4352,6 +4397,7 @@ async fn run_agent(
     stream.send_status("request_start", None);
     let root = state.inner().clone();
     let state = agent_runtime::isolate_run(&root, &request).await?;
+    agent_control::register(&request_id).await;
     // 控制面只确认提交成功；后台任务负责读取宿主 stdout、投影工具/文本事件，
     // 并在终态发送 result/error。这样 invoke 返回后 WebView 仍有独立事件流可消费。
     tauri::async_runtime::spawn(async move {
@@ -4368,6 +4414,7 @@ async fn run_agent(
         drop(global);
         drop(runtime);
         root.running.lock().await.remove(&stream.request_id);
+        agent_control::remove(&stream.request_id).await;
         stream.send_session(state.inner.lock().await.session.clone());
         match result {
             Ok(result) => stream.send_result(result),
@@ -4975,8 +5022,12 @@ fn agent_node_command(app: &AppHandle) -> String {
             return override_path;
         }
     }
+    if let Some(path) = bundled_runtime_file("runtime/node/node.exe") {
+        return path.to_string_lossy().into_owned();
+    }
     if let Ok(resource_dir) = app.path().resource_dir() {
         for candidate in [
+            resource_dir.join("runtime").join("node").join("node.exe"),
             resource_dir.join("node").join("node.exe"),
             resource_dir.join("resources").join("node").join("node.exe"),
         ] {
@@ -4988,11 +5039,91 @@ fn agent_node_command(app: &AppHandle) -> String {
     "node".to_string()
 }
 
+/// 定位随安装包或便携目录分发的文件；发布版不得借用构建机源码目录。
+fn bundled_runtime_file(relative: &str) -> Option<PathBuf> {
+    let executable_root = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from));
+    let mut roots = Vec::new();
+    if let Some(root) = executable_root {
+        roots.push(root.clone());
+        roots.push(root.join("resources"));
+    }
+    let packaged = roots.into_iter().map(|root| root.join(relative)).find(|path| path.is_file());
+    if packaged.is_some() { return packaged; }
+    // runtime-stage 的内部直接是 node/python，没有第二层 runtime；旧拼接路径
+    // 在开发模式中找不到文件，而发布模式的源码回退又会掩盖安装资源遗漏。
+    #[cfg(debug_assertions)]
+    {
+        let staged = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("runtime-stage")
+            .join(relative.strip_prefix("runtime/").unwrap_or(relative));
+        if staged.is_file() { return Some(staged); }
+    }
+    None
+}
+
+fn resolve_runtime_command(command: &str) -> String {
+    let trimmed = command.trim();
+    if trimmed.is_empty() || Path::new(trimmed).components().count() > 1 {
+        return trimmed.to_string();
+    }
+    let relative = match trimmed.to_ascii_lowercase().as_str() {
+        "node" | "node.exe" => Some("runtime/node/node.exe"),
+        "npm" | "npm.cmd" => Some("runtime/node/npm.cmd"),
+        "npx" | "npx.cmd" => Some("runtime/node/npx.cmd"),
+        "python" | "python.exe" | "python3" | "python3.exe" | "py" | "py.exe" => Some("runtime/python/python.exe"),
+        _ => None,
+    };
+    relative.and_then(bundled_runtime_file)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn bundled_runtime_path_env(existing: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    let mut paths = Vec::new();
+    let user_runtime = app_data_root().join("runtime");
+    paths.push(user_runtime.join("npm"));
+    paths.push(user_runtime.join("python").join("Python312").join("Scripts"));
+    if let Some(path) = bundled_runtime_file("runtime/node/node.exe") {
+        if let Some(parent) = path.parent() { paths.push(parent.to_path_buf()); }
+    }
+    if let Some(path) = bundled_runtime_file("runtime/python/python.exe") {
+        if let Some(parent) = path.parent() { paths.push(parent.to_path_buf()); }
+    }
+    if let Some(existing) = existing.or_else(|| std::env::var_os("PATH")) {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        // 复用 Windows 自带 PowerShell 5 和系统命令，不另塞一套 PowerShell 7。
+        let system = PathBuf::from(root).join("System32");
+        paths.push(system.join("WindowsPowerShell").join("v1.0"));
+        paths.push(system);
+    }
+    std::env::join_paths(paths).ok()
+}
+
+/// 给 Agent 和 MCP 子进程配置相同的包内运行时与可写依赖目录，不改系统 PATH。
+fn configure_bundled_runtime(command: &mut Command, path_override: Option<std::ffi::OsString>) {
+    if let Some(path) = bundled_runtime_path_env(path_override) { command.env("PATH", path); }
+    let root = app_data_root();
+    if bundled_runtime_file("runtime/node/node.exe").is_some() {
+        command.env("npm_config_cache", root.join("cache").join("npm"))
+            .env("npm_config_prefix", root.join("runtime").join("npm"));
+    }
+    if bundled_runtime_file("runtime/python/python.exe").is_some() {
+        // 仅把解释器放进安装目录不够：Program Files 通常不可写，嵌入式 Python
+        // 还可能误读开发机的全局用户包。显式指定应用自己的 user base，让 pip
+        // 安装与后续 Python import 使用同一个可写目录，且不污染用户原有 Python。
+        command.env("PYTHONUSERBASE", root.join("runtime").join("python"))
+            .env("PIP_USER", "1")
+            .env("PIP_CACHE_DIR", root.join("cache").join("pip"))
+            .env("PIP_DISABLE_PIP_VERSION_CHECK", "1");
+    }
+}
+
 fn agent_session_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("PLC Pilot")
-        .join("sessions")
+    app_data_root().join("sessions")
 }
 
 fn agent_cwd(project: &ProjectContext) -> PathBuf {
@@ -5042,6 +5173,7 @@ async fn run_pi_host(
     let project_cwd = agent_cwd(project);
     let cwd = dunce::simplified(&project_cwd);
     let mut command = Command::new(agent_node_command(app));
+    configure_bundled_runtime(&mut command, None);
     command
         .arg(script)
         .current_dir(cwd)
@@ -5054,10 +5186,10 @@ async fn run_pi_host(
     let mut child = command.spawn().map_err(|error| {
         AppError::Internal(format!("PI_HOST_UNAVAILABLE:无法启动 Node.js：{error}"))
     })?;
-    let mut stdin = child
+    let stdin = Arc::new(Mutex::new(child
         .stdin
         .take()
-        .ok_or_else(|| AppError::Internal("Pi 宿主 stdin 不可用".to_string()))?;
+        .ok_or_else(|| AppError::Internal("Pi 宿主 stdin 不可用".to_string()))?));
     let stdout = child
         .stdout
         .take()
@@ -5139,6 +5271,8 @@ async fn run_pi_host(
     });
 
     let mcp_sessions = McpSessionRegistry::default();
+    let mut steering_task = None;
+    let control = agent_control::get(&request_id).await;
     let result = async {
         let ready = read_host_json_or_abort(&mut reader, state).await?;
         if ready.get("type").and_then(Value::as_str) != Some("ready") {
@@ -5150,7 +5284,17 @@ async fn run_pi_host(
         if state.abort_requested.load(Ordering::SeqCst) {
             return Err(AppError::Internal("当前 Agent 任务已中止".to_string()));
         }
-        write_host_json(&mut stdin, host_request).await?;
+        write_host_json(&mut *stdin.lock().await, host_request).await?;
+        if let Some(control) = &control {
+            if let Some(mut receiver) = control.receiver.lock().await.take() {
+                let input = stdin.clone();
+                steering_task = Some(tokio::spawn(async move {
+                    while let Some(message) = receiver.recv().await {
+                        if write_host_json(&mut *input.lock().await, message).await.is_err() { break; }
+                    }
+                }));
+            }
+        }
         let mut diagnostics = Vec::new();
         let mut session = previous_session.clone();
         let final_text = loop {
@@ -5208,7 +5352,7 @@ async fn run_pi_host(
                             return Err(AppError::Internal("当前 Agent 任务已中止".to_string()));
                         }
                     };
-                    write_host_json(&mut stdin, response).await?;
+                    write_host_json(&mut *stdin.lock().await, response).await?;
                 }
                 Some("result") => {
                     let final_text = value
@@ -5256,7 +5400,7 @@ async fn run_pi_host(
     if state.abort_requested.load(Ordering::SeqCst) {
         // 先调用 Pi 原生 abort，让 SDK 落盘中断消息和统计，再回收宿主进程。
         // 直接 kill 会导致新会话的 session_file 和已执行工具的记录来不及同步。
-        let _ = write_host_json(&mut stdin, json!({ "type": "abort" })).await;
+        let _ = write_host_json(&mut *stdin.lock().await, json!({ "type": "abort" })).await;
         let _ = timeout(Duration::from_secs(3), async {
             loop {
                 let value = read_host_json(&mut reader).await?;
@@ -5268,6 +5412,7 @@ async fn run_pi_host(
             Ok::<(), AppError>(())
         }).await;
     }
+    if let Some(task) = steering_task { task.abort(); }
     let _ = child.kill().await;
     if let Err(AppError::Internal(message)) = &result {
         if message.starts_with("PI_HOST_UNAVAILABLE:") {
@@ -8551,13 +8696,18 @@ fn extract_session_message_images(message: &Value) -> Vec<CodexImageInput> {
 }
 
 fn session_paths_equal(left: &str, right: &str) -> bool {
-    let left_path = PathBuf::from(left);
-    let right_path = PathBuf::from(right);
+    let left_path = PathBuf::from(left.trim().strip_prefix(r"\\?\").unwrap_or(left.trim()));
+    let right_path = PathBuf::from(right.trim().strip_prefix(r"\\?\").unwrap_or(right.trim()));
     match (
         std::fs::canonicalize(left_path),
         std::fs::canonicalize(right_path),
     ) {
-        (Ok(left), Ok(right)) => left == right,
+        (Ok(left), Ok(right)) => {
+            #[cfg(windows)]
+            { left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy()) }
+            #[cfg(not(windows))]
+            { left == right }
+        },
         _ => left.eq_ignore_ascii_case(right),
     }
 }
@@ -9792,7 +9942,11 @@ fn parse_http_json(body: &str) -> Result<Value, AppError> {
 }
 
 async fn spawn_mcp(config: &McpServerConfig) -> Result<Child, AppError> {
-    let mut command = Command::new(&config.command);
+    let command_path = resolve_runtime_command(&config.command);
+    let mut command = Command::new(&command_path);
+    let path_override = config.env.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| std::ffi::OsString::from(value));
+    configure_bundled_runtime(&mut command, path_override.clone());
     command
         .args(&config.args)
         .envs(&config.env)
@@ -9800,6 +9954,9 @@ async fn spawn_mcp(config: &McpServerConfig) -> Result<Child, AppError> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if let Some(path) = bundled_runtime_path_env(path_override) {
+        command.env("PATH", path);
+    }
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     command
@@ -10569,6 +10726,60 @@ mod tests {
         assert!(skill_catalog_entries(&ProjectContext::default()).len() >= 5);
         assert!(mcp_catalog_entries().iter().all(|entry| !entry.package.is_empty() && !entry.source.is_empty() && !entry.license.is_empty()));
     }
+
+    #[test]
+    fn bundled_runtime_commands_use_staged_node_and_python_when_available() {
+        if bundled_runtime_file("runtime/node/node.exe").is_none()
+            || bundled_runtime_file("runtime/python/python.exe").is_none()
+        {
+            return;
+        }
+        assert!(Path::new(&resolve_runtime_command("npx.cmd")).is_file());
+        assert!(Path::new(&resolve_runtime_command("python")).is_file());
+    }
+
+    #[test]
+    fn imported_models_preserve_endpoint_credentials_and_survive_config_roundtrip() {
+        let source = ModelConfig { base_url: "https://models.example.test/v1".into(), model: "model-a".into(),
+            api_key: Some("仅用于验证的凭据".into()), context_window: 256000, ..ModelConfig::default() };
+        let mut state = RuntimeState { models: vec![source.clone()], model: source.clone(), ..RuntimeState::default() };
+        let added = merge_discovered_models(&mut state, ModelConfig { api_key: None, ..source.clone() }, vec!["model-b".into(), "model-c".into(), "model-b".into()]).expect("批量添加");
+        assert_eq!(added.len(), 2);
+        assert_eq!(state.models.len(), 3);
+        assert!(state.models.iter().all(|model| model.api_key == source.api_key && model.base_url == source.base_url));
+        let directory = tempfile::tempdir().expect("创建配置验证目录");
+        let path = directory.path().join("config.json");
+        write_json_atomic(&path, &runtime_config_without_secrets(&state), "验证配置").expect("保存配置");
+        let text = fs::read_to_string(&path).expect("重新读取配置");
+        assert!(!text.contains("仅用于验证的凭据"));
+        let restored: PersistedRuntimeConfig = serde_json::from_str(&text).expect("恢复模型");
+        assert_eq!(restored.models.len(), 3);
+        assert!(restored.models.iter().all(|model| model.base_url == source.base_url && model.context_window == 256000 && model.enabled));
+    }
+
+    #[test]
+    fn import_deduplicates_only_within_same_provider_and_keeps_custom_limits() {
+        let mut source = ModelConfig::default();
+        source.model = "model-a".into();
+        source.context_window = 256000;
+        let mut state = RuntimeState { models: vec![source.clone()], ..RuntimeState::default() };
+        merge_discovered_models(&mut state, ModelConfig { context_window: 128000, ..source.clone() }, vec!["model-a".into()]).expect("复用已有模型");
+        assert_eq!(state.models.len(), 1);
+        assert_eq!(state.models[0].context_window, 256000);
+        merge_discovered_models(&mut state, ModelConfig { base_url: "https://other.example.test/v1".into(), ..source }, vec!["model-a".into()]).expect("另一个接口的同名模型");
+        assert_eq!(state.models.len(), 2);
+        assert_ne!(state.models[0].id, state.models[1].id);
+    }
+
+    #[test]
+    fn session_paths_accept_windows_long_path_prefix_without_rejecting_valid_history() {
+        let Some(record) = list_session_records().into_iter().next() else { return; };
+        let prefixed = if record.path.starts_with(r"\\?\") { record.path.clone() } else { format!(r"\\?\{}", record.path) };
+        let result = agent_runtime::session_record_for_path(&record.path);
+        assert!(result.is_ok(), "恢复结果：{result:?}；文件：{:?}；根目录：{:?}", fs::canonicalize(&record.path), fs::canonicalize(agent_session_dir()));
+        assert!(agent_runtime::session_record_for_path(&prefixed).is_ok());
+    }
+
 
     #[test]
     fn static_diagnostics_detect_unclosed_structured_text_blocks() {

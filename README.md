@@ -2,11 +2,14 @@
 
 PLC Pilot 是面向 CODESYS 3.5 系列的独立桌面 Agent 工作台，推荐使用 SP21/SP22。界面和会话交互复用 CodexUI 的成熟 Vue 组件，底层使用 Pi Agent 会话宿主；工程读取、修改审批、真实编译诊断和安全边界由本项目 Rust 运行时负责。
 
+项目仓库：[github.com/1812095643/PLCpilot](https://github.com/1812095643/PLCpilot)
+
 ## 已接入能力
 
 - Codex 风格独立桌面布局：会话栏、聊天、工程概览、Skills、命令面板（`Ctrl/Cmd+K`）、最近会话和上下文占用；不依赖 CODESYS 内嵌侧栏。
 - 斜杠命令：`/help`、`/status`、`/new`、`/clear`、`/sessions`、`/rename`、`/compact`、`/scan`、`/compile`、`/diagnostics`、`/skills`、`/mcp`、`/tools`、`/model`、`/approve`、`/reject`。
 - Pi Agent 宿主：持久化 JSONL 会话、流式事件、自动上下文压缩、重试和会话恢复。
+- 工作区与会话：用户导入的目录和自动创建的临时会话目录都作为项目分组；临时会话按 `文档\\PLCpilot\\日期\\时间-随机标识` 创建独立工作目录，先有对话再生成文件夹，重启后仍可在项目列表切换。
 - PLC Skills：内置 CODESYS 工程工作流、PLC 安全审查、IEC 61131-3 Structured Text 规则，并读取项目内用户自定义 Skills；设置页提供免费 Skill 商店和下一轮自动加载。
 - PLC 内置工具：`plc__project_snapshot`、`plc__list_pous`、`plc__read_st_source`、`plc__search_project`、`plc__propose_edit`、`plc__compile_project`、`plc__diagnostics`。常用工程读取和诊断不需要另行安装 MCP。
 - 可选 MCP：设置页提供至少 11 个免费 MCP 商店条目，其中包含官方 Filesystem、Memory、Sequential Thinking、Everything、Puppeteer，以及社区 Context7、CODESYS MCP Toolkit、CODESYS MCP SP21+、CODESYS MCP SP21+ 中文版、Festo CODESYS MCP、CODESYS Persistent MCP；同时支持手动配置、stdio JSON-RPC（JSONL、`Content-Length`）和 Streamable HTTP（JSON、SSE、Bearer Token、`Mcp-Session-Id`）工具发现与调用。
@@ -30,7 +33,7 @@ npm install
 npm run tauri:dev
 ```
 
-Pi 宿主需要 Node.js 22.19 或更新版本。发布包内的 `pi-agent-host.bundle.mjs` 已把必要的 Pi 运行逻辑合并为单文件，不再要求安装包携带深层 `node_modules`；没有 Node.js 时，Rust Agent 会自动使用内置后备链路继续工作。
+发布包内包含精简的 Node.js 运行时（含 `npm`/`npx`）和 Python 3.12 嵌入式运行时（含 pip），空白 Windows 环境不需要另装 Node.js 或 Python。MCP 商店只在用户安装或首次启动时通过内置 `npx` 按需获取具体包，不把任何 MCP 包缓存塞进安装包；Python MCP 依赖也按需安装到用户目录。CODESYS 和 WebView2 仍属于外部软件，安装器会在缺少 WebView2 时使用官方 bootstrapper。
 
 ## 发布构建
 
@@ -39,7 +42,7 @@ npm run build
 npm run tauri:build
 ```
 
-Windows 安装包和可执行文件会输出到 `src-tauri/target/release/bundle`。构建前会自动生成 `agent-host/pi-agent-host.bundle.mjs` 并嵌入安装包；目标机器仍需 Node.js 22.19+（或另行配置 `PLC_PILOT_NODE`），直接 EXE 是否便携取决于目标机器的 WebView2 运行时，不能把它描述为完全零依赖 portable 包。
+`npm run tauri:build` 生成 `src-tauri/target/release/bundle` 中的安装包，并自动同步 `output/PLC-Pilot-Portable` 和便携 ZIP。构建前会生成 Agent bundle 和 `runtime-stage`；Agent bundle 会在仓库外独立启动检查，防止借用开发依赖掩盖漏包。Node/Python 同时提供给 Agent、审批后的命令和 MCP，依赖缓存写入 `%LOCALAPPDATA%\PLC Pilot`，不修改系统 PATH。便携版需已有 WebView2；安装版可联网自动补装。首次安装 MCP 或 Python 依赖也需要网络，带原生编译依赖的第三方包仍按其自身要求配置。
 
 ## CODESYS 工程桥接
 

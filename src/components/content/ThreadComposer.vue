@@ -71,6 +71,7 @@ export type ThreadComposerExposed = {
   hydrateDraft: (payload: ComposerDraftPayload) => void
   appendTextToDraft: (text: string) => void
   hasUnsavedDraft: () => boolean
+  readDraft: () => ComposerDraftPayload
 }
 
 const props = withDefaults(defineProps<{
@@ -868,6 +869,7 @@ defineExpose<ThreadComposerExposed>({
   hydrateDraft,
   appendTextToDraft,
   hasUnsavedDraft: () => hasUnsavedDraft.value,
+  readDraft: () => ({ text: draft.value, skills: selectedSkills.value.map(({ name, path }) => ({ name, path })), attachments: serializeAttachments(), references: [...mentionReferences.value], responseAnnotations: [...draftResponseAnnotations.value] }),
 })
 </script>
 
@@ -980,8 +982,8 @@ defineExpose<ThreadComposerExposed>({
             type="button"
             class="plc-composer-stop"
             :disabled="!canSubmit"
-            aria-label="打断并发送"
-            title="打断当前任务并发送"
+            aria-label="立即调整方向"
+            title="立即调整方向，当前操作完成后采用新指令"
             @click="submitCurrent('steer')"
           >
             <IconTablerBolt aria-hidden="true" />

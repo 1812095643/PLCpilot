@@ -31,113 +31,7 @@
          :data-message-id="message.id"
         >
         <div v-if="isCommandMessage(message)" class="message-row" data-role="system">
-          <div class="message-stack" data-role="system">
-            <button
-              v-if="getGroupedCommandsForLatest(message).length > 0"
-              type="button"
-              class="cmd-row cmd-row-group cmd-compact"
-              :class="[commandStatusClass(message), { 'cmd-expanded': isCommandGroupExpanded(message) }]"
-              @click="toggleCommandGroup(message)"
-            >
-              <span class="cmd-tool-glyph" aria-hidden="true">
-                <IconTablerBolt v-if="commandUsesMcp(message)" />
-                <IconTablerTerminal v-else />
-              </span>
-              <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandGroupExpanded(message) }">▶</span>
-              <span class="cmd-group-label">{{ commandGroupSummaryLabel(message) }}</span>
-              <span class="cmd-status">{{ commandGroupSummaryStatus(message) }}</span>
-            </button>
-            <div
-              v-if="getGroupedCommandsForLatest(message).length > 0"
-              class="cmd-group-wrap"
-              :class="{ 'cmd-group-visible': isCommandGroupExpanded(message) }"
-            >
-              <div class="cmd-group-inner">
-                <div
-                  v-for="cmd in getCommandBlockForLatest(message)"
-                  :key="`grouped-cmd-${cmd.id}`"
-                  class="worked-cmd-item"
-                >
-                  <button
-                    type="button"
-                    class="cmd-row"
-                    :class="[
-                      commandStatusClass(cmd),
-                      {
-                        'cmd-expanded': isCommandExpanded(cmd),
-                        'cmd-compact': true,
-                      },
-                    ]"
-                    @click="toggleCommandExpand(cmd)"
-                    >
-                      <span class="cmd-tool-glyph" aria-hidden="true">
-                        <IconTablerBolt v-if="commandUsesMcp(cmd)" />
-                        <IconTablerTerminal v-else />
-                      </span>
-                      <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">▶</span>
-                      <code class="cmd-label">{{ cmd.commandExecution?.command || '(command)' }}</code>
-                    <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
-                  </button>
-                  <div
-                    class="cmd-output-wrap"
-                    :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }"
-                  >
-                    <div class="cmd-output-inner">
-                      <div class="cmd-detail-panel">
-                        <div class="cmd-detail-header">
-                          <span>{{ commandOutputFormat(cmd) }}</span>
-                        </div>
-                        <pre
-                          class="cmd-output"
-                          :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
-                          v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
-                        ></pre>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-            <template v-else>
-              <button
-                type="button"
-                class="cmd-row"
-                :class="[
-                  commandStatusClass(message),
-                  {
-                    'cmd-expanded': isCommandExpanded(message),
-                    'cmd-compact': isCommandCompact(message),
-                  },
-                ]"
-                @click="toggleCommandExpand(message)"
-              >
-                <span class="cmd-tool-glyph" aria-hidden="true">
-                  <IconTablerBolt v-if="commandUsesMcp(message)" />
-                  <IconTablerTerminal v-else />
-                </span>
-                <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(message) }">▶</span>
-                <code class="cmd-label">{{ message.commandExecution?.command || '(command)' }}</code>
-                <span class="cmd-status">{{ commandStatusLabel(message) }}</span>
-              </button>
-              <div
-                class="cmd-output-wrap"
-                :class="{ 'cmd-output-visible': isCommandExpanded(message) }"
-              >
-                <div class="cmd-output-inner">
-                  <div class="cmd-detail-panel">
-                    <div class="cmd-detail-header">
-                      <span>{{ commandOutputFormat(message) }}</span>
-                    </div>
-                    <pre
-                      class="cmd-output"
-                      :class="{ 'cmd-output-condensed': isCommandOutputCondensed(message) }"
-                      v-text="message.commandExecution?.aggregatedOutput || '(no output)'"
-                    ></pre>
-                  </div>
-                </div>
-              </div>
-            </template>
-          </div>
+          <ConversationActivityGroup :messages="getCommandBlockForLatest(message)" />
         </div>
 
         <div
@@ -280,67 +174,10 @@
               </div>
 
               <article v-if="message.text.length > 0" class="message-card" :data-role="message.role">
-                <span v-if="message.messageType === 'queued'" class="message-queued-badge">排队中</span>
-                <div v-if="message.messageType === 'worked'" class="worked-separator-wrap" aria-live="polite">
-                  <button
-                    type="button"
-                    class="worked-separator"
-                    :disabled="(message.activityEventIds?.length ?? 0) === 0"
-                    :aria-expanded="isWorkedExpanded(message)"
-                    :aria-controls="workedDetailsId(message)"
-                    @click="toggleWorkedExpand(message)"
-                  >
-                    <span class="worked-separator-line" aria-hidden="true" />
-                    <span v-if="message.activityEventIds?.length" class="worked-chevron" :class="{ 'worked-chevron-open': isWorkedExpanded(message) }">▶</span>
-                    <span class="worked-separator-text">{{ message.text }}</span>
-                    <span v-if="message.activityDurationMs" class="worked-duration">{{ formatWorkedDuration(message.activityDurationMs) }}</span>
-                    <span class="worked-separator-line" aria-hidden="true" />
-                  </button>
-                  <div v-if="isWorkedExpanded(message)" :id="workedDetailsId(message)" class="worked-details" role="region" :aria-label="`${message.text}详情`">
-                    <div
-                      v-for="cmd in getCommandsForWorked(message)"
-                      :key="`worked-cmd-${cmd.id}`"
-                      class="worked-cmd-item"
-                    >
-                      <button
-                        type="button"
-                        class="cmd-row"
-                        :class="[
-                          commandStatusClass(cmd),
-                          {
-                            'cmd-expanded': isCommandExpanded(cmd),
-                            'cmd-compact': isCommandCompact(cmd),
-                          },
-                        ]"
-                        @click="toggleCommandExpand(cmd)"
-                      >
-                        <span class="cmd-tool-glyph" aria-hidden="true">
-                          <IconTablerBolt v-if="commandUsesMcp(cmd)" />
-                          <IconTablerTerminal v-else />
-                        </span>
-                        <span class="cmd-chevron" :class="{ 'cmd-chevron-open': isCommandExpanded(cmd) }">▶</span>
-                        <code class="cmd-label">{{ cmd.commandExecution?.command || '(command)' }}</code>
-                        <span class="cmd-status">{{ commandStatusLabel(cmd) }}</span>
-                      </button>
-                      <div
-                        class="cmd-output-wrap"
-                        :class="{ 'cmd-output-visible': isCommandExpanded(cmd) }"
-                      >
-                        <div class="cmd-output-inner">
-                          <div class="cmd-detail-panel">
-                            <div class="cmd-detail-header">
-                              <span>{{ commandOutputFormat(cmd) }}</span>
-                            </div>
-                            <pre
-                              class="cmd-output"
-                              :class="{ 'cmd-output-condensed': isCommandOutputCondensed(cmd) }"
-                              v-text="cmd.commandExecution?.aggregatedOutput || '(no output)'"
-                            ></pre>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
+                <span v-if="message.messageType === 'queued' || message.messageType === 'queued-steering'" class="message-queued-badge">{{ message.messageType === 'queued-steering' ? '调整中' : '排队中' }}</span>
+                <div v-if="message.messageType === 'worked'" class="turn-activity-summary">
+                  <p class="turn-duration">{{ message.activityDurationMs ? formatWorkedDuration(message.activityDurationMs) : '处理完成' }}</p>
+                  <ConversationActivityGroup v-if="getCommandsForWorked(message).length > 0" :messages="getCommandsForWorked(message)" />
                 </div>
                 <div v-else-if="isPlanMessage(message)" class="plan-card" :data-streaming="message.messageType === 'plan.live'">
                   <div class="plan-card-header">
@@ -598,21 +435,6 @@
                     <hr v-else-if="block.kind === 'thematicBreak'" class="message-divider" />
                   </template>
                 </div>
-                <div v-if="isTurnErrorMessage(message)" class="turn-error-actions">
-                  <p class="turn-error-guidance">{{ turnErrorGuidance(message) }}</p>
-                  <button
-                    v-if="message.retryPayload"
-                    type="button"
-                    class="message-action-button turn-error-retry"
-                    :disabled="props.isTurnInProgress"
-                    aria-label="重试本轮消息"
-                    title="保留原配置重试本轮消息"
-                    @click="emit('retry-message', message)"
-                  >
-                    <IconTablerRefresh class="icon-svg" />
-                    <span>重试</span>
-                  </button>
-                </div>
               </article>
 
               <section v-if="readAnchoredFileChangeSummary(message)" class="file-change-summary-block file-change-summary-block-inline">
@@ -720,7 +542,9 @@
                 </button>
               </div>
 
-              <div v-if="showMessageToolbar(message)" class="message-toolbar" :data-role="message.role">
+              <div v-if="showMessageToolbar(message)" class="message-toolbar" :class="{ 'message-toolbar-error': isTurnErrorMessage(message) }" :data-role="message.role">
+                <span v-if="isTurnErrorMessage(message)" class="turn-error-inline-guidance">{{ turnErrorGuidance(message) }}</span>
+                <button v-if="isTurnErrorMessage(message) && message.retryPayload" type="button" class="message-action-button" :disabled="props.isTurnInProgress" aria-label="重试本轮消息" @click="emit('retry-message', message)"><IconTablerRefresh class="icon-svg" /><span>重试</span></button>
                 <button
                   v-if="showMessageCopyButton(message)"
                   type="button"
@@ -775,26 +599,21 @@
         </div>
       </li>
       </template>
-      <li v-if="liveOverlay" class="conversation-item conversation-item-overlay">
+      <li v-if="visibleLiveOverlay" class="conversation-item conversation-item-overlay">
         <div class="message-row">
           <div class="message-stack">
-            <article class="live-overlay-inline" :data-status="liveOverlay.status || 'working'" aria-live="polite">
+            <article class="live-overlay-inline" :data-status="visibleLiveOverlay.status || 'working'" aria-live="polite">
               <div class="live-overlay-heading">
-                <span v-if="liveOverlay.status === 'reconnecting'" class="live-overlay-reconnect-spinner" aria-hidden="true" />
-                <span v-else class="live-overlay-pulse" aria-hidden="true" />
-                <p class="live-overlay-label">{{ liveOverlay.activityLabel }}</p>
+                <IconWifi v-if="visibleLiveOverlay.status === 'reconnecting'" :size="15" stroke="1.5" aria-hidden="true" />
+                <IconBrain v-else :size="15" stroke="1.5" aria-hidden="true" />
+                <p class="live-overlay-label">{{ visibleLiveOverlay.activityLabel }}</p>
               </div>
-              <p v-if="liveOverlay.activityDetails.length > 0" class="live-overlay-detail">
-                {{ liveOverlay.activityDetails.join(' · ') }}
+              <p v-if="visibleLiveOverlay.activityDetails.length > 0" class="live-overlay-detail">
+                {{ visibleLiveOverlay.activityDetails.join(' · ') }}
               </p>
-              <p
-                v-if="liveOverlay.reasoningText"
-                class="live-overlay-reasoning"
-              >
-                {{ liveOverlay.reasoningText }}
-              </p>
-              <div v-if="liveOverlay.errorText" class="live-overlay-error">
-                <span>{{ liveOverlay.errorText }}</span>
+              <details v-if="visibleLiveOverlay.reasoningText" class="live-overlay-thinking"><summary>思考摘要</summary><p class="live-overlay-reasoning">{{ visibleLiveOverlay.reasoningText }}</p></details>
+              <div v-if="visibleLiveOverlay.errorText" class="live-overlay-error">
+                <span>{{ visibleLiveOverlay.errorText }}</span>
                 <span class="live-overlay-guidance">请检查上方工具时间线后重试。</span>
               </div>
             </article>
@@ -1037,6 +856,8 @@ import IconTablerTerminal from '../icons/IconTablerTerminal.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 import SessionTimeline, { type SessionTimelineTurn } from './SessionTimeline.vue'
+import ConversationActivityGroup from './ConversationActivityGroup.vue'
+import { IconWifi, IconBrain } from '@tabler/icons-vue'
 
 type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
 
@@ -1104,6 +925,10 @@ function readPlanData(message: UiMessage): { explanation: string; steps: UiPlanS
 
 function isCommandMessage(message: UiMessage): boolean {
   return message.messageType === 'commandExecution' && !!message.commandExecution
+}
+
+function isQueuedMessage(message: UiMessage): boolean {
+  return message.messageType === 'queued' || message.messageType === 'queued-steering'
 }
 
 function isPlanMessage(message: UiMessage): boolean {
@@ -1184,14 +1009,16 @@ const groupedCommandsByLatestId = computed<Record<string, UiMessage[]>>(() => {
     }
 
     const block: UiMessage[] = []
-    while (index < props.messages.length && isCommandMessage(props.messages[index])) {
+    while (index < props.messages.length && isCommandMessage(props.messages[index])
+      && props.messages[index].turnId === message.turnId
+      && props.messages[index].commandExecution?.kind === message.commandExecution?.kind) {
       block.push(props.messages[index])
       index += 1
     }
 
     // 运行中必须逐项展示每个真实工具；本轮结束后才交给 worked 三层折叠。
     // 否则第二个工具一出现，现有连续命令分组会立刻吞掉第一条状态。
-    if (block.length <= 1 || isLiveTurnRuntime.value) continue
+    if (block.length <= 1 || isLiveTurnRuntime.value || ['retry', 'thinking', 'model'].includes(message.commandExecution?.kind || '')) continue
     const latest = block[block.length - 1]
     next[latest.id] = block.slice(0, -1)
   }
@@ -1378,7 +1205,7 @@ function formatWorkedDuration(durationMs: number): string {
   if (hours > 0) parts.push(`${hours} 小时`)
   if (minutes > 0 || hours > 0) parts.push(`${minutes} 分`)
   parts.push(`${seconds} 秒`)
-  return `处理 ${parts.join(' ')}`
+  return `用时 ${parts.join('')}`
 }
 
 function toggleFileChangeSummary(message: UiMessage): void {
@@ -1484,6 +1311,17 @@ const props = defineProps<{
   loadEarlierMessages?: (threadId: string) => Promise<void>
 }>()
 
+const visibleLiveOverlay = computed(() => {
+  const overlay = props.liveOverlay
+  if (!overlay) return null
+  // 已有逐字输出时由正文光标表示生成中，避免正文下再堆一个“正在生成回复”。
+  if (overlay.status === 'streaming' && hasLiveAssistantText.value) return null
+  const alreadyShown = props.messages.some((message) => message.commandExecution?.status === 'inProgress'
+    && (message.commandExecution.command === overlay.activityLabel
+      || (message.commandExecution.kind === 'retry' && overlay.status === 'reconnecting')))
+  return alreadyShown ? null : overlay
+})
+
 /**
  * 每条已发送的用户消息建立一个刻度，预览随回复增量更新；尚未发送的队列不占刻度。
  * 工具、思考和 worked 汇总属于同一轮的后台轨迹，不再各自占用导轨刻度。
@@ -1492,7 +1330,7 @@ const timelineAssistantByUserId = computed<Record<string, UiMessage>>(() => {
   const next: Record<string, UiMessage> = {}
   for (let index = 0; index < props.messages.length; index += 1) {
     const userMessage = props.messages[index]
-    if (userMessage.role !== 'user' || userMessage.messageType === 'queued') continue
+    if (userMessage.role !== 'user' || isQueuedMessage(userMessage)) continue
     let assistantMessage: UiMessage | undefined
     for (let cursor = index + 1; cursor < props.messages.length; cursor += 1) {
       const candidate = props.messages[cursor]
@@ -1511,7 +1349,7 @@ const timelineAssistantByUserId = computed<Record<string, UiMessage>>(() => {
 })
 
 const timelineTurns = computed<SessionTimelineTurn[]>(() => props.messages
-  .filter((message) => message.role === 'user' && message.messageType !== 'queued')
+  .filter((message) => message.role === 'user' && !isQueuedMessage(message))
   .map((userMessage) => ({ userMessage, assistantMessage: timelineAssistantByUserId.value[userMessage.id] })))
 
 const emit = defineEmits<{
@@ -1646,7 +1484,26 @@ const LOAD_MORE_SCROLL_THRESHOLD_PX = 200
 const renderWindowStart = ref(0)
 const isLoadingMore = ref(false)
 
-const visibleMessages = computed(() => props.messages.slice(renderWindowStart.value))
+const visibleMessages = computed(() => {
+  // 历史 UI 状态可能把耗时放在轮次末尾。只调整展示顺序，保持会话序号和
+  // 分支、编辑的原始记录不变：用户消息 → 耗时/分割线 → 工具/思考 → 正文。
+  const durationByTurn = new Map(props.messages.filter((message) => message.messageType === 'worked').map((message) => [message.turnId ?? `index:${message.turnIndex}`, message]))
+  const userTurns = new Set(props.messages.filter((message) => message.role === 'user').map((message) => message.turnId ?? `index:${message.turnIndex}`))
+  const ordered = props.messages.flatMap((message) => {
+    const turnKey = message.turnId ?? `index:${message.turnIndex}`
+    if (message.messageType === 'worked' && userTurns.has(turnKey)) return []
+    const duration = message.role === 'user' ? durationByTurn.get(turnKey) : undefined
+    return duration ? [message, duration] : [message]
+  })
+  return ordered.slice(renderWindowStart.value).filter((message) => {
+  // 流式回复建立时先插入空 assistant 占位；浮动状态行已经承担反馈，
+  // 空占位不能参与列表布局，否则重试/思考之间会出现一整行无意义空白。
+  return !(message.messageType === 'agentMessage.live'
+    && !message.text.trim()
+    && !(message.attachments?.length)
+    && !(message.references?.length))
+  })
+})
 const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
 
 const showJumpToLatestButton = computed(
@@ -2089,6 +1946,7 @@ function showMessageCopyButton(message: UiMessage): boolean {
 }
 
 function showMessageToolbar(message: UiMessage): boolean {
+  if (message.messageType === 'agentMessage.live' || message.messageType === 'agentMessage.commentary') return false
   return message.role === 'user' || (message.role === 'assistant' && message.text.trim().length > 0)
 }
 
@@ -4468,6 +4326,7 @@ onBeforeUnmount(() => {
 
 .live-overlay-heading {
   @apply flex min-w-0 items-center gap-2;
+  color:#858990;
 }
 
 .live-overlay-pulse {
@@ -4481,7 +4340,7 @@ onBeforeUnmount(() => {
 }
 
 .live-overlay-label {
-  @apply m-0 text-sm leading-5 font-medium text-zinc-600;
+  @apply m-0 text-xs leading-5 font-normal text-zinc-500;
 }
 
 .live-overlay-detail {
@@ -4598,6 +4457,11 @@ onBeforeUnmount(() => {
 .message-toolbar {
   @apply mt-1 self-start flex items-center gap-1 opacity-[0.01] transition-opacity duration-200;
 }
+
+.message-body[data-role='user'] .message-toolbar { align-self:flex-end; }
+.message-toolbar-error { opacity:1; margin-top:8px; }
+.turn-error-inline-guidance { min-width:0; max-width:60ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#bb6565; font-size:11px; }
+.conversation-item[data-message-type='agentMessage.commentary'] { margin-top:-5px; }
 
 .message-row:hover .message-toolbar {
   @apply opacity-100;
@@ -4958,8 +4822,14 @@ onBeforeUnmount(() => {
 }
 
 .message-card {
-  @apply max-w-[min(var(--chat-card-max,76ch),100%)] px-0 py-0 bg-transparent border-none rounded-none;
+  @apply w-full max-w-full px-0 py-0 bg-transparent border-none rounded-none;
 }
+
+.turn-duration { margin:2px 0 6px; padding-bottom:8px; border-bottom:1px solid color-mix(in srgb,currentColor 12%,transparent); color:#858990; font-size:12px; line-height:20px; }
+.conversation-item[data-message-type='commandExecution'] { margin-block:-2px; }
+.conversation-item[data-message-type='agentMessage.commentary'] .message-text { font-size:13px; line-height:1.75; }
+.conversation-item-overlay { margin-top:-7px; }
+.conversation-item-overlay .live-overlay-inline { padding-top:0; padding-bottom:0; }
 
 .message-text-flow {
   @apply flex flex-col gap-2;

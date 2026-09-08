@@ -16,6 +16,7 @@ import SettingsPage from './components/settings/SettingsPage.vue'
 import type { ComposerDraftPayload, ThreadComposerExposed, SubmitPayload } from './components/content/ThreadComposer.vue'
 import { useWorkspaceThreads, type WorkspaceThread } from './composables/useWorkspaceThreads'
 import { useAppTheme } from './composables/useAppTheme'
+import { useModelSettings } from './composables/useModelSettings'
 import IconTablerBolt from './components/icons/IconTablerBolt.vue'
 import IconTablerSettings from './components/icons/IconTablerSettings.vue'
 import IconTablerSearch from './components/icons/IconTablerSearch.vue'
@@ -28,6 +29,7 @@ import { normalizePathForUi } from './pathUtils'
 import {
   approveChange,
   abortAgent,
+  steerAgent,
   compactContext,
   compileProject,
   deleteModel,
@@ -36,6 +38,7 @@ import {
   EMPTY_SNAPSHOT,
   getSkillContent,
   getSnapshot,
+  importModels,
   modelFormFromSummary,
   deleteSession,
   forkSession,
@@ -82,6 +85,8 @@ import type { Diagnostic } from './api/plcBridge'
 type View = 'chat' | 'overview' | 'skills'
 
 const snapshot = shallowRef<Snapshot>(EMPTY_SNAPSHOT)
+const modelSettings = useModelSettings(snapshot)
+const isSavingModel = shallowRef(false)
 const workspace = useWorkspaceThreads()
 const messages = workspace.field('messages')
 /** 当前 Composer 中等待随下一条用户消息发送的回复批注。 */
@@ -104,6 +109,7 @@ const settingsCategory = shallowRef('models')
 const showCommandPalette = shallowRef(false)
 const showAbout = shallowRef(false)
 const showReward = shallowRef(false)
+const GITHUB_REPOSITORY_URL = 'https://github.com/1812095643/PLCpilot'
 type AppDialog = { kind: 'confirm' | 'prompt'; title: string; message: string; value: string; resolve: (value: boolean | string | null) => void } | null
 const appDialog = shallowRef<AppDialog>(null)
 const showSkillDetail = shallowRef(false)
@@ -141,6 +147,10 @@ function closeAppDialog(result: boolean | string | null): void {
   const dialog = appDialog.value
   appDialog.value = null
   dialog?.resolve(result)
+}
+
+function openGithubRepository(): void {
+  window.open(GITHUB_REPOSITORY_URL, '_blank', 'noopener,noreferrer')
 }
 
 const fallbackCommands: CommandSummary[] = [
@@ -230,7 +240,9 @@ const agentContext = computed(() => ({
   active_file: currentProject.value.active_file,
 }))
 
-const sidebarProjects = computed(() => snapshot.value.projects.filter((project) => !/\/documents\/plcpilot\/\d{4}-\d{2}-\d{2}\//iu.test(pathKey(project.path))))
+// 临时会话也有真实工作目录，和用户导入的文件夹一样按项目分组；只有
+// 旧版本遗留的无路径线程才落到侧栏底部的“其他会话”。
+const sidebarProjects = computed(() => snapshot.value.projects)
 const sidebarThreads = computed<SidebarThread[]>(() => {
   const locals = workspace.threads.value.map((thread) => ({
     id: thread.id,
@@ -279,6 +291,10 @@ async function deleteSidebarThread(id: string): Promise<void> {
 
 function newId(prefix: string): string {
   return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`
+}
+
+function isQueuedMessage(message: UiMessage): boolean {
+  return message.messageType === 'queued' || message.messageType === 'queued-steering'
 }
 
 function messageAttachments(attachments: UiAttachment[]): UiAttachment[] {
@@ -365,11 +381,18 @@ function restoreSessionMessages(record: SessionRecord): UiMessage[] {
         })),
     ]
   }
-  return restored.flatMap((message) => {
+  return restored.flatMap((message, index) => {
     if (message.role !== 'assistant') return [message]
     const activities = record.activities?.filter((entry) => entry.turn_index === message.sessionTurnIndex).map((entry) => eventToMessage(entry.event, entry.turn_index, record.cwd || '')) ?? []
     if (!activities.length) return [message]
-    return [...activities, { id: newId('worked'), role: 'system' as const, text: `${activities.length} 项后台操作`, messageType: 'worked', activityEventIds: activities.map((item) => item.id), turnIndex: message.turnIndex, turnId: message.turnId }, message]
+    const hasLaterReply = restored.slice(index + 1).some((next) => next.role === 'assistant' && next.sessionTurnIndex === message.sessionTurnIndex)
+    if (hasLaterReply) return activities.some((activity) => activity.role === 'assistant' && activity.text.trim() === message.text.trim()) ? [] : [message]
+    // 一个轮次可能包含多段进度说明。后台轨迹只在最终回复前恢复一次，避免
+    // 每段 assistant 文本都重复渲染整轮工具，并复用原消息 ID 以保留批注绑定。
+    const timeline = activities.map((activity) => activity.role === 'assistant'
+      ? restored.find((item) => item.role === 'assistant' && item.sessionTurnIndex === message.sessionTurnIndex && item.text.trim() === activity.text.trim()) ?? activity
+      : activity).filter((item) => item.id !== message.id)
+    return [...timeline, message]
   })
 }
 
@@ -486,7 +509,13 @@ async function refresh(): Promise<void> {
   if (isRefreshing.value) return
   isRefreshing.value = true
   try {
+    await modelSettings.reload()
     const next = await getSnapshot()
+    // MCP 探测期间可能已保存/导入模型。完整快照只合并其他数据，模型以独立
+    // 接口为准，避免较晚返回的旧快照把新配置和对话选择器回滚。
+    next.models = snapshot.value.models
+    next.model = snapshot.value.model
+    next.active_model_id = snapshot.value.active_model_id
     snapshot.value = next
     projectPathDraft.value = next.project.path || ''
     const activeModel = next.models.find((model) => model.id === next.active_model_id && model.enabled)
@@ -503,8 +532,6 @@ async function refresh(): Promise<void> {
       selectedModel.value = next.models.find((model) => model.id === selectedModelProfileId.value)?.model || activeModel.model
     }
     reasoningEffort.value = normalizeReasoningEffort(reasoningEffort.value, selectedModelProfile.value)
-    modelDiscovery.value = null
-    modelDiscoveryError.value = ''
     const server = next.mcp_servers[0]
     if (server) {
       mcpForm.value = {
@@ -524,6 +551,17 @@ async function refresh(): Promise<void> {
 }
 
 function eventToMessage(event: AgentEvent, turnIndex: number, cwd = currentCwd.value): UiMessage {
+  if (event.kind === 'steering') {
+    const input = JSON.parse(event.detail || '{}') as { text?: string; turn_index?: number; references?: UiMentionReference[]; attachments?: Array<{ id: string; name: string; mime_type: string; size: number; kind: UiAttachment['kind']; data_base64?: string; text_content?: string }> }
+    return { id: `turn-${turnIndex}:${event.id}`, role: 'user', text: input.text || event.title,
+      messageType: 'steering', turnId: `turn-${turnIndex}`, turnIndex, sessionTurnIndex: input.turn_index,
+      references: input.references, attachments: input.attachments?.map((item) => ({ id: item.id, name: item.name, mimeType: item.mime_type, size: item.size, kind: item.kind, status: 'ready', dataBase64: item.data_base64, textContent: item.text_content })),
+    }
+  }
+  if (event.kind === 'progress') return {
+    id: `turn-${turnIndex}:${event.id}`, role: 'assistant', text: event.detail || event.title,
+    messageType: 'agentMessage.commentary', turnId: `turn-${turnIndex}`, turnIndex,
+  }
   const status = event.status === 'warning' || event.status === 'error' ? 'failed' : event.status === 'done' || event.status === 'approved' ? 'completed' : event.status === 'waiting' ? 'waiting' : event.status === 'blocked' ? 'declined' : 'inProgress'
   const command = event.title || event.tool || event.kind
   return {
@@ -548,7 +586,7 @@ function eventToMessage(event: AgentEvent, turnIndex: number, cwd = currentCwd.v
 }
 
 function isVisibleActivityEvent(event: AgentEvent): boolean {
-  return ['tool', 'command', 'retry', 'approval', 'safety', 'compaction', 'progress'].includes(event.kind)
+  return ['tool', 'command', 'retry', 'approval', 'safety', 'compaction', 'progress', 'steering'].includes(event.kind)
     || (event.kind === 'mcp' && ['warning', 'error', 'blocked'].includes(event.status))
 }
 
@@ -587,10 +625,10 @@ function appendAgentResult(
   sessionTurnIndex?: number,
 ): void {
   const { messages, liveOverlay, diagnostics, diagnosticNote } = workspace.refs(thread)
-  const queuedMessages = messages.value.filter((item) => item.messageType === 'queued')
-  const turnIndex = messages.value.filter((item) => item.role === 'user' && item.messageType !== 'queued').length
+  const queuedMessages = messages.value.filter(isQueuedMessage)
+  const turnIndex = messages.value.filter((item) => item.role === 'user' && !isQueuedMessage(item)).length
   const annotatedBaseMessages = messages.value
-    .filter((item) => !item.id.startsWith('pending-assistant-') && item.messageType !== 'queued')
+    .filter((item) => !item.id.startsWith('pending-assistant-') && !isQueuedMessage(item))
     .map((item) => {
       if (item.role !== 'assistant') return item
       const additions = responseAnnotations.filter((annotation) => annotation.sourceMessageId === item.id)
@@ -619,7 +657,7 @@ function appendAgentResult(
   const resultMessages = result.events
     .filter(isVisibleActivityEvent)
     .map((event) => eventToMessage(event, turnIndex, thread.project.project_directory || thread.project.path || ''))
-  const activityEventIds = resultMessages.map((message) => message.id)
+  const activityEventIds = resultMessages.filter((message) => message.commandExecution).map((message) => message.id)
   const activityMessage: UiMessage | null = activityEventIds.length > 0 || activityDurationMs > 0
     ? {
         id: newId('worked'),
@@ -646,7 +684,7 @@ function appendAgentResult(
   // 批注的显示标记属于被选中的旧 AI 回复；同时把同一份结构化数据放进
   // 新用户消息，供 Pi/JSONL 会话作为下一轮上下文持久化。两处使用同一 ID，
   // 不会在恢复或再次渲染时生成重复编号。
-  messages.value = [...annotatedBaseMessages, userMessage, ...resultMessages, ...(activityMessage ? [activityMessage] : []), assistantMessage, ...queuedMessages]
+  messages.value = [...annotatedBaseMessages, userMessage, ...(activityMessage ? [activityMessage] : []), ...resultMessages, assistantMessage, ...queuedMessages]
   thread.session = result.session
   thread.pendingChanges = result.pending_changes
   snapshot.value = {
@@ -704,7 +742,7 @@ function queuedMessageFromPayload(id: string, payload: SubmitPayload): UiMessage
     collaborationMode: payload.collaborationMode,
     messageType: 'queued',
     turnId: `queued-${id}`,
-    turnIndex: messages.value.filter((item) => item.role === 'user' && item.messageType !== 'queued').length,
+    turnIndex: messages.value.filter((item) => item.role === 'user' && !isQueuedMessage(item)).length,
   }
 }
 
@@ -743,6 +781,52 @@ function cancelQueuedSubmit(id: string): void {
   messages.value = messages.value.filter((message) => message.id !== id)
 }
 
+function reorderQueuedSubmit(id: string, targetId: string): void {
+  const list = [...queuedSubmits.value]
+  const index = list.findIndex((item) => item.id === id)
+  const target = list.findIndex((item) => item.id === targetId)
+  if (index < 0 || target < 0 || list[index].steering || list[target].steering) return
+  const [item] = list.splice(index, 1)
+  list.splice(target, 0, item)
+  queuedSubmits.value = list
+}
+
+function withdrawQueuedSubmit(id: string): void {
+  const item = queuedSubmits.value.find((item) => item.id === id && !item.steering)
+  if (!item || !composerRef.value) return
+  const draft = composerRef.value.readDraft()
+  const unique = <T extends { id: string }>(items: T[]) => [...new Map(items.map((item) => [item.id, item])).values()]
+  composerRef.value.hydrateDraft({
+    text: [item.payload.text, draft.text].filter(Boolean).join('\n\n'),
+    skills: [...new Map([...item.payload.skills, ...draft.skills].map((skill) => [skill.path, skill])).values()],
+    attachments: unique([...(item.payload.attachments || []), ...(draft.attachments || [])]),
+    references: unique([...(item.payload.references || []), ...(draft.references || [])]),
+    responseAnnotations: unique([...(item.payload.responseAnnotations || []), ...(draft.responseAnnotations || [])]),
+  })
+  cancelQueuedSubmit(id)
+}
+
+async function submitSteering(payload: SubmitPayload, thread = workspace.active.value, queuedId?: string): Promise<void> {
+  const id = queuedId || newId('steer')
+  const item = { id, payload, steering: true }
+  thread.queuedSubmits = queuedId ? thread.queuedSubmits.map((entry) => entry.id === id ? item : entry) : [...thread.queuedSubmits, item]
+  try {
+    await steerAgent(thread.streamingRequestId, thread.id, id, payload)
+    showNotice('已提交新方向，当前操作完成后采用。')
+  } catch (error) {
+    thread.queuedSubmits = thread.queuedSubmits.map((entry) => entry.id === id ? { ...entry, steering: false } : entry)
+    showNotice(`${String(error)} 消息已保留在队列中。`)
+    if (!thread.isBusy) void drainSubmitQueue(thread)
+  }
+}
+
+async function steerQueuedSubmit(id: string): Promise<void> {
+  const item = queuedSubmits.value.find((item) => item.id === id && !item.steering)
+  if (!item) return
+  if (isBusy.value) await submitSteering(item.payload, workspace.active.value, id)
+  else { cancelQueuedSubmit(id); await onSubmit(item.payload) }
+}
+
 function resumeSubmitQueue(): void {
   queuePaused.value = false
   void drainSubmitQueue()
@@ -770,8 +854,8 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   const visibleAttachments = messageAttachments(attachments)
   if (!text && attachments.length === 0 && responseAnnotations.length === 0) return
   if (isBusy.value) {
-    enqueueSubmit(payload, thread, payload.mode === 'steer')
-    if (payload.mode === 'steer') await onInterrupt(true, thread)
+    if (payload.mode === 'steer') await submitSteering(payload, thread)
+    else enqueueSubmit(payload, thread)
     return
   }
   isBusy.value = true
@@ -786,8 +870,8 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     errorText: '',
     status: 'working',
   }
-  const queuedMessagesAtStart = messages.value.filter((item) => item.messageType === 'queued')
-  const baseMessages = messages.value.filter((item) => item.messageType !== 'queued')
+  const queuedMessagesAtStart = messages.value.filter(isQueuedMessage)
+  const baseMessages = messages.value.filter((item) => !isQueuedMessage(item))
   const pendingTurnIndex = baseMessages.filter((item) => item.role === 'user').length
   const requestModel = payload.model?.trim() || selectedModel.value
   const requestModelProfileId = payload.modelProfileId?.trim() || selectedModelProfileId.value
@@ -855,6 +939,15 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   }
 
   function showAgentEvent(item: AgentEvent): void {
+    if (item.kind === 'steering') {
+      thread.queuedSubmits = thread.queuedSubmits.filter((input) => input.id !== item.id)
+      upsertLiveAgentEvent(item, pendingTurnIndex, thread)
+      return
+    } else if (item.kind === 'steering_error') {
+      thread.queuedSubmits = thread.queuedSubmits.map((input) => input.id === item.id ? { ...input, steering: false } : input)
+      showNotice('方向调整尚未采用，消息已保留在发送队列。')
+      return
+    }
     if (item.kind === 'turn' && item.detail) {
       const metadata = JSON.parse(item.detail) as { turn_index?: number }
       if (typeof metadata.turn_index === 'number' && Number.isInteger(metadata.turn_index)) {
@@ -868,6 +961,12 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
       messages.value = messages.value.map((message) => message.commandExecution?.kind === 'retry' && message.commandExecution.status === 'inProgress' ? { ...message, commandExecution: { ...message.commandExecution, status: 'completed', exitCode: 0 } } : message)
     }
     upsertLiveAgentEvent(item, pendingTurnIndex, thread)
+    if (item.kind === 'progress') {
+      // 已落定的中途说明使用独立正文。清理同一段 live 文本，下一次生成再续写，
+      // 避免进度说明、工具详情和浮动状态中重复出现同一段文字。
+      resetTextStream(requestId)
+      return
+    }
     if (item.kind === 'retry') {
       stopThinkingTimer()
       if (item.status === 'running' || item.status === 'warning') {
@@ -1025,18 +1124,19 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     await flushTextStream(requestId)
     // runAgent 返回的是本轮完整结果；以发送前的历史为基线，避免把本轮用户消息
     // 误当成历史再次拼接，或者在占位消息清理时误删上一轮消息。
-    const queuedMessages = messages.value.filter((item) => item.messageType === 'queued')
+    const queuedMessages = messages.value.filter(isQueuedMessage)
     messages.value = [...baseMessages, ...queuedMessages]
     const finishedAt = globalThis.performance?.now?.() ?? Date.now()
     appendAgentResult(result, text, payload.skills, visibleAttachments, payload.references, responseAnnotations, finishedAt - startedAt, requestModelProfileId, requestModel, requestReasoningEffort, requestCollaborationMode, thread, nativeTurnIndex)
     pendingResponseAnnotations.value = []
-    await refresh()
+    // 正文和工具轨迹已经落地，连接检查/MCP 状态刷新不应继续占住发送按钮。
+    void refresh().catch(() => undefined)
   } catch (error) {
     const errorText = error instanceof Error ? error.message : String(error)
     const interrupted = /已中止|已停止/u.test(errorText)
     // 中断或最终错误无需继续播放动画，但要保留已经收到的完整部分回复。
     await flushTextStream(requestId, true)
-    const queuedMessages = messages.value.filter((item) => item.messageType === 'queued')
+    const queuedMessages = messages.value.filter(isQueuedMessage)
     const activityMessages = messages.value.filter((item) => item.turnIndex === pendingTurnIndex && item.commandExecution).map((item): UiMessage => (
       item.commandExecution?.status === 'inProgress' ? { ...item, commandExecution: { ...item.commandExecution, status: 'interrupted' } } : item
     ))
@@ -1104,6 +1204,8 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     streamingRequestId.value = ''
     streamingAssistantId.value = ''
     stopTextStream(requestId)
+    // 轮次边界处来不及被 SDK 消费的调整消息恢复为普通队列，保证输入不丢失。
+    thread.queuedSubmits = thread.queuedSubmits.map((item) => ({ ...item, steering: false }))
     if (thread.queuedSubmits.length > 0) void drainSubmitQueue(thread)
   }
 }
@@ -1313,7 +1415,7 @@ async function onRetryMessage(message: UiMessage): Promise<void> {
     if (!forked) return
   } else {
     messages.value = messages.value.filter((item) => (
-      item.turnId !== message.turnId || item.messageType === 'queued'
+      item.turnId !== message.turnId || isQueuedMessage(item)
     ))
   }
 
@@ -1474,35 +1576,57 @@ async function onReject(change: PendingChange): Promise<void> {
 }
 
 async function onSaveModel(form: ModelForm): Promise<void> {
+  if (isSavingModel.value) return
+  isSavingModel.value = true
   try {
     const summary = await saveModel(form)
-    const discovery = modelDiscovery.value
+    await modelSettings.reload()
     selectedModelProfileId.value = summary.id
     selectedModel.value = summary.model
     reasoningEffort.value = normalizeReasoningEffort(reasoningEffort.value, summary)
-    await refresh()
-    modelDiscovery.value = discovery
     showNotice(`模型“${summary.name}”已保存到本机配置。`)
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
-  }
+  } finally { isSavingModel.value = false }
+}
+
+async function onImportModels(form: ModelForm, ids: string[]): Promise<void> {
+  if (isSavingModel.value) return
+  isSavingModel.value = true
+  try {
+    const added = await importModels(form, ids)
+    await modelSettings.reload()
+    const first = added[0]
+    if (first) {
+      selectedModelProfileId.value = first.id
+      selectedModel.value = first.model
+      reasoningEffort.value = normalizeReasoningEffort(reasoningEffort.value, first)
+    }
+    showNotice(`已添加 ${added.length} 个模型，可在对话下方切换。`)
+  } catch (error) { showNotice(String(error)) }
+  finally { isSavingModel.value = false }
 }
 
 async function onDiscoverModels(form: ModelForm): Promise<void> {
   modelDiscoveryError.value = ''
   isDiscoveringModels.value = true
   try {
-    const result = await discoverModels({ ...form })
-    await refresh()
+    // 获取模型也是明确提交连接设置的动作；先保存地址和凭据，再发起请求，
+    // 以前这里只更新连接检测时间，用户填写的新 URL/Key 从未真正落盘。
+    const saved = await saveModel(form)
+    selectedModelProfileId.value = saved.id
+    selectedModel.value = saved.model
+    await modelSettings.reload()
+    const result = await discoverModels({ ...form, id: saved.id })
     modelDiscovery.value = result
     showNotice(result.models.length > 0 ? `已获取 ${result.models.length} 个可用模型。` : '接口已响应，但没有返回可用模型。')
   } catch (error) {
     const errorText = error instanceof Error ? error.message : String(error)
-    await refresh()
     modelDiscovery.value = null
     modelDiscoveryError.value = errorText
     showNotice('模型列表获取未完成，请查看设置面板中的原因。')
   } finally {
+    await modelSettings.reload()
     isDiscoveringModels.value = false
   }
 }
@@ -1711,6 +1835,11 @@ let stopWindowDrop: (() => void) | undefined
 let syncTimer: number | undefined
 
 onMounted(async () => {
+  await modelSettings.reload()
+  if (modelSettings.loaded.value) {
+    selectedModelProfileId.value = snapshot.value.active_model_id
+    selectedModel.value = snapshot.value.model.model
+  }
   await refresh()
   try {
     const restored = await workspace.restore()
@@ -1769,7 +1898,7 @@ onUnmounted(() => {
         @window-error="showNotice"
         @open-about="showAbout = true"
         @open-reward="showReward = true"
-        @open-github="showNotice('GitHub 链接待配置。')"
+        @open-github="openGithubRepository"
       />
     </template>
 
@@ -1787,10 +1916,14 @@ onUnmounted(() => {
     <template #content>
       <SettingsPage v-if="showSettings" v-model:category="settingsCategory" :snapshot="snapshot" :theme="theme" @close="showSettings = false" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
         <template #models>
-          <ModelSettingsPanel :models="snapshot.models" :active-model-id="snapshot.active_model_id" :selected-model-id="selectedModelProfileId"
+          <p v-if="!modelSettings.loaded.value || modelSettings.error.value" class="plc-model-loading" role="status">
+            {{ modelSettings.error.value || '正在读取本机模型配置…' }}
+            <button v-if="modelSettings.error.value" type="button" @click="modelSettings.reload()">重新读取</button>
+          </p>
+          <ModelSettingsPanel v-if="modelSettings.loaded.value" :models="snapshot.models" :active-model-id="snapshot.active_model_id" :selected-model-id="selectedModelProfileId" :is-saving="isSavingModel"
             :discovery="modelDiscovery" :discovery-error="modelDiscoveryError" :is-discovering="isDiscoveringModels"
             :current-context-tokens="workspace.active.value.session.context_tokens" :remaining-context-percent="tokenUsage?.remainingContextPercent ?? null" :auto-compaction-enabled="workspace.active.value.session.auto_compaction_enabled"
-            @save="onSaveModel" @discover="onDiscoverModels" @set-active="onSetActiveModel" @toggle-enabled="onToggleModel" @duplicate="onDuplicateModel" @remove="onDeleteModel" />
+            @save="onSaveModel" @discover="onDiscoverModels" @import="onImportModels" @set-active="onSetActiveModel" @toggle-enabled="onToggleModel" @duplicate="onDuplicateModel" @remove="onDeleteModel" />
         </template>
       </SettingsPage>
       <section v-else class="content-root plc-content">
@@ -1845,7 +1978,7 @@ onUnmounted(() => {
     </template>
 
     <template #composer>
-      <ComposerQueue v-if="!showSettings && activeView === 'chat' && queuedSubmits.length" :items="queuedSubmits" :paused="queuePaused" @cancel="cancelQueuedSubmit" @resume="resumeSubmitQueue" />
+      <ComposerQueue v-if="!showSettings && activeView === 'chat' && queuedSubmits.length" :items="queuedSubmits" :paused="queuePaused" :busy="isBusy" @cancel="cancelQueuedSubmit" @resume="resumeSubmitQueue" @edit="withdrawQueuedSubmit" @steer="steerQueuedSubmit" @reorder="reorderQueuedSubmit" />
       <ThreadComposer
         v-if="!showSettings && activeView === 'chat'"
         ref="composerRef"

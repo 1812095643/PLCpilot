@@ -22,7 +22,7 @@ export type WorkspaceThread = {
   selectedModelProfileId: string
   reasoningEffort: ReasoningEffort
   collaborationMode: CollaborationModeKind
-  queuedSubmits: Array<{ id: string; payload: SubmitPayload }>
+  queuedSubmits: Array<{ id: string; payload: SubmitPayload; steering?: boolean }>
   isDrainingSubmitQueue: boolean
   queuePaused: boolean
   textStream: ReturnType<typeof useAgentTextStream>
@@ -76,6 +76,7 @@ export function useWorkspaceThreads() {
           if (entry[key] !== undefined) Object.assign(thread, { [key]: entry[key] })
         }
         thread.queuePaused = thread.queuedSubmits.length > 0
+        thread.queuedSubmits = thread.queuedSubmits.map((item) => ({ ...item, steering: false }))
         thread.messages = thread.messages.map((message) => message.messageType === 'agentMessage.live'
           ? { ...message, messageType: 'assistant.partial' }
           : message.commandExecution?.status === 'inProgress'

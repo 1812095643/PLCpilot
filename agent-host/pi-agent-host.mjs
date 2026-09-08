@@ -28,6 +28,9 @@ let activeSession = null;
 let activeUnsubscribe = null;
 let activeConfig = null;
 const pendingToolRequests = new Map();
+const pendingSteering = [];
+const deliveredSteering = [];
+let flushingSteering = false;
 const activeToolArguments = new Map();
 let compactionCount = 0;
 let lastCompactedAt = null;
@@ -45,7 +48,7 @@ function writeMessage(message) {
 
 function sendEvent(event) {
   writeMessage({ type: "event", event });
-  if (activeSession && ["tool", "command", "approval", "safety", "progress", "compaction"].includes(event.kind) && event.status !== "running") {
+  if (activeSession && ["tool", "command", "approval", "safety", "progress", "compaction", "steering"].includes(event.kind) && event.status !== "running") {
     activeSession.sessionManager.appendCustomEntry("plc-pilot.activity", { turn_index: activeTurnIndex, event });
   }
 }
@@ -464,12 +467,23 @@ function sessionState() {
 
 function handleSessionEvent(event) {
   if (event.type === "message_end") {
-    if (event.message?.role === "user") sendEvent(makeEvent("turn", "用户消息已记录", JSON.stringify({ turn_index: activeTurnIndex }), "done", null, "user-turn"));
-    if (event.message?.role === "assistant" && event.message.stopReason === "toolUse") {
+    if (event.message?.role === "user") {
+      const text = typeof event.message.content === "string" ? event.message.content : (event.message.content ?? []).filter((part) => part.type === "text").map((part) => part.text).join("\n");
+      const index = deliveredSteering.findIndex((input) => input.prompt === text);
+      if (index >= 0) {
+        const input = deliveredSteering.splice(index, 1)[0];
+        activeTurnIndex = Math.max(0, activeSession.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message?.role === "user").length - 1);
+        const metadata = { turn_index: activeTurnIndex, text: input.message, attachments: input.attachments ?? [], references: input.references ?? [], response_annotations: input.response_annotations ?? [], skills: input.skills ?? [] };
+        activeSession.sessionManager.appendCustomEntry("plc-pilot.ui-turn", metadata);
+        sendEvent(makeEvent("steering", "已采用新的方向", JSON.stringify(metadata), "done", null, input.id));
+      } else sendEvent(makeEvent("turn", "用户消息已记录", JSON.stringify({ turn_index: activeTurnIndex }), "done", null, "user-turn"));
+    }
+    if (event.message?.role === "assistant" && (event.message.stopReason === "toolUse" || deliveredSteering.length > 0)) {
       const progress = event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
       if (progress.trim()) sendEvent(makeEvent("progress", "进度说明", progress, "done"));
     }
     writeMessage({ type: "session", session: sessionState() });
+    void flushSteering();
   }
   if (event.type === "message_start" && event.message?.role === "assistant") {
     writeMessage({ type: "stream_start" });
@@ -515,6 +529,7 @@ function handleSessionEvent(event) {
       event.toolName,
       event.toolCallId,
     ));
+    void flushSteering();
     return;
   }
   if (event.type === "tool_execution_update") {
@@ -523,7 +538,7 @@ function handleSessionEvent(event) {
     sendEvent(makeEvent(
       copy.kind,
       copy.title,
-      stringifyToolDetail(event.partialResult, 16000) ?? stringifyToolDetail(args),
+      JSON.stringify({ arguments: stringifyToolDetail(args, 8000), output: stringifyToolDetail(event.partialResult, 16000) }),
       "running",
       event.toolName,
       event.toolCallId,
@@ -534,7 +549,9 @@ function handleSessionEvent(event) {
     const args = event.args ?? activeToolArguments.get(event.toolCallId) ?? {};
     activeToolArguments.delete(event.toolCallId);
     const copy = toolActivityCopy(event.toolName, args, "done", Boolean(event.isError));
-    const detail = stringifyToolDetail(event.result, 16000);
+    // 展示标题会截断长命令。把完整参数与输出分别保存，展开时才能还原 Shell
+    // 命令行和原始换行，而不是把返回 JSON 和状态标题混成同一个段落。
+    const detail = JSON.stringify({ arguments: stringifyToolDetail(args, 8000), output: stringifyToolDetail(event.result, 16000) });
     const decision = event.result?.details?.plcDecision;
     if (decision === "pending" || decision === "blocked") {
       sendEvent(makeEvent(decision === "pending" ? "approval" : "safety", decision === "pending" ? `等待审批 ${event.toolName}` : `已阻止 ${event.toolName}`, detail, decision === "pending" ? "waiting" : "blocked", event.toolName, event.toolCallId));
@@ -601,12 +618,33 @@ function handleSessionEvent(event) {
     return;
   }
   if (event.type === "agent_start") {
+    void flushSteering();
     sendEvent(makeEvent("model", "正在思考…", null, "running", null, "agent-run"));
     return;
   }
   if (event.type === "agent_settled") {
     sendEvent(makeEvent("model", "本轮处理已完成", null, "done", null, "agent-run"));
   }
+}
+
+/** 使用 Pi 原生 steer 队列，在当前工具完成后的模型调用前注入输入，不执行 abort。 */
+async function flushSteering() {
+  if (!activeSession || flushingSteering) return;
+  flushingSteering = true;
+  try {
+    while (pendingSteering.length && activeSession.isStreaming) {
+      const input = pendingSteering.shift();
+      const references = (input.references ?? []).map((reference) => `${reference.label}: ${reference.path}`).join("\n");
+      const skills = (input.skills ?? []).map((path) => `本次请使用 Skill：${path}`).join("\n");
+      const prompt = [String(input.message ?? "").trim(), attachmentPromptText(input.attachments ?? []), responseAnnotationPromptText(input.response_annotations ?? []), references, skills].filter(Boolean).join("\n\n");
+      deliveredSteering.push({ ...input, prompt });
+      try { await activeSession.steer(prompt, codexImageInputs(input.attachments ?? [])); }
+      catch (error) {
+        deliveredSteering.splice(deliveredSteering.findIndex((item) => item.id === input.id), 1);
+        sendEvent(makeEvent("steering_error", "方向调整尚未采用", String(error), "error", null, input.id));
+      }
+    }
+  } finally { flushingSteering = false; }
 }
 
 async function disposeSession() {
@@ -875,6 +913,11 @@ async function runCompact(config) {
 }
 
 async function handleCommand(command) {
+  if (command.type === "steer") {
+    pendingSteering.push(command);
+    await flushSteering();
+    return;
+  }
   if (command.type === "execute_approved" || command.type === "record_approval") {
     try {
       if (command.type === "record_approval") {

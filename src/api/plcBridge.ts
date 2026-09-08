@@ -442,6 +442,8 @@ export const EMPTY_SNAPSHOT: Snapshot = {
 }
 
 export const getSnapshot = () => invoke<Snapshot>('get_snapshot')
+export type ModelSettingsSnapshot = Pick<Snapshot, 'models' | 'model' | 'active_model_id' | 'config_directory'>
+export const getModelSettings = () => invoke<ModelSettingsSnapshot>('get_model_settings')
 export const selectProject = (path: string) => invoke<ProjectContext>('select_project', { path })
 export const pickProjectFolder = () => invoke<string | null>('pick_project_folder')
 export const listProjects = () => invoke<WorkspaceProject[]>('list_projects')
@@ -479,8 +481,8 @@ export const searchComposerMentions = (cwd: string, query: string, limit = 24) =
   limit,
 })
 
-export const saveModel = (form: ModelForm) => invoke<ModelSummary>('configure_model', {
-  config: {
+function modelConfigPayload(form: ModelForm) {
+  return {
     id: form.id,
     name: form.name,
     provider: form.provider,
@@ -492,8 +494,11 @@ export const saveModel = (form: ModelForm) => invoke<ModelSummary>('configure_mo
     reasoning_levels: form.reasoningLevels,
     enabled: form.enabled,
     is_default: form.isDefault,
-  },
-})
+  }
+}
+
+export const saveModel = (form: ModelForm) => invoke<ModelSummary>('configure_model', { config: modelConfigPayload(form) })
+export const importModels = (form: ModelForm, modelIds: string[]) => invoke<ModelSummary[]>('import_models', { config: modelConfigPayload(form), modelIds })
 
 export const discoverModels = (form: ModelForm) => invoke<ModelDiscoveryResult>('discover_models', {
   config: {
@@ -645,6 +650,16 @@ export const runAgent = async (
 
 /** 请求桌面运行时取消当前 Agent 轮次；不会触碰工程文件或已提交的审批动作。 */
 export const abortAgent = (requestId?: string) => invoke<{ aborted: boolean }>('abort_agent', { requestId })
+export const steerAgent = (requestId: string, threadId: string, inputId: string, payload: { text: string; attachments: UiAttachment[]; references: UiMentionReference[]; responseAnnotations: UiResponseTextAnnotation[]; skills: Array<{ path: string }> }) => invoke<{ accepted: boolean }>('steer_agent', {
+  requestId,
+  input: {
+    request_id: inputId, client_thread_id: threadId, message: payload.text,
+    attachments: payload.attachments.map((item) => ({ id: item.id, name: item.name, mime_type: item.mimeType, size: item.size, kind: item.kind, data_base64: item.dataBase64, text_content: item.textContent, error: item.error })),
+    references: payload.references,
+    response_annotations: payload.responseAnnotations.map((item) => ({ id: item.id, source_message_id: item.sourceMessageId, source_message_key: item.sourceMessageKey, source_turn_index: item.sourceTurnIndex, selected_text: item.selectedText, body: item.body, created_at: item.createdAt })),
+    skills: payload.skills.map((item) => item.path),
+  },
+})
 export const startTemporaryWorkspace = () => invoke<ProjectContext>('start_temporary_workspace')
 
 export const compactContext = (instructions: string, context: AgentContextBinding) => invoke<AgentResult>('compact_context', {
