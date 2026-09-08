@@ -33,6 +33,7 @@ const emit = defineEmits<{
   'open-about': []
   'open-reward': []
   'open-github': []
+  'check-updates': []
 }>()
 
 type MenuKey = 'file' | 'edit' | 'view' | 'help'
@@ -72,6 +73,7 @@ function menuItems(key: MenuKey): MenuItem[] {
     case 'help':
       return [
         { label: '工作台设置', action: () => emit('open-settings') },
+        { label: '检查更新', action: () => emit('check-updates') },
         { label: '关于作者 · 蔡徐坤', action: () => emit('open-about') },
         { label: '打赏作者', action: () => emit('open-reward') },
         { label: 'GitHub · PLCpilot', action: () => emit('open-github') },

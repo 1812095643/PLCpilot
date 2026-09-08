@@ -1,0 +1,77 @@
+name: 发布 Windows 安装包与更新
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: 核对发布版本
+        run: |
+          $version = (Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_TYPE -ne 'tag' -or $env:GITHUB_REF_NAME -ne "v$version") { throw '请从与当前版本对应的 v 标签发布。' }
+      - run: npm ci
+      - name: 验证更新保护与构建发布包
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: |
+          if (!$env:TAURI_SIGNING_PRIVATE_KEY) { throw '请先配置 TAURI_SIGNING_PRIVATE_KEY 仓库密钥。' }
+          npm run build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npx tauri build --config '{"build":{"beforeBuildCommand":""}}'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run package:portable
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $version = (Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          npx tauri signer sign "output/PLC-Pilot-Portable-$version-win-x64.zip"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node scripts/prepare-release.mjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Windows-发布文件
+          path: release-stage/*
+          retention-days: 7
+      - name: 上传完整产物后发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $existing = gh release view $tag --json isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            if (!(($existing | ConvertFrom-Json).isDraft)) { throw '该版本已经公开，请提升版本号后发布，避免覆盖用户正在下载的文件。' }
+          } else {
+            gh release create $tag --verify-tag --draft --title "PLC Pilot $tag" --notes-file release-notes.md
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          $assets = @(Get-ChildItem release-stage -File | ForEach-Object FullName)
+          gh release upload $tag @assets --clobber
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh release edit $tag --draft=false --latest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

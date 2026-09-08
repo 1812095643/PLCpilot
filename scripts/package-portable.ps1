@@ -27,5 +27,7 @@ if (Test-Path -LiteralPath $runtimeTarget) {
 Copy-Item -LiteralPath $runtimeSource -Destination $runtimeTarget -Recurse
 Copy-Item -LiteralPath $releaseExecutable -Destination (Join-Path $portableDirectory 'plc-pilot.exe') -Force
 Copy-Item -LiteralPath $agentBundle -Destination (Join-Path $portableDirectory 'pi-agent-host.bundle.mjs') -Force
+# EXE 会被 Tauri 写入安装器类型；独立标记才能可靠区分便携目录与安装版。
+@{ product = 'PLC Pilot'; version = $version; format = 1 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $portableDirectory 'portable.json') -Encoding UTF8
 Compress-Archive -LiteralPath $portableDirectory -DestinationPath $archive -CompressionLevel Optimal -Force
 Get-Item -LiteralPath $archive | Select-Object Name, Length

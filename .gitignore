@@ -1,3 +1,7 @@
 runtime-stage/
 tmp/plc-pilot-runtime-cache/
 output/PLC-Pilot-Portable/runtime/
+release-stage/
+output/PLC-Pilot-Portable-*.zip.sig
+output/PLC-Pilot-Portable-*-win-x64.zip
+output/PLC-Pilot-Portable/portable.json

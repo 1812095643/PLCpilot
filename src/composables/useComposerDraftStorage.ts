@@ -38,5 +38,9 @@ export function useComposerDraftStorage() {
     if (isTauri()) save(id, value)
     return value
   }
-  return { save, read, flush }
+  /** 安装退出前排空所有会话的防抖写入，避免最近 250ms 的文字和附件丢失。 */
+  async function flushAll(): Promise<void> {
+    await Promise.all([...new Set([...pending.keys(), ...writes.keys()])].map(flush))
+  }
+  return { save, read, flush, flushAll }
 }

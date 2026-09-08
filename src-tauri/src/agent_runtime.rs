@@ -35,6 +35,10 @@ pub async fn isolate_run(root: &AppState, request: &AgentRequest) -> Result<AppS
     let request_id = request.request_id.clone().unwrap_or_default();
     let thread_id = request.client_thread_id.clone().unwrap_or_else(|| "desktop-default".into());
     let mut running = root.running.lock().await;
+    // 安装与任务注册共用 running 锁；否则“检查无任务”之后的新请求可能被更新进程中断。
+    if updates::INSTALLING.load(Ordering::SeqCst) {
+        return Err(AppError::Configuration("程序正在安装更新，重启完成后即可继续发送。".into()));
+    }
     if running.values().any(|run| run.thread_id == thread_id || request.session_file.as_ref().is_some_and(|path| run.session_file.as_ref().is_some_and(|other| session_paths_equal(path, other)))) {
         return Err(AppError::Configuration("该会话正在运行，请排队发送或先停止当前任务。".into()));
     }

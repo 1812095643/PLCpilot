@@ -13,6 +13,10 @@ import ThreadComposer from './components/content/ThreadComposer.vue'
 import ComposerQueue from './components/content/ComposerQueue.vue'
 import ModelSettingsPanel from './components/settings/ModelSettingsPanel.vue'
 import SettingsPage from './components/settings/SettingsPage.vue'
+import UpdatesSettingsPanel from './components/settings/UpdatesSettingsPanel.vue'
+import AppUpdateNotice from './components/settings/AppUpdateNotice.vue'
+import { useAppUpdates } from './composables/useAppUpdates'
+import { useComposerDraftStorage } from './composables/useComposerDraftStorage'
 import type { ComposerDraftPayload, ThreadComposerExposed, SubmitPayload } from './components/content/ThreadComposer.vue'
 import { useWorkspaceThreads, type WorkspaceThread } from './composables/useWorkspaceThreads'
 import { useAppTheme } from './composables/useAppTheme'
@@ -88,6 +92,12 @@ const snapshot = shallowRef<Snapshot>(EMPTY_SNAPSHOT)
 const modelSettings = useModelSettings(snapshot)
 const isSavingModel = shallowRef(false)
 const workspace = useWorkspaceThreads()
+const tasksRunning = computed(() => workspace.threads.value.some((thread) => thread.isBusy || thread.isDrainingSubmitQueue || (!thread.queuePaused && thread.queuedSubmits.length > 0)))
+const updater = useAppUpdates(async () => {
+  await nextTick()
+  await useComposerDraftStorage().flushAll()
+  await workspace.persist()
+}, () => tasksRunning.value)
 const messages = workspace.field('messages')
 /** 当前 Composer 中等待随下一条用户消息发送的回复批注。 */
 const pendingResponseAnnotations = workspace.field('pendingResponseAnnotations')
@@ -1868,6 +1878,8 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <AppUpdateNotice v-if="!showSettings && updater.state.available && updater.state.phase === 'available' && updater.state.dismissedVersion !== updater.state.available.version"
+    :version="updater.state.available.version" @open="settingsCategory = 'updates'; showSettings = true" @dismiss="updater.state.dismissedVersion = updater.state.available!.version" />
   <DesktopLayout
     :is-sidebar-collapsed="isSidebarCollapsed"
     :is-settings-mode="showSettings"
@@ -1899,6 +1911,7 @@ onUnmounted(() => {
         @open-about="showAbout = true"
         @open-reward="showReward = true"
         @open-github="openGithubRepository"
+        @check-updates="settingsCategory = 'updates'; showSettings = true; updater.check()"
       />
     </template>
 
@@ -1915,6 +1928,7 @@ onUnmounted(() => {
 
     <template #content>
       <SettingsPage v-if="showSettings" v-model:category="settingsCategory" :snapshot="snapshot" :theme="theme" @close="showSettings = false" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
+        <template #updates><UpdatesSettingsPanel :state="updater.state" :busy="updater.active.value" :tasks-running="tasksRunning" @check="updater.check" @install="updater.install" @auto-check="updater.setAutoCheck" /></template>
         <template #models>
           <p v-if="!modelSettings.loaded.value || modelSettings.error.value" class="plc-model-loading" role="status">
             {{ modelSettings.error.value || '正在读取本机模型配置…' }}

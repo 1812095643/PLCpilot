@@ -44,6 +44,14 @@ npm run tauri:build
 
 `npm run tauri:build` 生成 `src-tauri/target/release/bundle` 中的安装包，并自动同步 `output/PLC-Pilot-Portable` 和便携 ZIP。构建前会生成 Agent bundle 和 `runtime-stage`；Agent bundle 会在仓库外独立启动检查，防止借用开发依赖掩盖漏包。Node/Python 同时提供给 Agent、审批后的命令和 MCP，依赖缓存写入 `%LOCALAPPDATA%\PLC Pilot`，不修改系统 PATH。便携版需已有 WebView2；安装版可联网自动补装。首次安装 MCP 或 Python 依赖也需要网络，带原生编译依赖的第三方包仍按其自身要求配置。
 
+## 软件内更新与发布
+
+“设置 → 软件更新”提供自动检查开关、手动检查、发布说明、下载进度和一键更新。“帮助 → 检查更新”也可直接进入。更新源固定为本仓库的 GitHub Release；程序先保存会话与所有草稿，任务仍在运行时保留下载并等待用户再次安装。便携版更新整套程序与运行时，替换问题会恢复旧版本，用户数据仍存放在原来的 C 盘应用目录。
+
+维护者同步修改 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 的版本和 `release-notes.md`，更新锁文件后推送 `v版本号` 标签。GitHub Actions 自动测试、构建 NSIS/MSI/便携包、签名并生成 `latest.json`，全部上传成功后才公开 Release。首次须在仓库 Actions Secret 配置 `TAURI_SIGNING_PRIVATE_KEY`；私钥保持在仓库外并妥善保存，不要更换已发布的公钥或提交私钥。安装本地构建的签名发布包时也需提供该环境变量。
+
+0.1.0 没有更新入口，用户需先手动安装一次 0.1.1 或更高版本。程序更新签名与 Windows Authenticode 代码签名相互独立。
+
 ## CODESYS 工程桥接
 
 PLC Pilot 不在 CODESYS 内嵌聊天窗口。已保存工程可以直接在桌面工作台的“工程概览”中选择；需要读取未保存的当前工程或当前编辑器选区时，可在 CODESYS 的 `Tools` → `Scripting` → `Execute Script File` 中执行 `codesys-bridge/Script Commands/plc_pilot_sync.py`。CODESYS 工程/POU 的真实写回和目标编译通过设置页安装的社区 MCP 完成，按 Agent 任务按需启动，不常驻后台。

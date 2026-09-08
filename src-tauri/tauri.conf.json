@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PLC Pilot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.plcpilot.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -27,6 +27,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "resources": {
       "../agent-host/pi-agent-host.bundle.mjs": "pi-agent-host.bundle.mjs",
@@ -46,6 +47,13 @@
         "type": "downloadBootstrapper",
         "silent": true
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNCQTMyMDkwODU5NzdDRjEKUldUeGZKZUZrQ0NqTzZEeDZZYlFURVJnWERSUzlzOHlLYlFLMi8zZ1A5bVVwTThJeTNmYWZIQ3kK",
+      "endpoints": ["https://github.com/1812095643/PLCpilot/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
     }
   }
 }

@@ -25,7 +25,7 @@ use tokio::{
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const APP_VERSION: &str = "0.1.0";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_AGENT_TURNS: usize = 8;
 const PI_HOST_TIMEOUT_SECONDS: u64 = 240;
@@ -46,6 +46,7 @@ mod attachments;
 mod agent_runtime;
 mod agent_control;
 mod settings;
+mod updates;
 mod generic_tools;
 use attachments::{prepare_attachments, read_local_file, AttachmentInput, CodexImageInput};
 
@@ -2329,6 +2330,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(state)
+        .manage(updates::UpdateManager::default())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let state = app.state::<AppState>().inner().clone();
             let handle = app.handle().clone();
@@ -2340,6 +2343,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            updates::get_update_preferences,
+            updates::save_update_preferences,
+            updates::check_app_update,
+            updates::download_app_update,
+            updates::install_app_update,
             get_snapshot,
             get_model_settings,
             import_models,
@@ -4481,6 +4489,10 @@ async fn run_agent_inner(
 
     // 同一工程会话只允许一个 Agent 运行，避免两个模型请求同时写入同一份 JSONL 会话。
     let _run_guard = state.agent_runs.lock().await;
+    // 本机 RPC 也会直接进入这里；它必须遵守与桌面消息相同的更新退出保护。
+    if updates::INSTALLING.load(Ordering::SeqCst) {
+        return Err(AppError::Configuration("程序正在安装更新，重启完成后即可继续任务。".into()));
+    }
     if !state.isolated { state.abort_requested.store(false, Ordering::SeqCst); }
     if state.abort_requested.load(Ordering::SeqCst) { return Err(AppError::Internal("当前 Agent 任务已中止".into())); }
     let command = request.message.trim();
