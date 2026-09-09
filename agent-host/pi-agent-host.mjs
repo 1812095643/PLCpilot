@@ -48,7 +48,9 @@ function writeMessage(message) {
 
 function sendEvent(event) {
   writeMessage({ type: "event", event });
-  if (activeSession && ["tool", "command", "approval", "safety", "progress", "compaction", "steering"].includes(event.kind) && event.status !== "running") {
+  if (activeSession && ["tool", "command", "approval", "safety", "progress", "compaction", "steering"].includes(event.kind)) {
+    // 把第一次 running 事件也落盘。SessionManager 读取时按 event.id 原位合并
+    // 后续状态，因此保留的是工具首次发起的 JSONL 位置，而不是完成位置。
     activeSession.sessionManager.appendCustomEntry("plc-pilot.activity", { turn_index: activeTurnIndex, event });
   }
 }

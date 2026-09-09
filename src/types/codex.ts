@@ -127,6 +127,8 @@ export type UiMessage = {
   turnIndex?: number
   /** 仅由本地会话恢复/分支使用的稳定消息序号，不参与 Agent 提示内容。 */
   sessionMessageIndex?: number
+  /** JSONL/实时事件的实际时间线位置；只用于按发生顺序恢复和渲染。 */
+  timelineOrder?: number
   /** Pi 原始用户轮次；null 表示本地命令或尚未进入 Pi 的请求。 */
   sessionTurnIndex?: number | null
   /** 发送该用户消息时选择的模型 profile。 */

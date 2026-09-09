@@ -450,6 +450,9 @@ pub struct ChatMessage {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub response_annotations: Vec<ResponseTextAnnotation>,
+    /// JSONL 中该消息的真实行位置；仅用于桌面恢复跨消息/工具的显示顺序。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline_order: Option<usize>,
 }
 
 /// Codex Composer 的回复选区批注数据。
@@ -4268,6 +4271,7 @@ async fn run_agent_legacy(
         model_profile_id: request.model_profile_id.clone(),
         reasoning_effort: request.reasoning_effort.clone(),
         response_annotations: request.response_annotations.clone(),
+        timeline_order: None,
     });
     push_event(
         &app,
@@ -5868,6 +5872,7 @@ fn tool_feedback(tool: &str, content: &str) -> ChatMessage {
         model_profile_id: None,
         reasoning_effort: None,
         response_annotations: Vec::new(),
+        timeline_order: None,
     }
 }
 
@@ -8487,7 +8492,7 @@ fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionR
     let mut ui_turns: Vec<Value> = Vec::new();
     let mut activities: Vec<Value> = Vec::new();
     const RESPONSE_ANNOTATION_ENTRY: &str = "plc-pilot.response-text-annotations";
-    for line in content.lines() {
+    for (line_index, line) in content.lines().enumerate() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -8559,13 +8564,21 @@ fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionR
                     model_profile_id: model_profile_id.clone(),
                     reasoning_effort: reasoning_effort.clone(),
                     response_annotations,
+                    timeline_order: Some(line_index),
                 });
             }
             Some("custom") if matches!(entry.get("customType").and_then(Value::as_str), Some("plc-pilot.ui-turn" | "plc-pilot.activity")) => {
                 if !preview {
-                    let data = entry.get("data").cloned().unwrap_or_default();
+                    let mut data = entry.get("data").cloned().unwrap_or_default();
+                    if let Some(object) = data.as_object_mut() {
+                        object.entry("timeline_order").or_insert_with(|| json!(line_index));
+                    }
                     let target = if entry["customType"] == "plc-pilot.ui-turn" { &mut ui_turns } else { &mut activities };
-                    if let Some(existing) = target.iter_mut().find(|current| current["turn_index"] == data["turn_index"] && current["event"]["id"] == data["event"]["id"]) { *existing = data; } else { target.push(data); }
+                    if let Some(existing) = target.iter_mut().find(|current| current["turn_index"] == data["turn_index"] && current["event"]["id"] == data["event"]["id"]) {
+                        let first_order = existing["timeline_order"].clone();
+                        *existing = data;
+                        if !first_order.is_null() { existing["timeline_order"] = first_order; }
+                    } else { target.push(data); }
                 }
             }
             Some("custom")

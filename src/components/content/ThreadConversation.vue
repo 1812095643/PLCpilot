@@ -1485,17 +1485,10 @@ const renderWindowStart = ref(0)
 const isLoadingMore = ref(false)
 
 const visibleMessages = computed(() => {
-  // 历史 UI 状态可能把耗时放在轮次末尾。只调整展示顺序，保持会话序号和
-  // 分支、编辑的原始记录不变：用户消息 → 耗时/分割线 → 工具/思考 → 正文。
-  const durationByTurn = new Map(props.messages.filter((message) => message.messageType === 'worked').map((message) => [message.turnId ?? `index:${message.turnIndex}`, message]))
-  const userTurns = new Set(props.messages.filter((message) => message.role === 'user').map((message) => message.turnId ?? `index:${message.turnIndex}`))
-  const ordered = props.messages.flatMap((message) => {
-    const turnKey = message.turnId ?? `index:${message.turnIndex}`
-    if (message.messageType === 'worked' && userTurns.has(turnKey)) return []
-    const duration = message.role === 'user' ? durationByTurn.get(turnKey) : undefined
-    return duration ? [message, duration] : [message]
-  })
-  return ordered.slice(renderWindowStart.value).filter((message) => {
+  // 消息数组本身就是唯一时间线。旧实现为了把耗时显示在用户消息后面，
+  // 在这里重新插入 worked，连带把工具视觉上固定到轮次开头；现在完全保留
+  // 实时归并和历史恢复后的原始顺序。
+  return props.messages.slice(renderWindowStart.value).filter((message) => {
   // 流式回复建立时先插入空 assistant 占位；浮动状态行已经承担反馈，
   // 空占位不能参与列表布局，否则重试/思考之间会出现一整行无意义空白。
   return !(message.messageType === 'agentMessage.live'

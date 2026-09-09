@@ -148,7 +148,7 @@ export type ToolSummary = {
 
 export type SessionRecord = {
   ui_turns?: Array<{ turn_index: number; text: string; attachments?: LocalAttachmentInput[]; references?: UiMentionReference[]; response_annotations?: SessionRecord['messages'][number]['response_annotations']; skills?: string[]; collaboration_mode?: 'default' | 'plan' }>
-  activities?: Array<{ turn_index: number; event: AgentEvent }>
+  activities?: Array<{ turn_index: number; event: AgentEvent; timeline_order?: number }>
   session_id: string
   name: string | null
   path: string
@@ -163,6 +163,7 @@ export type SessionRecord = {
     images?: Array<{ image_url: string }>
     model_profile_id?: string | null
     reasoning_effort?: ReasoningEffort | null
+    timeline_order?: number
     response_annotations?: Array<{
       id: string
       source_message_id: string

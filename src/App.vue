@@ -372,6 +372,7 @@ function restoreSessionMessages(record: SessionRecord): UiMessage[] {
       turnId: `restored-${normalizedTurnIndex}`,
       sessionMessageIndex: index,
       sessionTurnIndex: normalizedTurnIndex,
+      timelineOrder: item.timeline_order,
     }
   })
   // 旧会话通常把批注写在发送它的 user 记录上；恢复时把标记重新挂到对应的
@@ -391,18 +392,36 @@ function restoreSessionMessages(record: SessionRecord): UiMessage[] {
         })),
     ]
   }
-  return restored.flatMap((message, index) => {
-    if (message.role !== 'assistant') return [message]
-    const activities = record.activities?.filter((entry) => entry.turn_index === message.sessionTurnIndex).map((entry) => eventToMessage(entry.event, entry.turn_index, record.cwd || '')) ?? []
-    if (!activities.length) return [message]
-    const hasLaterReply = restored.slice(index + 1).some((next) => next.role === 'assistant' && next.sessionTurnIndex === message.sessionTurnIndex)
-    if (hasLaterReply) return activities.some((activity) => activity.role === 'assistant' && activity.text.trim() === message.text.trim()) ? [] : [message]
-    // 一个轮次可能包含多段进度说明。后台轨迹只在最终回复前恢复一次，避免
-    // 每段 assistant 文本都重复渲染整轮工具，并复用原消息 ID 以保留批注绑定。
-    const timeline = activities.map((activity) => activity.role === 'assistant'
-      ? restored.find((item) => item.role === 'assistant' && item.sessionTurnIndex === message.sessionTurnIndex && item.text.trim() === activity.text.trim()) ?? activity
-      : activity).filter((item) => item.id !== message.id)
-    return [...timeline, message]
+  // 工具活动是 JSONL 中独立的 custom entry。按真实行号把它和 user/assistant
+  // 消息重新合并；不能再“找到一条 assistant 就把整轮活动放到它前面”。
+  const byTurn = new Map<number, UiMessage[]>()
+  for (const message of restored) {
+    const turn = message.sessionTurnIndex ?? message.turnIndex ?? 0
+    const list = byTurn.get(turn) ?? []
+    list.push(message)
+    byTurn.set(turn, list)
+  }
+  for (const entry of record.activities ?? []) {
+    const activity = eventToMessage(entry.event, entry.turn_index, record.cwd || '', entry.timeline_order)
+    const list = byTurn.get(entry.turn_index) ?? []
+    // 旧会话可能同时保留同一事件的多个状态；事件 ID 相同的记录只更新内容，
+    // 排序位置由第一次出现的 timeline_order 决定。
+    const existing = list.findIndex((item) => item.id === activity.id)
+    if (existing >= 0) {
+      activity.timelineOrder = list[existing].timelineOrder ?? activity.timelineOrder
+      list[existing] = activity
+    } else {
+      list.push(activity)
+    }
+    byTurn.set(entry.turn_index, list)
+  }
+  return Array.from(byTurn.keys()).sort((left, right) => left - right).flatMap((turn) => {
+    const list = byTurn.get(turn) ?? []
+    return list.sort((left, right) => {
+      const leftOrder = left.timelineOrder ?? Number.MAX_SAFE_INTEGER
+      const rightOrder = right.timelineOrder ?? Number.MAX_SAFE_INTEGER
+      return leftOrder - rightOrder
+    })
   })
 }
 
@@ -560,17 +579,17 @@ async function refresh(): Promise<void> {
   }
 }
 
-function eventToMessage(event: AgentEvent, turnIndex: number, cwd = currentCwd.value): UiMessage {
+function eventToMessage(event: AgentEvent, turnIndex: number, cwd = currentCwd.value, timelineOrder?: number): UiMessage {
   if (event.kind === 'steering') {
     const input = JSON.parse(event.detail || '{}') as { text?: string; turn_index?: number; references?: UiMentionReference[]; attachments?: Array<{ id: string; name: string; mime_type: string; size: number; kind: UiAttachment['kind']; data_base64?: string; text_content?: string }> }
     return { id: `turn-${turnIndex}:${event.id}`, role: 'user', text: input.text || event.title,
       messageType: 'steering', turnId: `turn-${turnIndex}`, turnIndex, sessionTurnIndex: input.turn_index,
-      references: input.references, attachments: input.attachments?.map((item) => ({ id: item.id, name: item.name, mimeType: item.mime_type, size: item.size, kind: item.kind, status: 'ready', dataBase64: item.data_base64, textContent: item.text_content })),
+      references: input.references, attachments: input.attachments?.map((item) => ({ id: item.id, name: item.name, mimeType: item.mime_type, size: item.size, kind: item.kind, status: 'ready', dataBase64: item.data_base64, textContent: item.text_content })), timelineOrder,
     }
   }
   if (event.kind === 'progress') return {
     id: `turn-${turnIndex}:${event.id}`, role: 'assistant', text: event.detail || event.title,
-    messageType: 'agentMessage.commentary', turnId: `turn-${turnIndex}`, turnIndex,
+    messageType: 'agentMessage.commentary', turnId: `turn-${turnIndex}`, turnIndex, timelineOrder,
   }
   const status = event.status === 'warning' || event.status === 'error' ? 'failed' : event.status === 'done' || event.status === 'approved' ? 'completed' : event.status === 'waiting' ? 'waiting' : event.status === 'blocked' ? 'declined' : 'inProgress'
   const command = event.title || event.tool || event.kind
@@ -583,6 +602,7 @@ function eventToMessage(event: AgentEvent, turnIndex: number, cwd = currentCwd.v
     messageType: 'commandExecution',
     turnId: `turn-${turnIndex}`,
     turnIndex,
+    timelineOrder,
     commandExecution: {
       command,
       tool: event.tool,
@@ -600,21 +620,62 @@ function isVisibleActivityEvent(event: AgentEvent): boolean {
     || (event.kind === 'mcp' && ['warning', 'error', 'blocked'].includes(event.status))
 }
 
+function splitLiveAssistantBeforeActivity(
+  event: AgentEvent,
+  turnIndex: number,
+  thread: WorkspaceThread,
+  streamedText: string,
+  resetStream: (requestId: string) => void,
+  requestId: string,
+): void {
+  if (!['tool', 'command', 'approval', 'safety', 'progress', 'steering'].includes(event.kind)) return
+  const { messages, streamingAssistantId } = workspace.refs(thread)
+  const eventId = event.id ? `turn-${turnIndex}:${event.id}` : ''
+  if (eventId && messages.value.some((message) => message.id === eventId)) return
+  const activeId = streamingAssistantId.value
+  if (activeId && streamedText.trim()) {
+    messages.value = messages.value.map((message) => message.id === activeId ? { ...message, text: streamedText } : message)
+  }
+  // 文本流 composable 只有一个当前缓冲。工具/命令后必须清空它，后续 delta
+  // 才会进入 upsertLiveAgentEvent 新建的 assistant 段，而不是把前文再写一遍。
+  resetStream(requestId)
+}
+
 /**
  * 将单次工具生命周期固定在一行中：start 首次插入，update/end 依据同一 ID 原位替换。
- * 插入点始终位于 live assistant 正文之前，所以工具调用顺序与模型真实执行顺序一致。
+ * 新的工具首次出现时插在当前文本段之后，并创建下一段 live assistant；同一
+ * toolCallId 的 update/end 只原位替换，因而不会把已经输出的文本重新挪到顶部。
  */
-function upsertLiveAgentEvent(event: AgentEvent, turnIndex: number, thread = workspace.active.value): void {
+function upsertLiveAgentEvent(event: AgentEvent, turnIndex: number, thread = workspace.active.value, timelineOrder?: number): void {
   const { messages, streamingAssistantId } = workspace.refs(thread)
   if (!isVisibleActivityEvent(event)) return
-  const nextMessage = eventToMessage(event, turnIndex, thread.project.project_directory || thread.project.path || '')
+  const nextMessage = eventToMessage(event, turnIndex, thread.project.project_directory || thread.project.path || '', timelineOrder)
   const next = [...messages.value]
   const existingIndex = next.findIndex((message) => message.id === nextMessage.id)
   if (existingIndex >= 0) {
+    // 生命周期更新不能重新计算顺序；保留第一次出现时的时间线位置。
+    nextMessage.timelineOrder = next[existingIndex].timelineOrder ?? timelineOrder
     next[existingIndex] = nextMessage
   } else {
     const assistantIndex = next.findIndex((message) => message.id === streamingAssistantId.value)
-    next.splice(assistantIndex >= 0 ? assistantIndex : next.length, 0, nextMessage)
+    const insertIndex = assistantIndex >= 0 ? assistantIndex + 1 : next.length
+    nextMessage.timelineOrder = timelineOrder
+    next.splice(insertIndex, 0, nextMessage)
+    // 工具后续返回的 delta 必须进入新的文本段，否则 watcher 会把文字继续写到
+    // 工具之前的 assistant 节点，视觉上就会再次出现“工具在顶部”的错位。
+    if (assistantIndex >= 0 && (event.kind === 'tool' || event.kind === 'command' || event.kind === 'approval' || event.kind === 'safety' || event.kind === 'progress' || event.kind === 'steering')) {
+      const nextAssistant: UiMessage = {
+        id: newId('assistant-live'),
+        role: 'assistant',
+        text: '',
+        messageType: 'agentMessage.live',
+        turnId: `turn-${turnIndex}`,
+        turnIndex,
+        timelineOrder: timelineOrder === undefined ? undefined : timelineOrder + 0.001,
+      }
+      next.splice(insertIndex + 1, 0, nextAssistant)
+      streamingAssistantId.value = nextAssistant.id
+    }
   }
   messages.value = next
 }
@@ -636,65 +697,52 @@ function appendAgentResult(
 ): void {
   const { messages, liveOverlay, diagnostics, diagnosticNote } = workspace.refs(thread)
   const queuedMessages = messages.value.filter(isQueuedMessage)
-  const turnIndex = messages.value.filter((item) => item.role === 'user' && !isQueuedMessage(item)).length
-  const annotatedBaseMessages = messages.value
-    .filter((item) => !item.id.startsWith('pending-assistant-') && !isQueuedMessage(item))
-    .map((item) => {
-      if (item.role !== 'assistant') return item
-      const additions = responseAnnotations.filter((annotation) => annotation.sourceMessageId === item.id)
-      if (additions.length === 0) return item
-      const existing = item.responseAnnotations ?? []
-      const merged = [...existing, ...additions.filter((annotation) => !existing.some((current) => current.id === annotation.id))]
-      return { ...item, responseAnnotations: merged }
-    })
-  const userMessage: UiMessage = {
-    id: newId('user'),
-    role: 'user',
-    text: userText,
-    skills: selectedSkills.length > 0 ? selectedSkills : undefined,
-    attachments: attachments.length > 0 ? attachments : undefined,
-    references: references.length > 0 ? references : undefined,
-    responseAnnotations: responseAnnotations.length > 0 ? responseAnnotations : undefined,
-    modelProfileId: modelProfileId || undefined,
-    model: modelId || undefined,
-    reasoningEffort: reasoningEffortId,
-    collaborationMode: collaborationModeId,
-    turnId: `turn-${turnIndex}`,
-    turnIndex,
-    sessionTurnIndex: sessionTurnIndex ?? null,
-    messageType: sessionTurnIndex === undefined ? 'localCommand' : undefined,
-  }
+  const currentMessages = messages.value.filter((item) => !isQueuedMessage(item))
+  const turnIndex = currentMessages.filter((item) => item.role === 'user').length - 1
   const resultMessages = result.events
     .filter(isVisibleActivityEvent)
-    .map((event) => eventToMessage(event, turnIndex, thread.project.project_directory || thread.project.path || ''))
-  const activityEventIds = resultMessages.filter((message) => message.commandExecution).map((message) => message.id)
-  const activityMessage: UiMessage | null = activityEventIds.length > 0 || activityDurationMs > 0
-    ? {
-        id: newId('worked'),
-        role: 'system',
-        text: activityEventIds.length === 0 ? '处理完成' : activityEventIds.length === 1
-          ? '已完成 1 项后台操作'
-          : `已完成 ${activityEventIds.length} 项后台操作`,
-        messageType: 'worked',
-        activityEventIds,
-        activityDurationMs: Math.max(0, Math.round(activityDurationMs)),
-        turnId: `turn-${turnIndex}`,
-        turnIndex,
-      }
-    : null
-  const assistantMessage: UiMessage = {
-    id: newId('assistant'),
-    role: 'assistant',
-    text: result.text,
-    turnId: `turn-${turnIndex}`,
-    turnIndex,
-    sessionTurnIndex: sessionTurnIndex ?? null,
-    messageType: sessionTurnIndex === undefined ? 'localCommand' : undefined,
+    .map((event, index) => eventToMessage(event, turnIndex, thread.project.project_directory || thread.project.path || '', index))
+  const resultById = new Map(resultMessages.map((message) => [message.id, message]))
+  const finalAssistantIndex = currentMessages.reduce((last, message, index) => message.role === 'assistant' && message.turnIndex === turnIndex ? index : last, -1)
+  // 只补上实时监听错过的活动，已存在的工具节点保持原始位置并更新最终状态。
+  const missingResultMessages: UiMessage[] = []
+  for (const [id, resultMessage] of resultById) {
+    const existingIndex = currentMessages.findIndex((message) => message.id === id)
+    if (existingIndex >= 0) {
+      currentMessages[existingIndex] = { ...currentMessages[existingIndex], ...resultMessage, timelineOrder: currentMessages[existingIndex].timelineOrder ?? resultMessage.timelineOrder }
+    } else {
+      missingResultMessages.push(resultMessage)
+    }
   }
-  // 批注的显示标记属于被选中的旧 AI 回复；同时把同一份结构化数据放进
-  // 新用户消息，供 Pi/JSONL 会话作为下一轮上下文持久化。两处使用同一 ID，
-  // 不会在恢复或再次渲染时生成重复编号。
-  messages.value = [...annotatedBaseMessages, userMessage, ...(activityMessage ? [activityMessage] : []), ...resultMessages, assistantMessage, ...queuedMessages]
+  if (missingResultMessages.length > 0) currentMessages.splice(finalAssistantIndex >= 0 ? finalAssistantIndex : currentMessages.length, 0, ...missingResultMessages)
+  const liveMessages = currentMessages.filter((item) => item.messageType === 'agentMessage.live')
+  const streamedText = liveMessages.map((item) => item.text).join('')
+  const lastLiveId = liveMessages[liveMessages.length - 1]?.id
+  for (let index = 0; index < currentMessages.length; index += 1) {
+    const item = currentMessages[index]
+    if (item.messageType !== 'agentMessage.live') continue
+    const text = item.text || (!streamedText.trim() && item.id === lastLiveId ? result.text : '')
+    currentMessages[index] = { ...item, text, messageType: text ? undefined : item.messageType, sessionTurnIndex: sessionTurnIndex ?? null }
+  }
+  for (let index = currentMessages.length - 1; index >= 0; index -= 1) {
+    if (currentMessages[index].messageType === 'agentMessage.live' && !currentMessages[index].text.trim()) currentMessages.splice(index, 1)
+  }
+  const activityEventIds = resultMessages.filter((message) => message.commandExecution).map((message) => message.id)
+  if ((activityEventIds.length > 0 || activityDurationMs > 0) && !currentMessages.some((message) => message.messageType === 'worked' && message.turnId === `turn-${turnIndex}`)) {
+    // worked 只承担耗时分隔线。工具节点已经按真实发生位置渲染，不能再把
+    // activityEventIds 绑定到 worked，否则 ThreadConversation 会隐藏原工具并
+    // 在分隔线处重复展开，重新制造“工具集中在顶部”的问题。
+    const workedMessage: UiMessage = { id: newId('worked'), role: 'system', text: '处理完成', messageType: 'worked', activityDurationMs: Math.max(0, Math.round(activityDurationMs)), turnId: `turn-${turnIndex}`, turnIndex }
+    const userIndex = currentMessages.findIndex((message) => message.role === 'user' && message.turnIndex === turnIndex)
+    const firstTurnIndex = currentMessages.findIndex((message) => message.turnIndex === turnIndex)
+    const insertAt = userIndex >= 0 ? userIndex + 1 : firstTurnIndex >= 0 ? firstTurnIndex : currentMessages.length
+    currentMessages.splice(insertAt, 0, workedMessage)
+  }
+  // 发送时已经存在用户消息；只在极端本地命令场景补全用户元数据，禁止重新插入
+  // 同一条用户内容，避免结束回调把工具和正文重新排列。
+  const userMessage = [...currentMessages].reverse().find((message) => message.role === 'user' && message.turnIndex === turnIndex)
+  if (userMessage) Object.assign(userMessage, { skills: selectedSkills.length ? selectedSkills : userMessage.skills, attachments: attachments.length ? attachments : userMessage.attachments, references: references.length ? references : userMessage.references, responseAnnotations: responseAnnotations.length ? responseAnnotations : userMessage.responseAnnotations, modelProfileId: modelProfileId || userMessage.modelProfileId, model: modelId || userMessage.model, reasoningEffort: reasoningEffortId, collaborationMode: collaborationModeId, sessionTurnIndex: sessionTurnIndex ?? userMessage.sessionTurnIndex })
+  messages.value = [...currentMessages, ...queuedMessages]
   thread.session = result.session
   thread.pendingChanges = result.pending_changes
   snapshot.value = {
@@ -844,7 +892,7 @@ function resumeSubmitQueue(): void {
 
 async function onSubmit(payload: SubmitPayload, thread = workspace.active.value): Promise<void> {
   const { messages, isBusy, liveOverlay, pendingResponseAnnotations, streamingRequestId, streamingAssistantId, selectedModel, selectedModelProfileId, reasoningEffort, collaborationMode } = workspace.refs(thread)
-  const { displayedText: streamingText, start: startTextStream, reset: resetTextStream, append: appendTextDelta, flush: flushTextStream, stop: stopTextStream } = thread.textStream
+  const { displayedText: streamingText, currentText: currentStreamingText, start: startTextStream, reset: resetTextStream, append: appendTextDelta, flush: flushTextStream, stop: stopTextStream } = thread.textStream
   const text = payload.text.trim()
   if (text === '/stop') { await onInterrupt(false, thread); return }
   if (text === '/new') { await startNewThread(); return }
@@ -948,10 +996,11 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     }
   }
 
-  function showAgentEvent(item: AgentEvent): void {
+  function showAgentEvent(item: AgentEvent, timelineOrder?: number): void {
     if (item.kind === 'steering') {
       thread.queuedSubmits = thread.queuedSubmits.filter((input) => input.id !== item.id)
-      upsertLiveAgentEvent(item, pendingTurnIndex, thread)
+      splitLiveAssistantBeforeActivity(item, pendingTurnIndex, thread, currentStreamingText(requestId), resetTextStream, requestId)
+      upsertLiveAgentEvent(item, pendingTurnIndex, thread, timelineOrder)
       return
     } else if (item.kind === 'steering_error') {
       thread.queuedSubmits = thread.queuedSubmits.map((input) => input.id === item.id ? { ...input, steering: false } : input)
@@ -970,7 +1019,8 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     if (item.kind === 'retry' && item.status === 'running') {
       messages.value = messages.value.map((message) => message.commandExecution?.kind === 'retry' && message.commandExecution.status === 'inProgress' ? { ...message, commandExecution: { ...message.commandExecution, status: 'completed', exitCode: 0 } } : message)
     }
-    upsertLiveAgentEvent(item, pendingTurnIndex, thread)
+    splitLiveAssistantBeforeActivity(item, pendingTurnIndex, thread, currentStreamingText(requestId), resetTextStream, requestId)
+    upsertLiveAgentEvent(item, pendingTurnIndex, thread, timelineOrder)
     if (item.kind === 'progress') {
       // 已落定的中途说明使用独立正文。清理同一段 live 文本，下一次生成再续写，
       // 避免进度说明、工具详情和浮动状态中重复出现同一段文字。
@@ -1090,7 +1140,7 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
       }
       return
     }
-    if (payload.type === 'event' && payload.event) showAgentEvent(payload.event)
+    if (payload.type === 'event' && payload.event) showAgentEvent(payload.event, payload.sequence)
   }
 
   try {
@@ -1132,10 +1182,30 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     // 等真实 delta 的可见缓冲排空后再换成最终消息，防止 Vue 把连续更新
     // 与最终落地合并成一次绘制，造成“看起来没有流式”的问题。
     await flushTextStream(requestId)
-    // runAgent 返回的是本轮完整结果；以发送前的历史为基线，避免把本轮用户消息
-    // 误当成历史再次拼接，或者在占位消息清理时误删上一轮消息。
+    // 实时列表已经保存了“文本段 → 工具 → 文本段”的真实顺序。这里仅把最后
+    // 一个 live assistant 收束为正式回复，并保留原有工具节点，不能再用结果事件
+    // 重新从 baseMessages 拼接，否则所有工具都会被挪到正文前面。
     const queuedMessages = messages.value.filter(isQueuedMessage)
-    messages.value = [...baseMessages, ...queuedMessages]
+    const currentMessages = messages.value.filter((item) => !isQueuedMessage(item))
+    const turnMessages = currentMessages.filter((item) => item.turnIndex === pendingTurnIndex)
+    const liveIndexes = turnMessages.map((item) => currentMessages.indexOf(item)).filter((index) => index >= 0 && currentMessages[index].messageType === 'agentMessage.live')
+    const lastLiveIndex = liveIndexes[liveIndexes.length - 1]
+    if (lastLiveIndex !== undefined) {
+      const lastLive = currentMessages[lastLiveIndex]
+      currentMessages[lastLiveIndex] = {
+        ...lastLive,
+        text: lastLive.text.trim() ? lastLive.text : result.text,
+        messageType: undefined,
+        sessionTurnIndex: nativeTurnIndex ?? null,
+      }
+    } else if (result.text.trim()) {
+      currentMessages.push({
+        id: newId('assistant'), role: 'assistant', text: result.text,
+        turnId: `turn-${pendingTurnIndex}`, turnIndex: pendingTurnIndex,
+        sessionTurnIndex: nativeTurnIndex ?? null,
+      })
+    }
+    messages.value = [...currentMessages, ...queuedMessages]
     const finishedAt = globalThis.performance?.now?.() ?? Date.now()
     appendAgentResult(result, text, payload.skills, visibleAttachments, payload.references, responseAnnotations, finishedAt - startedAt, requestModelProfileId, requestModel, requestReasoningEffort, requestCollaborationMode, thread, nativeTurnIndex)
     pendingResponseAnnotations.value = []
@@ -1147,26 +1217,20 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     // 中断或最终错误无需继续播放动画，但要保留已经收到的完整部分回复。
     await flushTextStream(requestId, true)
     const queuedMessages = messages.value.filter(isQueuedMessage)
-    const activityMessages = messages.value.filter((item) => item.turnIndex === pendingTurnIndex && item.commandExecution).map((item): UiMessage => (
+    const currentMessages = messages.value.filter((item) => !isQueuedMessage(item)).map((item): UiMessage => (
       item.commandExecution?.status === 'inProgress' ? { ...item, commandExecution: { ...item.commandExecution, status: 'interrupted' } } : item
     ))
     const partialText = streamingText.value.trim()
-    const partialAssistant: UiMessage | null = partialText
-      ? {
-          id: newId('assistant-partial'),
-          role: 'assistant',
-          text: partialText,
-          messageType: 'assistant.partial',
-          sessionTurnIndex: nativeTurnIndex ?? null,
-          turnId: `turn-${pendingTurnIndex}`,
-          turnIndex: pendingTurnIndex,
-        }
-      : null
+    const livePartialMessages = currentMessages.filter((item) => item.messageType === 'agentMessage.live')
+    const streamedPartialText = livePartialMessages.map((item) => item.text).join('')
+    const lastPartialId = livePartialMessages[livePartialMessages.length - 1]?.id
+    const finalizedPartialMessages = currentMessages.map((item) => {
+      if (item.messageType !== 'agentMessage.live') return item
+      const text = item.text || (!streamedPartialText.trim() && item.id === lastPartialId ? partialText : '')
+      return { ...item, text, messageType: text ? 'assistant.partial' : item.messageType, sessionTurnIndex: nativeTurnIndex ?? null }
+    }).filter((item) => item.messageType !== 'agentMessage.live' || item.text.trim())
     messages.value = [
-      ...baseMessages,
-      { ...pendingUserMessage, sessionTurnIndex: nativeTurnIndex ?? null },
-      ...activityMessages,
-      ...(partialAssistant ? [partialAssistant] : []),
+      ...finalizedPartialMessages,
       {
         id: newId('turn-error'),
         role: 'assistant',

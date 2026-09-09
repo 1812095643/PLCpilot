@@ -92,6 +92,11 @@ export function useAgentTextStream() {
     resolveDrainWaiters()
   }
 
+  /** 返回已显示文本加尚未绘制的真实 delta，供工具事件到达时切分文本段。 */
+  function currentText(requestId: string): string {
+    return requestId === activeRequestId.value ? displayedText.value + pendingText : ''
+  }
+
   return {
     activeRequestId: readonly(activeRequestId),
     displayedText: readonly(displayedText),
@@ -100,5 +105,6 @@ export function useAgentTextStream() {
     append,
     flush,
     stop,
+    currentText,
   }
 }
