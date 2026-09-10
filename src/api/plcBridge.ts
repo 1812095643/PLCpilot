@@ -2,6 +2,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { ReasoningEffort, UiAttachment, UiMentionReference, UiMentionKind, UiResponseTextAnnotation } from '../types/codex'
 
+export const openLocalPath = (path: string, mode: 'reveal' | 'default') => invoke<void>('open_local_path', { path, mode })
+
 export type ProviderKind = 'responses' | 'messages' | 'chatcompletions' | 'ollama'
 
 export type ProjectContext = {

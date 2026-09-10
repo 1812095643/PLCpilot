@@ -9,6 +9,18 @@ impl Default for RetryPreferences {
     fn default() -> Self { Self { max_retries: 5, base_delay_ms: 1000, max_delay_ms: 60000 } }
 }
 
+/// 旧配置缺少字段时默认启用长任务辅助，不改动 URL、模型或凭据。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextPreferences {
+    pub auto_compact: bool,
+    pub project_memory: bool,
+    pub auto_memory: bool,
+}
+impl Default for ContextPreferences {
+    fn default() -> Self { Self { auto_compact: true, project_memory: true, auto_memory: true } }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Preferences {
     #[serde(default)] pub custom_skills: Vec<CustomSkill>,
@@ -16,13 +28,14 @@ pub struct Preferences {
     #[serde(default)] pub retry: RetryPreferences,
     #[serde(default)] pub theme: Option<String>,
     #[serde(default = "default_access_mode")] pub access_mode: String,
+    #[serde(default)] pub context_management: ContextPreferences,
 }
 
 fn default_access_mode() -> String { "approval".into() }
 
 impl Default for Preferences {
     fn default() -> Self {
-        Self { custom_skills: Vec::new(), disabled_skills: HashSet::new(), retry: RetryPreferences::default(), theme: None, access_mode: default_access_mode() }
+        Self { custom_skills: Vec::new(), disabled_skills: HashSet::new(), retry: RetryPreferences::default(), theme: None, access_mode: default_access_mode(), context_management: ContextPreferences::default() }
     }
 }
 
@@ -51,6 +64,14 @@ pub fn apply_skill_preferences(skills: &mut Vec<SkillSummary>) {
 #[tauri::command]
 pub async fn get_preferences() -> Result<Preferences, AppError> { read_preferences() }
 
+// 前端桥接显式使用 context_management；不要依赖 Tauri 默认的参数大小写转换。
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_context_settings(context_management: ContextPreferences) -> Result<(), AppError> {
+    let mut preferences = read_preferences()?;
+    preferences.context_management = context_management;
+    persist(&preferences)
+}
+
 #[tauri::command]
 pub async fn save_theme_preference(theme: String) -> Result<(), AppError> {
     if !matches!(theme.as_str(), "light" | "dark" | "system") { return Err(AppError::Configuration("请选择明亮、暗黑或跟随系统。".into())); }
@@ -69,7 +90,8 @@ pub async fn save_retry_settings(retry: RetryPreferences) -> Result<(), AppError
     persist(&preferences)
 }
 
-#[tauri::command]
+// 两个界面入口共用蛇形参数名，与 settingsBridge 的实际请求保持一致。
+#[tauri::command(rename_all = "snake_case")]
 pub async fn save_access_mode(access_mode: String) -> Result<(), AppError> {
     if !matches!(access_mode.trim(), "approval" | "full") {
         return Err(AppError::Configuration("访问模式只能是审批模式或完全访问模式。".into()));
@@ -209,4 +231,26 @@ pub async fn probe_mcp_server(id: String, state: State<'_, AppState>) -> Result<
     let tools = McpClient::new(server).list_tools().await?.into_iter().map(tool_summary_from_mcp).collect::<Vec<_>>();
     if tools.is_empty() { return Err(AppError::Mcp("没有发现可用工具，请检查命令、参数、URL 和认证信息。".into())); }
     Ok(tools)
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn old_preferences_enable_context_without_changing_existing_options() {
+        let preferences: Preferences = serde_json::from_str(r#"{"theme":"dark","access_mode":"approval"}"#).unwrap();
+        assert!(preferences.context_management.auto_compact);
+        assert!(preferences.context_management.project_memory);
+        assert!(preferences.context_management.auto_memory);
+        assert_eq!(preferences.theme.as_deref(), Some("dark"));
+        assert_eq!(preferences.access_mode, "approval");
+    }
+
+    #[test]
+    fn disabled_context_options_survive_serialization() {
+        let settings = ContextPreferences { auto_compact: false, project_memory: false, auto_memory: false };
+        let restored: ContextPreferences = serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(!restored.auto_compact && !restored.project_memory && !restored.auto_memory);
+    }
 }

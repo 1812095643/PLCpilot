@@ -20,6 +20,8 @@ import { useComposerDraftStorage } from './composables/useComposerDraftStorage'
 import type { ComposerDraftPayload, ThreadComposerExposed, SubmitPayload } from './components/content/ThreadComposer.vue'
 import { useWorkspaceThreads, type WorkspaceThread } from './composables/useWorkspaceThreads'
 import { useAppTheme } from './composables/useAppTheme'
+import { useAccessMode } from './composables/useAccessMode'
+import { hasTurnResponseText } from './utils/conversationTurns'
 import { useModelSettings } from './composables/useModelSettings'
 import IconTablerBolt from './components/icons/IconTablerBolt.vue'
 import IconTablerSettings from './components/icons/IconTablerSettings.vue'
@@ -129,6 +131,16 @@ const projectPathDraft = shallowRef('')
 const composerRef = shallowRef<ComponentPublicInstance<ThreadComposerExposed> | null>(null)
 const conversationRef = shallowRef<ComponentPublicInstance<ThreadConversationExposed> | null>(null)
 const { preference: theme } = useAppTheme()
+const { mode: accessMode, ready: accessModeReady, saving: accessModeSaving, update: saveComposerAccessMode } = useAccessMode(showNotice)
+
+async function onAccessModeChange(mode: 'approval' | 'full'): Promise<void> {
+  if (mode === accessMode.value || tasksRunning.value || accessModeSaving.value) return
+  // 与 Codex permissions_menu/permission_popups 一致，完全访问是显式选择并确认，
+  // 不会因打开菜单或切换会话自动升级；两个入口共用保存结果，失败时保持旧模式。
+  if (mode === 'full' && !await requestConfirm('启用完全访问？', '已启用工具将直接修改文件、运行命令及执行 CODESYS 在线操作，无需逐项审批。此设置适用于所有项目的新任务；计划模式仍只读。')) return
+  if (tasksRunning.value) return
+  if (await saveComposerAccessMode(mode)) showNotice(mode === 'full' ? '已启用完全访问。' : '已恢复审批模式。')
+}
 const collaborationMode = workspace.field('collaborationMode')
 const selectedModel = workspace.field('selectedModel')
 const selectedModelProfileId = workspace.field('selectedModelProfileId')
@@ -721,7 +733,7 @@ function appendAgentResult(
   for (let index = 0; index < currentMessages.length; index += 1) {
     const item = currentMessages[index]
     if (item.messageType !== 'agentMessage.live') continue
-    const text = item.text || (!streamedText.trim() && item.id === lastLiveId ? result.text : '')
+    const text = item.text || (!streamedText.trim() && item.id === lastLiveId && !hasTurnResponseText(currentMessages, turnIndex, result.text) ? result.text : '')
     currentMessages[index] = { ...item, text, messageType: text ? undefined : item.messageType, sessionTurnIndex: sessionTurnIndex ?? null }
   }
   for (let index = currentMessages.length - 1; index >= 0; index -= 1) {
@@ -1192,13 +1204,14 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     const lastLiveIndex = liveIndexes[liveIndexes.length - 1]
     if (lastLiveIndex !== undefined) {
       const lastLive = currentMessages[lastLiveIndex]
+      const finalText = lastLive.text.trim() ? lastLive.text : hasTurnResponseText(currentMessages, pendingTurnIndex, result.text) ? '' : result.text
       currentMessages[lastLiveIndex] = {
         ...lastLive,
-        text: lastLive.text.trim() ? lastLive.text : result.text,
-        messageType: undefined,
+        text: finalText,
+        messageType: finalText ? undefined : 'agentMessage.live',
         sessionTurnIndex: nativeTurnIndex ?? null,
       }
-    } else if (result.text.trim()) {
+    } else if (result.text.trim() && !hasTurnResponseText(currentMessages, pendingTurnIndex, result.text)) {
       currentMessages.push({
         id: newId('assistant'), role: 'assistant', text: result.text,
         turnId: `turn-${pendingTurnIndex}`, turnIndex: pendingTurnIndex,
@@ -1991,7 +2004,7 @@ onUnmounted(() => {
     </template>
 
     <template #content>
-      <SettingsPage v-if="showSettings" v-model:category="settingsCategory" :snapshot="snapshot" :theme="theme" @close="showSettings = false" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
+      <SettingsPage v-if="showSettings" v-model:category="settingsCategory" :snapshot="snapshot" :theme="theme" :access-mode="accessMode" :access-mode-disabled="!accessModeReady || accessModeSaving || tasksRunning" @update:access-mode="onAccessModeChange" @close="showSettings = false" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
         <template #updates><UpdatesSettingsPanel :state="updater.state" :busy="updater.active.value" :tasks-running="tasksRunning" @check="updater.check" @install="updater.install" @auto-check="updater.setAutoCheck" /></template>
         <template #models>
           <p v-if="!modelSettings.loaded.value || modelSettings.error.value" class="plc-model-loading" role="status">
@@ -2019,6 +2032,7 @@ onUnmounted(() => {
             @resend-message="onResendMessage"
             @retry-message="onRetryMessage"
             @fork-message="onForkMessage"
+            @notice="showNotice"
             @add-response-annotation="addResponseAnnotation"
             @update-response-annotation="updateResponseAnnotation"
             @remove-response-annotation="removeResponseAnnotation"
@@ -2073,12 +2087,15 @@ onUnmounted(() => {
         :skills="skills"
         :thread-token-usage="tokenUsage"
         :is-turn-in-progress="isBusy"
+        :access-mode="accessMode"
+        :access-mode-disabled="!accessModeReady || accessModeSaving || tasksRunning"
         :disabled="false"
         :send-with-enter="true"
         :in-progress-submit-mode="'queue'"
         :response-annotations="pendingResponseAnnotations"
         @submit="onSubmit"
         @interrupt="onInterrupt"
+        @update:access-mode="onAccessModeChange"
         @update:selected-collaboration-mode="collaborationMode = $event"
         @update:selected-model="onComposerModelChange"
         @update:selected-reasoning-effort="reasoningEffort = $event || 'none'"

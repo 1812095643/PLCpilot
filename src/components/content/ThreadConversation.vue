@@ -29,12 +29,13 @@
          :data-role="message.role"
          :data-message-type="message.messageType || ''"
          :data-message-id="message.id"
+         :data-live-tail="message.id === latestLiveAssistantId ? 'true' : 'false'"
         >
         <div v-if="isCommandMessage(message)" class="message-row" data-role="system">
           <ConversationActivityGroup :messages="getCommandBlockForLatest(message)" />
         </div>
 
-        <div
+      <div
           v-else-if="isFileChangeMessage(message)"
           class="message-row"
           :data-role="message.role"
@@ -581,20 +582,16 @@
                     <span>重发</span>
                   </button>
                 </template>
-                <button
-                  v-if="message.role === 'assistant' && !['localCommand', 'turnError', 'turnInterrupted'].includes(message.messageType || '')"
-                  type="button"
-                  class="message-action-button"
-                  :disabled="props.isTurnInProgress"
-                  aria-label="从这条回复 Fork 会话"
-                  title="从这条回复 Fork 会话"
-                  @click="emit('fork-message', message)"
-                >
-                  <IconTablerGitFork class="icon-svg" />
-                  <span>Fork</span>
-                </button>
               </div>
             </article>
+          </div>
+        </div>
+      </li>
+      <li v-if="responseFooters.has(message.id)" class="conversation-item conversation-response-footer" :data-response-for="responseFooters.get(message.id)!.id">
+        <div class="message-row">
+          <div class="message-toolbar response-toolbar" role="group" aria-label="完整回复操作">
+            <button type="button" class="message-action-button" :data-copied="isMessageCopied(responseFooters.get(message.id)!)" aria-label="复制完整回复" title="复制完整回复" @click="copyMessage(responseFooters.get(message.id)!)"><IconTablerCopy class="icon-svg" /><span>{{ isMessageCopied(responseFooters.get(message.id)!) ? '已复制' : '复制' }}</span></button>
+            <button type="button" class="message-action-button" :disabled="props.isTurnInProgress" aria-label="从这次完整回复 Fork 会话" title="从这次完整回复 Fork 会话" @click="emit('fork-message', responseFooters.get(message.id)!)"><IconTablerGitFork class="icon-svg" /><span>Fork</span></button>
           </div>
         </div>
       </li>
@@ -698,10 +695,18 @@
       ref="fileLinkContextMenuRef"
       class="file-link-context-menu"
       :style="fileLinkContextMenuStyle"
+      role="menu"
+      aria-label="链接操作"
       @click.stop
     >
       <button type="button" class="file-link-context-menu-item" @click="openFileLinkContextBrowse">
         Open link
+      </button>
+      <button v-if="fileLinkContextLocalPath" type="button" class="file-link-context-menu-item" @click="revealFileLinkContextPath">
+        在文件管理器中显示
+      </button>
+      <button v-if="fileLinkContextLocalPath" type="button" class="file-link-context-menu-item" @click="openFileLinkContextDefaultApp">
+        用默认应用打开
       </button>
       <button type="button" class="file-link-context-menu-item" @click="copyFileLinkContextLink">
         Copy link
@@ -839,8 +844,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiMentionReference, UiPlanStep, UiResponseTextAnnotation } from '../../types/codex'
 import { updateThreadFileChanges } from '../../api/codexGateway'
+import { openLocalPath } from '../../api/plcBridge'
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
+import { duplicateProgressIds, responseFooterAnchors, responseTurnKeys } from '../../utils/conversationTurns'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
@@ -974,6 +981,10 @@ function isCopyableAssistantMessage(message: UiMessage): boolean {
   return message.role === 'assistant'
     && !isCommandMessage(message)
     && message.messageType !== 'worked'
+    // commentary 是工具调用前的进度播报，不属于用户可复制的正式回复。
+    // 如果把它纳入分组，锚点会落到被 showMessageToolbar 隐藏的段，
+    // 正文段就会错误地回退显示自己的复制/Fork 按钮。
+    && message.messageType !== 'agentMessage.commentary'
     && !(message.messageType ?? '').endsWith('.live')
 }
 
@@ -994,6 +1005,21 @@ const hasLiveAssistantText = computed(() =>
     message.text.trim().length > 0,
   ),
 )
+
+// 工具调用会把一次回复切成多个 live assistant 段。旧样式给所有段都画光标，
+// 于是工具前已经结束的正文末尾仍会闪烁。光标只属于当前最后一个有文字的
+// live 段，等 appendAgentResult 收束为正式消息后自然消失。
+const latestLiveAssistantId = computed(() => {
+  if (!props.isTurnInProgress || props.liveOverlay?.status !== 'streaming') return ''
+  for (let index = props.messages.length - 1; index >= 0; index -= 1) {
+    const message = props.messages[index]
+    if (message.role !== 'assistant' || message.messageType !== 'agentMessage.live') continue
+    // 最新 live 段可能刚由工具事件创建、尚未收到下一个 delta；这时必须
+    // 返回空值，不能回退给工具前的旧段，否则光标会固定闪在已结束正文后。
+    return message.text.trim().length > 0 ? message.id : ''
+  }
+  return ''
+})
 
 const isLiveTurnRuntime = computed(() =>
   Boolean(props.liveOverlay) || activeCommandMessageId.value.length > 0 || hasLiveAssistantText.value,
@@ -1357,6 +1383,7 @@ const emit = defineEmits<{
   'resend-message': [message: UiMessage]
   'retry-message': [message: UiMessage]
   'fork-message': [message: UiMessage]
+  notice: [message: string]
   'add-response-annotation': [annotation: UiResponseTextAnnotation]
   'update-response-annotation': [annotation: UiResponseTextAnnotation]
   'remove-response-annotation': [id: string]
@@ -1483,12 +1510,14 @@ const LOAD_MORE_SCROLL_THRESHOLD_PX = 200
 
 const renderWindowStart = ref(0)
 const isLoadingMore = ref(false)
+const hiddenDuplicateProgressIds = computed(() => duplicateProgressIds(props.messages))
 
 const visibleMessages = computed(() => {
   // 消息数组本身就是唯一时间线。旧实现为了把耗时显示在用户消息后面，
   // 在这里重新插入 worked，连带把工具视觉上固定到轮次开头；现在完全保留
   // 实时归并和历史恢复后的原始顺序。
   return props.messages.slice(renderWindowStart.value).filter((message) => {
+  if (hiddenDuplicateProgressIds.value.has(message.id)) return false
   // 流式回复建立时先插入空 assistant 占位；浮动状态行已经承担反馈，
   // 空占位不能参与列表布局，否则重试/思考之间会出现一整行无意义空白。
   return !(message.messageType === 'agentMessage.live'
@@ -1498,6 +1527,13 @@ const visibleMessages = computed(() => {
   })
 })
 const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
+
+const responseFooters = computed(() => responseFooterAnchors(
+  props.messages,
+  new Set(visibleMessages.value.filter((message) => !hiddenGroupedCommandIds.value.has(message.id)
+    && !hiddenWorkedCommandIds.value.has(message.id) && !hiddenFileChangeMessageIds.value.has(message.id)).map((message) => message.id)),
+  Boolean(props.isTurnInProgress),
+))
 
 const showJumpToLatestButton = computed(
   () => !autoFollowOutput.value && (props.messages.length > 0 || Boolean(props.liveOverlay)),
@@ -1827,16 +1863,17 @@ function buildCopyableMessageContent(message: UiMessage): string {
 
 const copyableResponseContentByAnchorId = computed<Record<string, string>>(() => {
   const groupedResponses = new Map<string, { anchorMessageId: string; parts: string[] }>()
+  const turnKeys = responseTurnKeys(props.messages)
 
   for (const message of props.messages) {
-    if (!isCopyableAssistantMessage(message)) continue
+    if (hiddenDuplicateProgressIds.value.has(message.id)) continue
+    if (message.role !== 'assistant' || isCommandMessage(message) || message.messageType === 'worked'
+      || (message.messageType || '').endsWith('.live') || ['turnError', 'turnInterrupted', 'localCommand'].includes(message.messageType || '')) continue
 
     const content = buildCopyableMessageContent(message)
     if (!content) continue
 
-    const responseKey = typeof message.turnIndex === 'number'
-      ? `turn:${message.turnIndex}`
-      : `message:${message.id}`
+    const responseKey = turnKeys.get(message.id) || `message:${message.id}`
     const existing = groupedResponses.get(responseKey)
     if (existing) {
       existing.anchorMessageId = message.id
@@ -1866,10 +1903,6 @@ const copyableResponseContentByAnchorId = computed<Record<string, string>>(() =>
   }
   return next
 })
-
-function showCopyResponseButton(message: UiMessage): boolean {
-  return typeof copyableResponseContentByAnchorId.value[message.id] === 'string'
-}
 
 const isSelectionCommentToolbarVisible = computed(() => Boolean(
   pendingCommentSelection.value && !isCommentDialogVisible.value,
@@ -1935,12 +1968,13 @@ function messageCopyContent(message: UiMessage): string {
 }
 
 function showMessageCopyButton(message: UiMessage): boolean {
-  return (message.role === 'user' || message.role === 'assistant') && Boolean(messageCopyContent(message))
+  if (message.role === 'user') return Boolean(messageCopyContent(message))
+  if (message.role === 'assistant') return ['localCommand', 'turnError', 'turnInterrupted'].includes(message.messageType || '') && Boolean(messageCopyContent(message))
+  return false
 }
 
 function showMessageToolbar(message: UiMessage): boolean {
-  if (message.messageType === 'agentMessage.live' || message.messageType === 'agentMessage.commentary') return false
-  return message.role === 'user' || (message.role === 'assistant' && message.text.trim().length > 0)
+  return showMessageCopyButton(message) || (isTurnErrorMessage(message) && Boolean(message.retryPayload))
 }
 
 function isMessageCopied(message: UiMessage): boolean {
@@ -3075,7 +3109,8 @@ function toBrowseUrl(pathValue: string): string {
 
   if (looksLikeAbsolutePath(resolved)) {
     const normalizedResolved = resolved.startsWith('/') ? resolved : `/${resolved}`
-    return `/codex-local-browse${encodeURI(normalizedResolved)}`
+    // # 和 ? 在 Windows 文件名中可能是字面内容，不能变成 URL 片段或查询参数。
+    return `/codex-local-browse${encodeURI(normalizedResolved).replace(/#/gu, '%23').replace(/\?/gu, '%3F')}`
   }
 
   return '#'
@@ -3085,6 +3120,7 @@ const fileLinkContextMenuStyle = computed(() => ({
   left: `${String(fileLinkContextMenuX.value)}px`,
   top: `${String(fileLinkContextMenuY.value)}px`,
 }))
+const fileLinkContextLocalPath = computed(() => localPathFromBrowseHref(fileLinkContextBrowseUrl.value))
 
 function toEditUrlFromBrowseHref(href: string): string {
   const normalizedHref = href.trim()
@@ -3099,7 +3135,7 @@ function toEditUrlFromBrowseHref(href: string): string {
   }
 }
 
-function onConversationContextMenu(event: MouseEvent): void {
+async function onConversationContextMenu(event: MouseEvent): Promise<void> {
   const target = event.target
   if (!(target instanceof Element)) return
 
@@ -3117,6 +3153,12 @@ function onConversationContextMenu(event: MouseEvent): void {
   fileLinkContextMenuX.value = event.clientX
   fileLinkContextMenuY.value = event.clientY
   isFileLinkContextMenuVisible.value = true
+  await nextTick()
+  const rect = fileLinkContextMenuRef.value?.getBoundingClientRect()
+  if (rect) {
+    fileLinkContextMenuX.value = Math.max(8, Math.min(event.clientX, window.innerWidth - rect.width - 8))
+    fileLinkContextMenuY.value = Math.max(8, Math.min(event.clientY, window.innerHeight - rect.height - 8))
+  }
 }
 
 function closeFileLinkContextMenu(): void {
@@ -3137,6 +3179,33 @@ function openFileLinkContextEdit(): void {
   if (!href || href === '#') return
   window.open(href, '_blank', 'noopener,noreferrer')
 }
+
+function localPathFromBrowseHref(href: string): string {
+  try {
+    const url = new URL(href, window.location.href)
+    const prefix = '/codex-local-browse'
+    // 外链即使路径形似本地浏览地址，也不能获得磁盘动作；只接受当前应用的精确路由。
+    if (url.origin !== new URL(window.location.href).origin || !url.pathname.startsWith(`${prefix}/`)) return ''
+    const decoded = decodeURIComponent(url.pathname.slice(prefix.length))
+    return decoded.replace(/^\/([A-Za-z]:[\\/])/u, '$1')
+  } catch {
+    return ''
+  }
+}
+
+async function runLocalPathAction(mode: 'reveal' | 'default'): Promise<void> {
+  const path = fileLinkContextLocalPath.value
+  closeFileLinkContextMenu()
+  if (!path) return
+  try {
+    await openLocalPath(path, mode)
+  } catch (error) {
+    emit('notice', String(error))
+  }
+}
+
+function revealFileLinkContextPath(): void { void runLocalPathAction('reveal') }
+function openFileLinkContextDefaultApp(): void { void runLocalPathAction('default') }
 
 async function copyFileLinkContextLink(): Promise<void> {
   const href = fileLinkContextBrowseUrl.value
@@ -4251,7 +4320,8 @@ onBeforeUnmount(() => {
 }
 
 .conversation-list {
-  @apply relative h-full min-h-0 list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-visible flex flex-col gap-2 sm:gap-3;
+  @apply relative h-full min-h-0 list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-visible flex flex-col;
+  gap: 6px;
 }
 
 .conversation-load-more {
@@ -4268,6 +4338,7 @@ onBeforeUnmount(() => {
 
 .conversation-item {
   @apply relative m-0 w-full min-w-0 flex;
+  flex-shrink: 0;
 }
 
 .conversation-item[data-timeline-jump='true'] .message-card {
@@ -4353,7 +4424,7 @@ onBeforeUnmount(() => {
   50% { opacity: 1; transform: scale(1.18); }
 }
 
-.conversation-item[data-message-type='agentMessage.live'] .message-text-flow::after {
+.conversation-item[data-message-type='agentMessage.live'][data-live-tail='true'] .message-text-flow > .message-text:last-child::after {
   display: inline-block;
   width: 1.5px;
   height: .95em;
@@ -4385,7 +4456,7 @@ onBeforeUnmount(() => {
 @media (prefers-reduced-motion: reduce) {
   .live-overlay-pulse,
   .live-overlay-reconnect-spinner,
-  .conversation-item[data-message-type='agentMessage.live'] .message-text-flow::after {
+  .conversation-item[data-message-type='agentMessage.live'][data-live-tail='true'] .message-text-flow > .message-text:last-child::after {
     animation: none;
   }
 }
@@ -4454,7 +4525,9 @@ onBeforeUnmount(() => {
 .message-body[data-role='user'] .message-toolbar { align-self:flex-end; }
 .message-toolbar-error { opacity:1; margin-top:8px; }
 .turn-error-inline-guidance { min-width:0; max-width:60ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#bb6565; font-size:11px; }
-.conversation-item[data-message-type='agentMessage.commentary'] { margin-top:-5px; }
+/* 工具块与正文统一由列表 gap 留白；负边距叠加会把工具后的正文挤到标题上。 */
+.conversation-response-footer .response-toolbar { margin-top:0; opacity:1; }
+.message-row:focus-within .message-toolbar { opacity:1; }
 
 .message-row:hover .message-toolbar {
   @apply opacity-100;
@@ -4819,13 +4892,11 @@ onBeforeUnmount(() => {
 }
 
 .turn-duration { margin:2px 0 6px; padding-bottom:8px; border-bottom:1px solid color-mix(in srgb,currentColor 12%,transparent); color:#858990; font-size:12px; line-height:20px; }
-.conversation-item[data-message-type='commandExecution'] { margin-block:-2px; }
 .conversation-item[data-message-type='agentMessage.commentary'] .message-text { font-size:13px; line-height:1.75; }
-.conversation-item-overlay { margin-top:-7px; }
 .conversation-item-overlay .live-overlay-inline { padding-top:0; padding-bottom:0; }
 
 .message-text-flow {
-  @apply flex flex-col gap-2;
+  @apply flex flex-col gap-1;
 }
 
 .plan-card {
@@ -5143,11 +5214,19 @@ onBeforeUnmount(() => {
 
 .file-link-context-menu {
   @apply fixed z-50 min-w-36 rounded-lg border border-zinc-200 bg-white p-1 shadow-xl;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow: auto;
 }
 
 .file-link-context-menu-item {
   @apply block w-full rounded-md px-2 py-1.5 text-left text-xs text-zinc-700 hover:bg-zinc-100;
 }
+
+:global(.dark) .file-link-context-menu { background: var(--plc-dark-input); border-color: var(--plc-dark-border); }
+:global(.dark) .file-link-context-menu-item { color: var(--plc-dark-text); }
+:global(.dark) .file-link-context-menu-item:hover { background: var(--plc-dark-control); }
+.file-link-context-menu-item:focus-visible { outline: 2px solid #007acc; outline-offset: -2px; }
 
 .message-divider {
   @apply m-0 border-0 h-px bg-slate-300/80;

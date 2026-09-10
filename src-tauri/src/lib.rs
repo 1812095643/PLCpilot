@@ -2364,6 +2364,7 @@ pub fn run() {
             configure_mcp,
             select_project,
             detect_codesys,
+            open_local_path,
             list_mcp_tools,
             call_mcp_tool,
             run_agent,
@@ -2376,6 +2377,7 @@ pub fn run() {
             settings::get_preferences,
             settings::save_theme_preference,
             settings::save_retry_settings,
+            settings::save_context_settings,
             settings::save_access_mode,
             settings::save_skill,
             settings::toggle_skill,
@@ -3192,6 +3194,45 @@ fn append_session_info(path: &str, name: &str) -> Result<(), AppError> {
 #[tauri::command]
 async fn detect_codesys() -> Result<CodesysStatus, AppError> {
     Ok(detect_codesys_installation())
+}
+
+/// 仅解析磁盘上的绝对文件/目录路径，不将输入作为 URL 或命令参数执行。
+fn resolve_local_path(path: &str, mode: &str) -> Result<PathBuf, AppError> {
+    let requested = path.trim();
+    if requested.is_empty() || !Path::new(requested).is_absolute() || !matches!(mode.trim(), "reveal" | "default") {
+        return Err(AppError::Configuration("本地文件打开方式不可用。".into()));
+    }
+    let target = dunce::canonicalize(requested)
+        .map_err(|error| AppError::Configuration(format!("本地路径不可用：{error}")))?;
+    if !target.is_file() && !target.is_dir() {
+        return Err(AppError::Configuration("请选择一个现有的本地文件或目录。".into()));
+    }
+    Ok(target)
+}
+
+/// 用户点击链接菜单后交由系统打开，存在性检查不等同于可执行文件安全认证。
+#[tauri::command]
+async fn open_local_path(path: String, mode: String) -> Result<(), AppError> {
+    let target = resolve_local_path(&path, &mode)?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        if mode.trim() == "reveal" {
+            let mut command = Command::new("explorer.exe");
+            if target.is_file() { command.arg(format!("/select,{}", target.to_string_lossy())); }
+            else { command.arg(&target); }
+            command.spawn().map_err(|error| AppError::Configuration(format!("打开文件管理器未完成：{error}")))?;
+            return Ok(());
+        }
+        let wide_path: Vec<u16> = target.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let result = unsafe { ShellExecuteW(std::ptr::null_mut(), windows_sys::w!("open"), wide_path.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+        if result as isize <= 32 { return Err(AppError::Configuration(format!("没有找到可以打开此文件的默认应用：{}", target.display()))); }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    { let _ = target; Err(AppError::Configuration("当前平台暂不支持系统默认应用打开。".into())) }
 }
 
 #[tauri::command]
@@ -5257,6 +5298,7 @@ async fn run_pi_host(
         "context_window": model.context_window,
         "reasoning_levels": model.reasoning_levels,
     });
+    let host_preferences = settings::read_preferences()?;
     let host_request = json!({
         "type": "run",
         "request_id": request_id,
@@ -5281,7 +5323,8 @@ async fn run_pi_host(
         "mcp_tools": tool_payload,
         "system_prompt": build_agent_system_prompt(project, request),
         "reasoning_effort": request_thinking_level(request),
-        "retry": settings::read_preferences()?.retry,
+        "retry": host_preferences.retry,
+        "context_management": host_preferences.context_management,
         "collaboration_mode": if request_is_plan_mode(request) { "plan" } else { "default" },
         "skills": request.skills,
     });
@@ -10973,5 +11016,18 @@ mod tests {
             fs::read_to_string(&second).expect("读取第二个文件"),
             "VAR_GLOBAL\n  Ready : BOOL := TRUE;\nEND_VAR\n"
         );
+    }
+
+    #[test]
+    fn local_path_action_only_accepts_existing_absolute_file_or_directory() {
+        let directory = tempfile::tempdir().expect("创建本地路径验证目录");
+        let file = directory.path().join("截图 1.txt");
+        fs::write(&file, "PLC Pilot").expect("写入本地路径验证文件");
+        let file_path = file.to_string_lossy().to_string();
+        assert_eq!(resolve_local_path(&file_path, "default").expect("解析默认应用文件"), dunce::canonicalize(&file).unwrap());
+        assert!(resolve_local_path(directory.path().to_string_lossy().as_ref(), "reveal").is_ok());
+        assert!(matches!(resolve_local_path(&file_path, "unknown"), Err(AppError::Configuration(_))));
+        assert!(matches!(resolve_local_path("not-a-local-path.txt", "reveal"), Err(AppError::Configuration(_))));
+        assert!(matches!(resolve_local_path(&directory.path().join("missing.txt").to_string_lossy(), "reveal"), Err(AppError::Configuration(_))));
     }
 }

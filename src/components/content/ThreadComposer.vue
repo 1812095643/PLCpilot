@@ -25,6 +25,7 @@ import ComposerAttachmentStrip from './ComposerAttachmentStrip.vue'
 import ComposerResponseAnnotationStrip from './ComposerResponseAnnotationStrip.vue'
 import ComposerMentionPopup from './ComposerMentionPopup.vue'
 import ComposerModelPicker from './ComposerModelPicker.vue'
+import ComposerAccessPicker from './ComposerAccessPicker.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
 import IconTablerPaperclip from '../icons/IconTablerPaperclip.vue'
@@ -88,6 +89,8 @@ const props = withDefaults(defineProps<{
   skills?: SkillItem[]
   threadTokenUsage?: UiThreadTokenUsage | null
   isTurnInProgress?: boolean
+  accessMode?: 'approval' | 'full'
+  accessModeDisabled?: boolean
   disabled?: boolean
   responseAnnotations?: UiResponseTextAnnotation[]
   sendWithEnter?: boolean
@@ -102,6 +105,8 @@ const props = withDefaults(defineProps<{
   responseAnnotations: () => [],
   threadTokenUsage: null,
   isTurnInProgress: false,
+  accessMode: 'approval',
+  accessModeDisabled: false,
   disabled: false,
   sendWithEnter: true,
   inProgressSubmitMode: 'steer',
@@ -112,6 +117,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   submit: [payload: SubmitPayload]
   interrupt: []
+  'update:access-mode': [mode: 'approval' | 'full']
   'update:selected-collaboration-mode': [mode: CollaborationModeKind]
   'update:selected-model': [modelId: string]
   'update:selected-reasoning-effort': [effort: ReasoningEffort | '']
@@ -949,6 +955,7 @@ defineExpose<ThreadComposerExposed>({
             :disabled="isInteractionDisabled"
             @toggle="onSkillToggle"
           />
+          <ComposerAccessPicker :mode="accessMode" :plan="isPlanMode" :disabled="accessModeDisabled" @select="emit('update:access-mode', $event)" />
         </div>
 
         <div class="plc-composer-actions">
@@ -1011,7 +1018,7 @@ defineExpose<ThreadComposerExposed>({
         </div>
       </div>
     </div>
-    <p v-if="isPlanMode" class="plc-plan-note">计划模式会先整理执行步骤，工程写入仍需逐项审批。</p>
+    <p v-if="isPlanMode" class="plc-plan-note">计划模式只读取和分析；退出计划模式后按所选权限执行。</p>
   </form>
 </template>
 

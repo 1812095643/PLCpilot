@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { hideProcessWindows, createApprovedTools, executeApprovedCommand, abortApprovedCommand, recordApproval } from "./builtin-tools.mjs";
+import { createProjectMemory, createContextExtension, contextSettings, redactContext } from "./context-memory.mjs";
 
 import { InMemoryCredentialStore, Type } from "@earendil-works/pi-ai";
 import {
@@ -37,6 +38,7 @@ let lastCompactedAt = null;
 let retryAfterHintMs = null;
 let retryStatusCode = null;
 let lastThinkingSignalAt = 0;
+let currentAssistantHasTextDelta = false;
 let activeTurnIndex = 0;
 const streamedToolSignals = new Map();
 let previousGlobalFetch = null;
@@ -480,7 +482,9 @@ function handleSessionEvent(event) {
         sendEvent(makeEvent("steering", "已采用新的方向", JSON.stringify(metadata), "done", null, input.id));
       } else sendEvent(makeEvent("turn", "用户消息已记录", JSON.stringify({ turn_index: activeTurnIndex }), "done", null, "user-turn"));
     }
-    if (event.message?.role === "assistant" && (event.message.stopReason === "toolUse" || deliveredSteering.length > 0)) {
+    // 正文已通过 delta 展示时，message_end 不能再发布同内容 progress；否则它会
+    // 在工具后被当成另一段正文，再叠加最终结果回执，产生截图中的多次重复。
+    if (event.message?.role === "assistant" && !currentAssistantHasTextDelta && (event.message.stopReason === "toolUse" || deliveredSteering.length > 0)) {
       const progress = event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
       if (progress.trim()) sendEvent(makeEvent("progress", "进度说明", progress, "done"));
     }
@@ -488,12 +492,14 @@ function handleSessionEvent(event) {
     void flushSteering();
   }
   if (event.type === "message_start" && event.message?.role === "assistant") {
+    currentAssistantHasTextDelta = false;
     writeMessage({ type: "stream_start" });
     return;
   }
   if (event.type === "message_update") {
     const assistantEvent = event.assistantMessageEvent;
     if (assistantEvent?.type === "text_delta") {
+      if (assistantEvent.delta) currentAssistantHasTextDelta = true;
       writeMessage({ type: "delta", delta: assistantEvent.delta });
     } else if (assistantEvent?.type?.startsWith("toolcall_")) {
       const call = assistantEvent.toolCall ?? assistantEvent.partial?.content?.[assistantEvent.contentIndex];
@@ -580,7 +586,7 @@ function handleSessionEvent(event) {
     }
     sendEvent(makeEvent(
       "compaction",
-      event.aborted ? "上下文压缩已中止" : "上下文压缩已完成",
+      event.aborted ? "上下文压缩已中止" : event.errorMessage ? "上下文尚未压缩，原始记录已保留" : "上下文压缩已完成",
       event.errorMessage ?? null,
       event.aborted || event.errorMessage ? "warning" : "done",
       null,
@@ -686,6 +692,7 @@ function configSignature(config) {
     collaboration_mode: config.collaboration_mode ?? "default",
     skills: config.skills ?? [],
     references: config.references ?? [],
+    context_management: config.context_management,
   });
 }
 
@@ -743,10 +750,18 @@ async function ensureSession(config) {
   const customTools = [...(config.mcp_tools ?? []).map((tool) => makeToolDefinition(tool, sendRequest)), ...createApprovedTools(cwd, sendRequest)];
   const systemPrompt = String(config.system_prompt ?? "").trim() ||
     "你是 PLC Pilot，必须先读取上下文，再提出可审查的工程操作。";
+  const contextPreferences = config.context_management ?? {};
+  const contextSecrets = [String(modelConfig.api_key ?? "")];
+  const memoryStore = await createProjectMemory(join(dirname(sessionDir), "memories"), cwd, contextSecrets);
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir: join(sessionDir, "agent"),
     noExtensions: true,
+    extensionFactories: [{ name: "plc-pilot-context", factory: createContextExtension({
+      store: memoryStore, preferences: contextPreferences, secrets: contextSecrets, runtime,
+      retry: { enabled: retryPreferences.max_retries > 0, maxRetries: retryPreferences.max_retries, baseDelayMs: retryPreferences.base_delay_ms },
+      notify: (title, detail) => sendEvent(makeEvent("compaction", title, detail, "warning")),
+    }) }],
     // 嵌入式与桌面运行时都只使用 PLC Pilot 自有目录；不能意外读取 Codex/Pi 的默认资源。
     noSkills: true,
     noContextFiles: true,
@@ -763,9 +778,9 @@ async function ensureSession(config) {
   } else {
     sessionManager = SessionManager.create(cwd, sessionDir);
   }
-  const toolNames = ["read", "grep", "find", "ls", ...customTools.map((tool) => tool.name)];
+  const toolNames = ["read", "grep", "find", "ls", "notes", "history", ...(contextPreferences.project_memory === false ? [] : ["memory"]), ...customTools.map((tool) => tool.name)];
   const settingsManager = SettingsManager.inMemory({
-    compaction: { enabled: true },
+    compaction: contextSettings(model.contextWindow, contextPreferences),
     retry: {
       enabled: retryPreferences.max_retries > 0,
       maxRetries: retryPreferences.max_retries,
@@ -790,6 +805,10 @@ async function ensureSession(config) {
   });
   activeSession = created.session;
   activeConfig = signature;
+  // 计数来自当前分支的真实检查点；重启或切换模型后不能又显示为压缩 0 次。
+  const checkpoints = sessionManager.getBranch().filter((entry) => entry.type === "compaction");
+  compactionCount = checkpoints.length;
+  lastCompactedAt = checkpoints.at(-1)?.timestamp ?? null;
 
   // Pi SDK 的请求会沿用 Node 全局 fetch；在不复制供应商实现的前提下，
   // 通过这一层记录响应状态和 Retry-After，供 AgentSession 的重试事件
@@ -837,6 +856,10 @@ async function ensureSession(config) {
     };
   }
   activeUnsubscribe = activeSession.subscribe(handleSessionEvent);
+  await activeSession.bindExtensions({
+    mode: "json",
+    onError: (error) => sendEvent(makeEvent("context", "上下文扩展暂不可用", redactContext(error.error, contextSecrets), "warning")),
+  });
   activeSession.agent.shouldStopAfterTurn = ({ toolResults }) => toolResults.some((result) => {
     const decision = result?.details?.plcDecision;
     return decision === "pending" || decision === "blocked";

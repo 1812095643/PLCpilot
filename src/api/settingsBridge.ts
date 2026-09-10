@@ -4,10 +4,12 @@ import type { ThemePreference } from '../types/theme'
 
 export type McpConfig = { id: string; name: string; command: string; args: string[]; env: Record<string, string>; headers: Record<string, string>; enabled: boolean; transport: 'stdio' | 'http'; url: string | null }
 export type RetrySettings = { max_retries: number; base_delay_ms: number; max_delay_ms: number }
-export type Preferences = { custom_skills: Array<{ id: string; path: string }>; disabled_skills: string[]; retry: RetrySettings; theme?: ThemePreference | null; access_mode: 'approval' | 'full' }
+export type ContextSettings = { auto_compact: boolean; project_memory: boolean; auto_memory: boolean }
+export type Preferences = { custom_skills: Array<{ id: string; path: string }>; disabled_skills: string[]; retry: RetrySettings; theme?: ThemePreference | null; access_mode: 'approval' | 'full'; context_management: ContextSettings }
 export const getPreferences = () => invoke<Preferences>('get_preferences')
 export const saveThemePreference = (theme: ThemePreference) => invoke<void>('save_theme_preference', { theme })
 export const saveRetrySettings = (retry: RetrySettings) => invoke<void>('save_retry_settings', { retry })
+export const saveContextSettings = (contextManagement: ContextSettings) => invoke<void>('save_context_settings', { context_management: contextManagement })
 export const saveAccessMode = (accessMode: Preferences['access_mode']) => invoke<void>('save_access_mode', { access_mode: accessMode })
 export const getMcpConfigs = () => invoke<McpConfig[]>('get_mcp_configs')
 export const saveMcpServer = (server: McpConfig) => invoke<McpSummary[]>('save_mcp_server', { server })
