@@ -2365,6 +2365,7 @@ pub fn run() {
             select_project,
             detect_codesys,
             open_local_path,
+            open_web_url,
             list_mcp_tools,
             call_mcp_tool,
             run_agent,
@@ -3210,6 +3211,32 @@ fn resolve_local_path(path: &str, mode: &str) -> Result<PathBuf, AppError> {
     Ok(target)
 }
 
+/// 仅网址菜单可调用此入口；磁盘路径及其他协议不会传给系统浏览器。
+#[tauri::command]
+async fn open_web_url(url: String) -> Result<(), AppError> {
+    let target = reqwest::Url::parse(url.trim())
+        .map_err(|_| AppError::Configuration("网址无法识别，请检查链接。".into()))?;
+    if !matches!(target.scheme(), "http" | "https") || target.host_str().is_none() {
+        return Err(AppError::Configuration("仅支持在浏览器中打开 HTTP 或 HTTPS 网址。".into()));
+    }
+    open_with_default_app(std::ffi::OsStr::new(target.as_str()))
+}
+
+/// 复用 Windows 默认关联程序，URL 与磁盘路径在各自入口校验，参数不经过 Shell 拼接。
+fn open_with_default_app(target: &std::ffi::OsStr) -> Result<(), AppError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        let wide_path: Vec<u16> = target.encode_wide().chain(std::iter::once(0)).collect();
+        let result = unsafe { ShellExecuteW(std::ptr::null_mut(), windows_sys::w!("open"), wide_path.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+        if result as isize <= 32 { return Err(AppError::Configuration("系统未能打开目标，请检查默认应用设置。".into())); }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    { let _ = target; Err(AppError::Configuration("当前平台暂不支持系统默认应用打开。".into())) }
+}
+
 /// 用户点击链接菜单后交由系统打开，存在性检查不等同于可执行文件安全认证。
 #[tauri::command]
 async fn open_local_path(path: String, mode: String) -> Result<(), AppError> {
@@ -3217,8 +3244,6 @@ async fn open_local_path(path: String, mode: String) -> Result<(), AppError> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
         if mode.trim() == "reveal" {
             let mut command = Command::new("explorer.exe");
             if target.is_file() { command.arg(format!("/select,{}", target.to_string_lossy())); }
@@ -3226,10 +3251,7 @@ async fn open_local_path(path: String, mode: String) -> Result<(), AppError> {
             command.spawn().map_err(|error| AppError::Configuration(format!("打开文件管理器未完成：{error}")))?;
             return Ok(());
         }
-        let wide_path: Vec<u16> = target.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let result = unsafe { ShellExecuteW(std::ptr::null_mut(), windows_sys::w!("open"), wide_path.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
-        if result as isize <= 32 { return Err(AppError::Configuration(format!("没有找到可以打开此文件的默认应用：{}", target.display()))); }
-        Ok(())
+        open_with_default_app(target.as_os_str())
     }
     #[cfg(not(windows))]
     { let _ = target; Err(AppError::Configuration("当前平台暂不支持系统默认应用打开。".into())) }

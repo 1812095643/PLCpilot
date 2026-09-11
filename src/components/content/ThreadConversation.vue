@@ -699,25 +699,18 @@
       aria-label="链接操作"
       @click.stop
     >
-      <button type="button" class="file-link-context-menu-item" @click="openFileLinkContextBrowse">
-        Open link
+      <button v-if="fileLinkContextTarget.kind === 'web'" type="button" role="menuitem" class="file-link-context-menu-item" @click="openFileLinkContextBrowse">
+        在浏览器中打开
       </button>
-      <button v-if="fileLinkContextLocalPath" type="button" class="file-link-context-menu-item" @click="revealFileLinkContextPath">
-        在文件管理器中显示
-      </button>
-      <button v-if="fileLinkContextLocalPath" type="button" class="file-link-context-menu-item" @click="openFileLinkContextDefaultApp">
+      <button v-if="fileLinkContextTarget.kind === 'file'" type="button" role="menuitem" class="file-link-context-menu-item" @click="openFileLinkContextDefaultApp">
         用默认应用打开
       </button>
-      <button type="button" class="file-link-context-menu-item" @click="copyFileLinkContextLink">
-        Copy link
+      <button v-if="fileLinkContextTarget.kind === 'file'" type="button" role="menuitem" class="file-link-context-menu-item" @click="revealFileLinkContextPath">
+        在资源管理器中显示
       </button>
-      <button
-        v-if="fileLinkContextEditUrl"
-        type="button"
-        class="file-link-context-menu-item"
-        @click="openFileLinkContextEdit"
-      >
-        Edit file
+      <div v-if="fileLinkContextTarget.kind !== 'other'" class="file-link-context-menu-divider" role="separator" />
+      <button type="button" role="menuitem" class="file-link-context-menu-item" @click="copyFileLinkContextLink">
+        {{ fileLinkContextTarget.kind === 'file' ? '复制路径' : '复制链接' }}
       </button>
     </div>
 
@@ -844,7 +837,9 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiMentionReference, UiPlanStep, UiResponseTextAnnotation } from '../../types/codex'
 import { updateThreadFileChanges } from '../../api/codexGateway'
-import { openLocalPath } from '../../api/plcBridge'
+import { openLocalPath, openWebUrl } from '../../api/plcBridge'
+import { classifyLinkTarget } from '../../utils/linkTarget'
+import { isTauri } from '@tauri-apps/api/core'
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 import { duplicateProgressIds, responseFooterAnchors, responseTurnKeys } from '../../utils/conversationTurns'
@@ -881,7 +876,6 @@ const isFileLinkContextMenuVisible = ref(false)
 const fileLinkContextMenuX = ref(0)
 const fileLinkContextMenuY = ref(0)
 const fileLinkContextBrowseUrl = ref('')
-const fileLinkContextEditUrl = ref('')
 const { isMobile } = useMobile()
 function parsePlanFromMessageText(text: string): { explanation: string; steps: UiPlanStep[] } | null {
   const normalized = text.replace(/\r\n/g, '\n').trim()
@@ -3120,20 +3114,7 @@ const fileLinkContextMenuStyle = computed(() => ({
   left: `${String(fileLinkContextMenuX.value)}px`,
   top: `${String(fileLinkContextMenuY.value)}px`,
 }))
-const fileLinkContextLocalPath = computed(() => localPathFromBrowseHref(fileLinkContextBrowseUrl.value))
-
-function toEditUrlFromBrowseHref(href: string): string {
-  const normalizedHref = href.trim()
-  if (!normalizedHref) return ''
-  try {
-    const resolved = new URL(normalizedHref, window.location.href)
-    if (!resolved.pathname.startsWith('/codex-local-browse')) return ''
-    const editPath = `/codex-local-edit${resolved.pathname.slice('/codex-local-browse'.length)}`
-    return `${editPath}${resolved.search}${resolved.hash}`
-  } catch {
-    return ''
-  }
-}
+const fileLinkContextTarget = computed(() => classifyLinkTarget(fileLinkContextBrowseUrl.value, window.location.href))
 
 async function onConversationContextMenu(event: MouseEvent): Promise<void> {
   const target = event.target
@@ -3149,7 +3130,6 @@ async function onConversationContextMenu(event: MouseEvent): Promise<void> {
   event.stopPropagation()
 
   fileLinkContextBrowseUrl.value = href
-  fileLinkContextEditUrl.value = toEditUrlFromBrowseHref(href)
   fileLinkContextMenuX.value = event.clientX
   fileLinkContextMenuY.value = event.clientY
   isFileLinkContextMenuVisible.value = true
@@ -3166,39 +3146,22 @@ function closeFileLinkContextMenu(): void {
   isFileLinkContextMenuVisible.value = false
 }
 
-function openFileLinkContextBrowse(): void {
-  const href = fileLinkContextBrowseUrl.value
+async function openFileLinkContextBrowse(): Promise<void> {
+  const target = fileLinkContextTarget.value
   closeFileLinkContextMenu()
-  if (!href || href === '#') return
-  window.open(href, '_blank', 'noopener,noreferrer')
-}
-
-function openFileLinkContextEdit(): void {
-  const href = fileLinkContextEditUrl.value
-  closeFileLinkContextMenu()
-  if (!href || href === '#') return
-  window.open(href, '_blank', 'noopener,noreferrer')
-}
-
-function localPathFromBrowseHref(href: string): string {
+  if (target.kind !== 'web') return
   try {
-    const url = new URL(href, window.location.href)
-    const prefix = '/codex-local-browse'
-    // 外链即使路径形似本地浏览地址，也不能获得磁盘动作；只接受当前应用的精确路由。
-    if (url.origin !== new URL(window.location.href).origin || !url.pathname.startsWith(`${prefix}/`)) return ''
-    const decoded = decodeURIComponent(url.pathname.slice(prefix.length))
-    return decoded.replace(/^\/([A-Za-z]:[\\/])/u, '$1')
-  } catch {
-    return ''
-  }
+    if (isTauri()) await openWebUrl(target.href)
+    else window.open(target.href, '_blank', 'noopener,noreferrer')
+  } catch (error) { emit('notice', String(error)) }
 }
 
 async function runLocalPathAction(mode: 'reveal' | 'default'): Promise<void> {
-  const path = fileLinkContextLocalPath.value
+  const target = fileLinkContextTarget.value
   closeFileLinkContextMenu()
-  if (!path) return
+  if (target.kind !== 'file') return
   try {
-    await openLocalPath(path, mode)
+    await openLocalPath(target.path, mode)
   } catch (error) {
     emit('notice', String(error))
   }
@@ -3208,14 +3171,16 @@ function revealFileLinkContextPath(): void { void runLocalPathAction('reveal') }
 function openFileLinkContextDefaultApp(): void { void runLocalPathAction('default') }
 
 async function copyFileLinkContextLink(): Promise<void> {
-  const href = fileLinkContextBrowseUrl.value
+  const target = fileLinkContextTarget.value
+  const href = target.kind === 'file' ? target.path : target.href
   closeFileLinkContextMenu()
   if (!href || href === '#') return
 
   try {
     await copyTextToClipboard(href)
-  } catch {
-    // Clipboard writes can be blocked by browser permissions; keep the context action best-effort.
+    emit('notice', target.kind === 'file' ? '路径已复制。' : '链接已复制。')
+  } catch (error) {
+    emit('notice', `暂时无法复制，请重试：${String(error)}`)
   }
 }
 
@@ -5227,6 +5192,7 @@ onBeforeUnmount(() => {
 :global(.dark) .file-link-context-menu-item { color: var(--plc-dark-text); }
 :global(.dark) .file-link-context-menu-item:hover { background: var(--plc-dark-control); }
 .file-link-context-menu-item:focus-visible { outline: 2px solid #007acc; outline-offset: -2px; }
+.file-link-context-menu-divider { height:1px; margin:4px 3px; background:color-mix(in srgb,currentColor 12%,transparent); }
 
 .message-divider {
   @apply m-0 border-0 h-px bg-slate-300/80;

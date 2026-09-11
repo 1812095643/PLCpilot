@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { ReasoningEffort, UiAttachment, UiMentionReference, UiMentionKind, UiResponseTextAnnotation } from '../types/codex'
 
 export const openLocalPath = (path: string, mode: 'reveal' | 'default') => invoke<void>('open_local_path', { path, mode })
+export const openWebUrl = (url: string) => invoke<void>('open_web_url', { url })
 
 export type ProviderKind = 'responses' | 'messages' | 'chatcompletions' | 'ollama'
 
