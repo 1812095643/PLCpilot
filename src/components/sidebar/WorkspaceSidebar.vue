@@ -41,7 +41,7 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
 
 <template>
   <aside class="workspace-sidebar">
-    <header><span class="sidebar-brand-mark" aria-hidden="true">P</span><strong class="sidebar-brand">PLC Pilot</strong><WorkbenchModePicker :model-value="props.workbenchMode" @update:model-value="emit('update:workbench-mode', $event)" /><button title="搜索会话" aria-label="搜索会话" @click="searchOpen = !searchOpen"><IconTablerSearch /></button><button title="新建临时会话" aria-label="新建临时会话" @click="emit('new-thread')"><IconTablerFilePencil /></button></header>
+    <header><strong class="sidebar-brand" aria-label="PLC Pilot"><span class="sidebar-brand-plc">PLC</span><span class="sidebar-brand-pilot">Pilot</span></strong><WorkbenchModePicker :model-value="props.workbenchMode" @update:model-value="emit('update:workbench-mode', $event)" /><button title="搜索会话" aria-label="搜索会话" @click="searchOpen = !searchOpen"><IconTablerSearch /></button><button title="新建临时会话" aria-label="新建临时会话" @click="emit('new-thread')"><IconTablerFilePencil /></button></header>
     <input v-if="searchOpen" v-model="search" class="sidebar-search" aria-label="搜索项目和会话" placeholder="搜索会话" />
     <button class="sidebar-nav" @click="emit('new-thread')"><IconTablerFilePencil /><span>新对话</span></button>
     <button class="sidebar-nav" @click="emit('open-overview')"><IconTablerFolder /><span>工程概览</span></button>
@@ -70,9 +70,10 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
 <style scoped>
 .workspace-sidebar { --sidebar-bg: #f3f3f3; --sidebar-text: #333; --sidebar-muted: #737373; --sidebar-hover: #e8e8e8; --sidebar-active: #dedede; height: 100%; display: flex; flex-direction: column; min-height: 0; gap: 4px; padding: 10px 8px; background: var(--sidebar-bg); color: var(--sidebar-text); font-size: 13px; }
 header { display: flex; align-items: center; gap: 2px; min-height: 30px; padding: 0 4px 8px; }
-header strong { flex: 1; font-size: 14px; font-weight: 600; }
-.sidebar-brand-mark { display: inline-flex; width: 19px; height: 19px; align-items: center; justify-content: center; border-radius: 4px; background: #ff8a00; color: #111; font-size: 11px; font-weight: 750; }
-.sidebar-brand { flex: 0 0 auto; margin-right: 2px; font-size: 13px; }
+header strong { font-size: 14px; font-weight: 600; }
+.sidebar-brand { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; margin-right: 2px; color: #111; font-size: 13px; font-weight: 650; letter-spacing: 0; line-height: 1; }
+.sidebar-brand-plc { color: #111; }
+.sidebar-brand-pilot { padding: 3px 4px; border-radius: 4px; background: #f59e0b; color: #111; }
 button { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 26px; height: 26px; border: 0; border-radius: 4px; color: inherit; background: transparent; cursor: pointer; }
 button:hover { background: var(--sidebar-hover); }
 button:focus-visible, input:focus-visible { outline: 2px solid #007acc; outline-offset: -2px; }
@@ -101,6 +102,7 @@ footer { display: flex; align-items: center; padding-top: 6px; gap: 4px; }
 footer .sidebar-nav { flex: 1; min-width: 0; width: auto; }
 .load-more { color: var(--sidebar-muted); }
 :global(.dark .workspace-sidebar) { --sidebar-bg: #181818; --sidebar-text: #d4d4d4; --sidebar-muted: #929292; --sidebar-hover: #252526; --sidebar-active: #303030; }
+:global(.dark .sidebar-brand), :global(.dark .sidebar-brand-plc), :global(.dark .sidebar-brand-pilot) { color: #fff; }
 @keyframes sidebar-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .thread-state.running { animation: none; } }
 </style>
