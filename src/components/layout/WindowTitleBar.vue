@@ -267,7 +267,7 @@ onBeforeUnmount(() => {
 
 .window-titlebar-brand { gap: 7px; padding: 0 8px 0 4px; color: var(--titlebar-text); }
 .window-titlebar-brand:hover { background: var(--titlebar-hover); }
-.window-titlebar-mark { display: inline-flex; width: 19px; height: 19px; align-items: center; justify-content: center; border-radius: 4px; background: #007acc; color: #fff; font-size: 11px; font-weight: 700; }
+.window-titlebar-mark { display: inline-flex; width: 19px; height: 19px; align-items: center; justify-content: center; border-radius: 4px; background: #ff8a00; color: #111; font-size: 11px; font-weight: 750; }
 .window-titlebar-title { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
 
 .window-titlebar-menus { gap: 1px; margin-left: 2px; }

@@ -49,6 +49,8 @@ mod settings;
 mod updates;
 mod generic_tools;
 mod diagnostics;
+mod model_providers;
+mod workbench;
 use attachments::{prepare_attachments, read_local_file, AttachmentInput, CodexImageInput};
 
 const CODESYS_SKILL: &str = include_str!("../../skills/codesys-agent/SKILL.md");
@@ -74,6 +76,9 @@ impl Default for ProviderKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
+    #[serde(default)] pub provider_id: String,
+    #[serde(skip)] pub provider_name: String,
+    #[serde(skip, default = "default_model_enabled")] pub provider_enabled: bool,
     /// 模型 profile 的稳定 ID；旧版单模型配置没有该字段，加载时会补齐。
     #[serde(default)]
     pub id: String,
@@ -122,6 +127,7 @@ fn default_model_enabled() -> bool {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            provider_id: String::new(), provider_name: String::new(), provider_enabled: true,
             id: "model-default".to_string(),
             name: "GPT-5".to_string(),
             provider: ProviderKind::Responses,
@@ -293,6 +299,7 @@ impl Default for ProjectContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSnapshot {
+    pub workbench_mode: workbench::WorkbenchMode,
     pub app_version: String,
     pub config_directory: String,
     pub model: ModelSummary,
@@ -312,6 +319,9 @@ pub struct AppSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSummary {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub selected: bool,
     pub id: String,
     pub name: String,
     pub provider: ProviderKind,
@@ -331,6 +341,7 @@ pub struct ModelSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedSecrets {
+    #[serde(default)] provider_api_keys: HashMap<String, String>,
     /// 当前模型接口的 Key 单独保存，避免进入普通配置正文。
     #[serde(default, alias = "api_key", alias = "OPENAI_API_KEY")]
     model_api_key: Option<String>,
@@ -497,6 +508,7 @@ pub struct ForkSessionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentRequest {
+    #[serde(default)] pub workbench_mode: Option<workbench::WorkbenchMode>,
     #[serde(default)]
     pub client_thread_id: Option<String>,
     #[serde(default)]
@@ -885,6 +897,8 @@ impl AppState {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
+    pub workbench_mode: workbench::WorkbenchMode,
+    pub model_providers: Vec<model_providers::ModelProvider>,
     pub models: Vec<ModelConfig>,
     pub active_model_id: String,
     /// 兼容现有调用链的当前模型镜像；始终与 models[active_model_id] 同步。
@@ -899,6 +913,8 @@ pub struct RuntimeState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedRuntimeConfig {
+    #[serde(default)] workbench_mode: workbench::WorkbenchMode,
+    #[serde(default)] model_providers: Vec<model_providers::ModelProvider>,
     #[serde(default)]
     reasoning_levels_version: u32,
     #[serde(default)]
@@ -948,6 +964,8 @@ impl Default for RuntimeState {
     fn default() -> Self {
         let model = ModelConfig::default();
         Self {
+            workbench_mode: workbench::WorkbenchMode::Codesys,
+            model_providers: Vec::new(),
             active_model_id: model.id.clone(),
             models: vec![model.clone()],
             model,
@@ -1067,9 +1085,6 @@ fn normalize_model_collection(models: Vec<ModelConfig>) -> Vec<ModelConfig> {
         }
         normalized.push(model);
     }
-    if normalized.is_empty() {
-        normalized.push(ModelConfig::default());
-    }
     if !normalized.iter().any(|model| model.is_default) {
         if let Some(first) = normalized.first_mut() {
             first.is_default = true;
@@ -1080,27 +1095,27 @@ fn normalize_model_collection(models: Vec<ModelConfig>) -> Vec<ModelConfig> {
 
 fn sync_active_model(state: &mut RuntimeState) {
     state.models = normalize_model_collection(std::mem::take(&mut state.models));
+    model_providers::sync_models(state);
     let active_index = state
         .models
         .iter()
-        .position(|model| model.id == state.active_model_id && model.enabled)
+        .position(|model| model.id == state.active_model_id && model.enabled && model.provider_enabled)
         .or_else(|| {
             state
                 .models
                 .iter()
-                .position(|model| model.is_default && model.enabled)
+                .position(|model| model.is_default && model.enabled && model.provider_enabled)
         })
-        .or_else(|| state.models.iter().position(|model| model.enabled))
-        .unwrap_or(0);
+        .or_else(|| state.models.iter().position(|model| model.enabled && model.provider_enabled));
     for (index, model) in state.models.iter_mut().enumerate() {
-        model.is_default = index == active_index;
+        model.is_default = Some(index) == active_index;
     }
-    if let Some(active) = state.models.get_mut(active_index) {
-        if !active.enabled {
-            active.enabled = true;
-        }
+    if let Some(active) = active_index.and_then(|index| state.models.get(index)) {
         state.active_model_id = active.id.clone();
         state.model = active.clone();
+    } else {
+        state.active_model_id.clear();
+        state.model = ModelConfig { id: String::new(), model: String::new(), enabled: false, is_default: false, ..ModelConfig::default() };
     }
 }
 
@@ -1184,9 +1199,11 @@ fn load_runtime_state() -> RuntimeState {
                 Ok(mut config) => {
                     // 只有完整读出旧配置才能迁移。解析异常时绝不能把默认模型
                     // 当成已恢复配置写回，避免临时读取问题覆盖用户 URL 和模型列表。
-                    needs_config_migration = content.contains("\"api_key\"") || !content.contains("\"models\"");
+                    needs_config_migration = content.contains("\"api_key\"") || !content.contains("\"models\"") || !content.contains("\"model_providers\"");
                     needs_config_migration |= migrate_reasoning_levels(&mut config);
-                    if config.models.is_empty() {
+                    state.model_providers = config.model_providers;
+                    state.workbench_mode = config.workbench_mode;
+                    if config.models.is_empty() && !content.contains("\"models\"") {
                         if let Some(model) = config.model {
                             state.models = vec![model];
                         }
@@ -1237,9 +1254,11 @@ fn load_runtime_state() -> RuntimeState {
         }
     }
     let project = state.project.clone();
+    state.project = workbench::project_context(&state.project, state.workbench_mode);
     upsert_project(&mut state.projects, &project, false);
     match load_persisted_secrets() {
         Ok(secrets) => {
+            for provider in &mut state.model_providers { provider.api_key = secrets.provider_api_keys.get(&provider.id).cloned(); }
             for model in &mut state.models {
                 if let Some(key) = secrets
                     .model_api_keys
@@ -1308,6 +1327,8 @@ fn runtime_config_without_secrets(state: &RuntimeState) -> PersistedRuntimeConfi
         })
         .collect::<Vec<_>>();
     PersistedRuntimeConfig {
+        workbench_mode: state.workbench_mode,
+        model_providers: state.model_providers.iter().cloned().map(|mut provider| { provider.api_key = None; provider }).collect(),
         reasoning_levels_version: 1,
         model: Some(ModelConfig {
             api_key: None,
@@ -1323,6 +1344,7 @@ fn runtime_config_without_secrets(state: &RuntimeState) -> PersistedRuntimeConfi
 
 fn persisted_secrets(state: &RuntimeState) -> Result<PersistedSecrets, AppError> {
     let mut secrets = load_persisted_secrets()?;
+    secrets.provider_api_keys = state.model_providers.iter().filter_map(|provider| provider.api_key.as_ref().map(|key| (provider.id.clone(), key.clone()))).collect();
     let model_ids = state
         .models
         .iter()
@@ -2364,6 +2386,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            workbench::set_workbench_mode,
+            workbench::inspect_workbench,
+            model_providers::get_model_providers,
+            model_providers::save_model_provider,
+            model_providers::delete_model_provider,
+            model_providers::set_model_provider_enabled,
+            model_providers::discover_provider_models,
+            model_providers::import_provider_models,
             diagnostics::record_frontend_diagnostic,
             updates::get_update_preferences,
             updates::save_update_preferences,
@@ -2459,7 +2489,7 @@ async fn get_snapshot(state: State<'_, AppState>) -> Result<AppSnapshot, AppErro
 #[tauri::command]
 async fn get_model_settings(state: State<'_, AppState>) -> Result<Value, AppError> {
     let guard = state.inner.lock().await;
-    Ok(json!({ "models": model_summaries(&guard.models), "model": model_summary(&guard.model),
+    Ok(json!({ "providers": guard.model_providers.iter().map(model_providers::summary).collect::<Vec<_>>(), "models": model_summaries(&guard.models), "model": model_summary(&guard.model),
         "active_model_id": guard.active_model_id, "config_directory": app_data_root().to_string_lossy() }))
 }
 
@@ -2469,6 +2499,7 @@ fn merge_discovered_models(state: &mut RuntimeState, config: ModelConfig, model_
         return Err(AppError::Configuration("请选择 1 到 500 个模型。".into()));
     }
     let mut source = config;
+    model_providers::bind_model(state, &mut source)?;
     if let Some(existing) = state.models.iter().find(|model| model.id == source.id && same_model_scope(model, &source))
         .or_else(|| state.models.iter().find(|model| same_model_scope(model, &source) && model.api_key.is_some())) {
         source = apply_saved_model_key(source, existing);
@@ -2570,17 +2601,8 @@ async fn configure_model_inner(
     let mut config = normalize_model_for_save(config)?;
     let mut stored = state.inner.lock().await;
     let mut guard = stored.clone();
+    model_providers::bind_model(&guard, &mut config)?;
     let previous_scope = guard.models.iter().find(|model| model.id == requested_id).cloned();
-    if !config.enabled
-        && !guard
-            .models
-            .iter()
-            .any(|model| model.id != requested_id && model.enabled)
-    {
-        return Err(AppError::Configuration(
-            "至少保留一个启用的模型".to_string(),
-        ));
-    }
     if let Some(existing) = guard.models.iter().find(|model| model.id == requested_id) {
         if config.api_key.is_none() && same_model_scope(&config, existing) {
             config.api_key = existing.api_key.clone();
@@ -2593,7 +2615,7 @@ async fn configure_model_inner(
             config.last_error = existing.last_error.clone();
         }
     }
-    if let Some(previous) = previous_scope.as_ref() {
+    if let Some(previous) = previous_scope.as_ref().filter(|_| config.provider_id.is_empty()) {
       if previous.provider != config.provider || previous.base_url != config.base_url || config.api_key.is_some() {
         // 一个 URL 就是一个服务商：修改服务商地址、协议或 Key 时同步同组模型，
         // 防止列表里出现“同一服务商一半能用、一半仍指向旧地址”的隐性配置。
@@ -2644,7 +2666,7 @@ async fn set_active_model_inner(id: String, state: &AppState) -> Result<ModelSum
     let exists = guard
         .models
         .iter()
-        .any(|model| model.id == requested && model.enabled);
+        .any(|model| model.id == requested && model.enabled && model.provider_enabled);
     if !exists {
         return Err(AppError::Configuration("该模型不存在或已停用".to_string()));
     }
@@ -2673,12 +2695,6 @@ async fn set_model_enabled_inner(
     let Some(index) = guard.models.iter().position(|model| model.id == requested) else {
         return Err(AppError::Configuration("该模型不存在".to_string()));
     };
-    let was_enabled = guard.models[index].enabled;
-    if !enabled && was_enabled && guard.models.iter().filter(|item| item.enabled).count() <= 1 {
-        return Err(AppError::Configuration(
-            "至少保留一个启用的模型".to_string(),
-        ));
-    }
     guard.models[index].enabled = enabled;
     sync_active_model(&mut guard);
     let summaries = model_summaries(&guard.models);
@@ -2717,9 +2733,6 @@ async fn duplicate_model_inner(id: String, state: &AppState) -> Result<ModelSumm
 async fn delete_model_inner(id: String, state: &AppState) -> Result<Vec<ModelSummary>, AppError> {
     let requested = id.trim();
     let mut guard = state.inner.lock().await;
-    if guard.models.len() <= 1 {
-        return Err(AppError::Configuration("至少保留一个模型配置".to_string()));
-    }
     let before = guard.models.len();
     guard.models.retain(|model| model.id != requested);
     if guard.models.len() == before {
@@ -3026,6 +3039,7 @@ async fn list_projects(state: State<'_, AppState>) -> Result<Vec<WorkspaceProjec
 async fn pick_project_folder() -> Result<Option<String>, AppError> {
     let selected = rfd::AsyncFileDialog::new()
         .set_title("选择 CODESYS 工程目录")
+        .set_title("选择工作目录")
         .pick_folder()
         .await;
     Ok(selected.map(|handle| handle.path().to_string_lossy().into_owned()))
@@ -3530,6 +3544,12 @@ async fn sync_current_project(state: State<'_, AppState>) -> Result<ProjectConte
 async fn sync_current_project_inner(state: &AppState) -> Result<ProjectContext, AppError> {
     let current = state.inner.lock().await.project.clone();
     if state.isolated { return Ok(current); }
+    let mode = state.inner.lock().await.workbench_mode;
+    if mode != workbench::WorkbenchMode::Codesys {
+        let project = workbench::project_context(&current, mode);
+        state.inner.lock().await.project = project.clone();
+        return Ok(project);
+    }
     let synced = sync_project_from_codesys(current.clone());
     if current.path.as_ref().zip(synced.path.as_ref()).is_some_and(|(current, synced)| !session_paths_equal(current, synced)) { return Ok(current); }
     let mut guard = state.inner.lock().await;
@@ -4168,6 +4188,9 @@ async fn call_mcp_tool_inner(
     request: ToolCallRequest,
     state: &AppState,
 ) -> Result<ToolCallResult, AppError> {
+    if !workbench::tool_allowed(state.inner.lock().await.workbench_mode, &request.server_id, &request.tool_name) {
+        return Err(AppError::Mcp("当前模式不使用该工业工具，请先切换相应工作模式。".into()));
+    }
     let full_access = settings::read_preferences()?.access_mode == "full";
     if !full_access && (is_forbidden_tool(&request.tool_name) || is_mutating_tool(&request.tool_name)) {
         return Err(AppError::Mcp(
@@ -4335,7 +4358,7 @@ async fn run_agent_legacy(
     let plan_mode = request_is_plan_mode(&request);
 
     let mut events = Vec::new();
-    let tools = discover_tools(&servers, &mut events).await;
+    let mut tools = discover_tools(&servers, &mut events).await;
     let system = build_agent_system_prompt(&project, &request);
     let mut messages = request.history;
     let attachment_text = attachments::attachment_context(&request.attachments);
@@ -4491,6 +4514,7 @@ async fn run_agent(
     let stream = AgentStreamSender::new(request_id.clone(), app.clone());
     stream.send_status("request_start", None);
     let root = state.inner().clone();
+    if request.workbench_mode.is_none() { request.workbench_mode = Some(root.inner.lock().await.workbench_mode); }
     let state = agent_runtime::isolate_run(&root, &request).await?;
     agent_control::register(&request_id).await;
     // 控制面只确认提交成功；后台任务负责读取宿主 stdout、投影工具/文本事件，
@@ -4564,8 +4588,14 @@ async fn run_agent_inner(
     // 每次 Agent 请求都重新合并原生 CODESYS 快照，确保工程切换、编辑器和选区变化不会沿用旧上下文。
     // CODESYS 宿主还会把刚采集的 snapshot_id 注入请求；若文件在请求间隙被替换，
     // 直接拒绝本轮而不把上一工程内容交给模型。
-    let current_project = sync_current_project_inner(state).await?;
-    validate_codesys_context_binding(&current_project, request.codesys_context.as_ref())?;
+    let mode = request.workbench_mode.unwrap_or(state.inner.lock().await.workbench_mode);
+    let current_project = if mode == workbench::WorkbenchMode::Codesys { sync_current_project_inner(state).await? }
+        else { workbench::project_context(&state.inner.lock().await.project, mode) };
+    if mode == workbench::WorkbenchMode::Codesys { validate_codesys_context_binding(&current_project, request.codesys_context.as_ref())?; }
+    if mode != workbench::WorkbenchMode::Codesys && matches!(request.message.trim(), "/compile" | "/diagnostics" | "/diag") {
+        request.message = if mode == workbench::WorkbenchMode::Stone { "请使用 STone 官方工具检查当前工程并执行真实编译，先确认解决方案路径和安装环境，依照审批流程运行并返回官方诊断。".into() }
+            else { "请分析当前工作目录，按实际项目类型检查并说明可用验证命令；不要运行 PLC 专用编译器。".into() };
+    }
     let current_session_id = state.inner.lock().await.session.session_id.clone();
     request.references = normalize_mention_references(
         &current_project,
@@ -4764,16 +4794,16 @@ async fn run_agent_inner(
         }
         "/scan" => {
             let current = state.inner.lock().await.project.clone();
-            let scanned = scan_project_context(current);
+            let scanned = workbench::project_context(&current, mode);
             let text = if scanned.exists {
                 format!(
-                    "工程扫描完成：{} 个文件，{} 个可能的 POU/源对象。\n{}",
+                    "工作目录扫描完成：{} 个文件，{} 个源对象。\n{}",
                     scanned.file_count,
                     scanned.pou_count,
                     scanned.scan_message.clone().unwrap_or_default()
                 )
             } else {
-                "请先选择一个存在的 CODESYS 工程文件或目录。".to_string()
+                "请先选择一个存在的工作目录或工程文件。".to_string()
             };
             state.inner.lock().await.project = scanned;
             return Ok(agent_result_from_state(
@@ -4991,7 +5021,7 @@ async fn run_agent_inner(
         let guard = state.inner.lock().await;
         (
             model_profile_for_request(&guard, &request)?,
-            guard.mcp_servers.clone(),
+            guard.mcp_servers.iter().filter(|server| workbench::tool_allowed(mode, &server.id, "")).cloned().collect::<Vec<_>>(),
             guard.session.clone(),
         )
     };
@@ -5003,7 +5033,8 @@ async fn run_agent_inner(
     validate_model_config(&model)?;
 
     let mut events = Vec::new();
-    let tools = discover_tools(&servers, &mut events).await;
+    let mut tools = discover_tools(&servers, &mut events).await;
+    tools.retain(|tool| workbench::tool_allowed(mode, &tool.server_id, &tool.name));
     for event in events.clone() {
         if let Some(stream) = stream.as_ref() {
             stream.send_event(event.clone());
@@ -5583,6 +5614,10 @@ async fn process_pi_tool_request(
         .unwrap_or_default()
         .to_string();
     let arguments = value.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let mode = state.inner.lock().await.workbench_mode;
+    if !workbench::tool_allowed(mode, &server_id, &tool_name) {
+        return Ok(json!({"type":"tool_result", "request_id":request_id, "content":[{"type":"text","text":"当前工作模式未启用该工具，请切换模式后执行。"}], "is_error":true, "decision":"blocked"}));
+    }
     let qualified = qualify_tool(&server_id, &tool_name);
     let full_access = settings::read_preferences()?.access_mode == "full";
     let needs_approval = is_mutating_tool(&tool_name) || is_forbidden_tool(&tool_name);
@@ -5809,7 +5844,7 @@ async fn process_pi_tool_request(
         stream,
     );
     if mcp_transport(&server) != "http" {
-        push_event_with_stream(app, events, AgentEvent::new(&call_id, "mcp", "已握手并复用本轮 CODESYS MCP 会话", Some(format!("服务：{} · 工具：{}", server.name, tool_name)), "running", Some(qualified.clone())), stream);
+        push_event_with_stream(app, events, AgentEvent::new(&call_id, "mcp", "已握手并复用本轮 MCP 会话", Some(format!("服务：{} · 工具：{}", server.name, tool_name)), "running", Some(qualified.clone())), stream);
     }
     let result = if mcp_transport(&server) == "http" {
         // Streamable HTTP 服务可能自行管理会话；保留现有 session-id 握手实现。
@@ -8123,7 +8158,8 @@ async fn snapshot_from_app_state(state: &State<'_, AppState>) -> Result<AppSnaps
 async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, AppError> {
     // CODESYS 脚本命令会把当前主工程写入桥接快照；每次刷新先合并该快照，避免侧栏停留在旧的手动路径。
     let current_project = state.inner.lock().await.project.clone();
-    let synced_project = sync_project_from_codesys(current_project);
+    let mode = state.inner.lock().await.workbench_mode;
+    let synced_project = if mode == workbench::WorkbenchMode::Codesys { sync_project_from_codesys(current_project) } else { workbench::project_context(&current_project, mode) };
     state.inner.lock().await.project = synced_project;
     let guard = state.inner.lock().await;
     let model = model_summary(&guard.model);
@@ -8137,14 +8173,16 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
         .filter(|item| item.summary.status == "pending")
         .map(|item| item.summary.clone())
         .collect();
-    let servers = guard.mcp_servers.clone();
+    let servers = guard.mcp_servers.iter().filter(|server| workbench::tool_allowed(mode, &server.id, "")).cloned().collect::<Vec<_>>();
     let session = guard.session.clone();
     let project_for_skills = project.clone();
     drop(guard);
     // 一次刷新只探测每个 MCP 服务一次，避免启动两遍 stdio 进程并让有状态的
     // HTTP MCP 服务收到重复初始化请求。
-    let (mcp_servers, tools) = inspect_mcp_servers(&servers).await;
+    let (mcp_servers, mut tools) = inspect_mcp_servers(&servers).await;
+    tools.retain(|tool| workbench::tool_allowed(mode, &tool.server_id, &tool.name));
     Ok(AppSnapshot {
+        workbench_mode: mode,
         app_version: APP_VERSION.to_string(),
         config_directory: app_data_root().to_string_lossy().into_owned(),
         model,
@@ -8154,7 +8192,7 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
         project,
         projects,
         codesys: detect_codesys_installation(),
-        skills: discover_skills(&project_for_skills),
+        skills: discover_skills(&project_for_skills).into_iter().filter(|skill| workbench::skill_allowed(mode, skill)).collect(),
         commands: available_commands(),
         tools,
         sessions: list_session_records(),
@@ -8170,6 +8208,7 @@ fn model_summary(config: &ModelConfig) -> ModelSummary {
         .map(str::trim)
         .is_some_and(|key| !key.is_empty());
     ModelSummary {
+        provider_id: config.provider_id.clone(), provider_name: config.provider_name.clone(), selected: config.enabled && config.provider_enabled,
         id: config.id.clone(),
         name: if config.name.trim().is_empty() {
             config.model.clone()
@@ -8184,7 +8223,7 @@ fn model_summary(config: &ModelConfig) -> ModelSummary {
         context_window: config.context_window,
         max_tokens: config.max_tokens,
         reasoning_levels: config.reasoning_levels.clone(),
-        enabled: config.enabled,
+        enabled: config.enabled && config.provider_enabled,
         is_default: config.is_default,
         last_error: config.last_error.clone(),
         last_checked_at: config.last_checked_at.clone(),
@@ -9253,10 +9292,11 @@ fn model_profile_for_request(
         return state
             .models
             .iter()
-            .find(|model| model.id == profile_id && model.enabled)
+            .find(|model| model.id == profile_id && model.enabled && model.provider_enabled)
             .cloned()
             .ok_or_else(|| AppError::Configuration("所选模型不存在或已停用".to_string()));
     }
+    if !state.model.enabled || !state.model.provider_enabled { return Err(AppError::Configuration("请在设置中启用服务商并添加至少一个模型。".into())); }
     Ok(state.model.clone())
 }
 
@@ -9332,7 +9372,8 @@ fn selected_skill_label(value: &str) -> String {
 
 /// 为本轮请求附加计划模式和重点 Skill 约束；基础 PLC 安全提示始终保留。
 fn build_agent_system_prompt(project: &ProjectContext, request: &AgentRequest) -> String {
-    let mut prompt = build_system_prompt(project);
+    let mode = request.workbench_mode.unwrap_or_default();
+    let mut prompt = workbench::system_prompt(project, mode);
     prompt.push_str(&format!(
         "\n\n本轮思考级别：{}。请在该级别下保持结论、证据和风险表达清晰。",
         request_thinking_level(request)
@@ -9357,7 +9398,7 @@ fn build_agent_system_prompt(project: &ProjectContext, request: &AgentRequest) -
             "\n本轮重点应用 Skills：{}。回答时优先引用这些规则。",
             selected.join("、")
         ));
-        let known_skills = discover_skills(project);
+        let known_skills = discover_skills(project).into_iter().filter(|skill| workbench::skill_allowed(mode, skill)).collect::<Vec<_>>();
         for selected_value in &request.skills {
             let selected_id = selected_value
                 .trim()

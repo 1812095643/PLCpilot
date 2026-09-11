@@ -10,15 +10,18 @@ import IconTablerChevronDown from '../icons/IconTablerChevronDown.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
 import ThemeToggle from './ThemeToggle.vue'
+import WorkbenchModePicker from './WorkbenchModePicker.vue'
+import type { WorkbenchMode } from '../../api/plcBridge'
 import type { ThemePreference } from '../../types/theme'
 
 export type SidebarThread = { id: string; name: string; cwd: string; busy: boolean; status: string; persisted: boolean }
-const props = defineProps<{ projects: WorkspaceProject[]; threads: SidebarThread[]; activeId: string; theme: ThemePreference }>()
+const props = defineProps<{ projects: WorkspaceProject[]; threads: SidebarThread[]; activeId: string; theme: ThemePreference; workbenchMode: WorkbenchMode }>()
 const emit = defineEmits<{
   'new-thread': [project?: WorkspaceProject]; 'select-thread': [id: string]; 'open-project': [project: WorkspaceProject];
   'add-project': []; 'remove-project': [project: WorkspaceProject]; 'rename-thread': [id: string]; 'delete-thread': [id: string];
   'open-settings': []; 'open-skills': []; 'open-overview': [];
   'update:theme': [theme: ThemePreference];
+  'update:workbench-mode': [mode: WorkbenchMode];
 }>()
 const search = shallowRef('')
 const searchOpen = shallowRef(false)
@@ -38,7 +41,7 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
 
 <template>
   <aside class="workspace-sidebar">
-    <header><strong>PLC Pilot</strong><button title="搜索会话" aria-label="搜索会话" @click="searchOpen = !searchOpen"><IconTablerSearch /></button><button title="新建临时会话" aria-label="新建临时会话" @click="emit('new-thread')"><IconTablerFilePencil /></button></header>
+    <header><span class="sidebar-brand-mark" aria-hidden="true">P</span><strong class="sidebar-brand">PLC Pilot</strong><WorkbenchModePicker :model-value="props.workbenchMode" @update:model-value="emit('update:workbench-mode', $event)" /><button title="搜索会话" aria-label="搜索会话" @click="searchOpen = !searchOpen"><IconTablerSearch /></button><button title="新建临时会话" aria-label="新建临时会话" @click="emit('new-thread')"><IconTablerFilePencil /></button></header>
     <input v-if="searchOpen" v-model="search" class="sidebar-search" aria-label="搜索项目和会话" placeholder="搜索会话" />
     <button class="sidebar-nav" @click="emit('new-thread')"><IconTablerFilePencil /><span>新对话</span></button>
     <button class="sidebar-nav" @click="emit('open-overview')"><IconTablerFolder /><span>工程概览</span></button>
@@ -68,6 +71,8 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
 .workspace-sidebar { --sidebar-bg: #f3f3f3; --sidebar-text: #333; --sidebar-muted: #737373; --sidebar-hover: #e8e8e8; --sidebar-active: #dedede; height: 100%; display: flex; flex-direction: column; min-height: 0; gap: 4px; padding: 10px 8px; background: var(--sidebar-bg); color: var(--sidebar-text); font-size: 13px; }
 header { display: flex; align-items: center; gap: 2px; min-height: 30px; padding: 0 4px 8px; }
 header strong { flex: 1; font-size: 14px; font-weight: 600; }
+.sidebar-brand-mark { display: inline-flex; width: 19px; height: 19px; align-items: center; justify-content: center; border-radius: 4px; background: #ff8a00; color: #111; font-size: 11px; font-weight: 750; }
+.sidebar-brand { flex: 0 0 auto; margin-right: 2px; font-size: 13px; }
 button { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 26px; height: 26px; border: 0; border-radius: 4px; color: inherit; background: transparent; cursor: pointer; }
 button:hover { background: var(--sidebar-hover); }
 button:focus-visible, input:focus-visible { outline: 2px solid #007acc; outline-offset: -2px; }

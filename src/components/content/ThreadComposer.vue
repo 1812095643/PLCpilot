@@ -63,6 +63,8 @@ export type SubmitPayload = {
 }
 
 export type ComposerModelOption = {
+  providerName?: string
+  providerId?: string
   id: string
   name: string
   model: string

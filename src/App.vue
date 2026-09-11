@@ -39,13 +39,10 @@ import {
   compactContext,
   compileProject,
   deleteModel,
-  discoverModels,
   duplicateModel,
   EMPTY_SNAPSHOT,
   getSkillContent,
   getSnapshot,
-  importModels,
-  modelFormFromSummary,
   deleteSession,
   forkSession,
   pickProjectFolder,
@@ -58,6 +55,7 @@ import {
   saveModel,
   setActiveModel,
   setModelEnabled,
+  setWorkbenchMode,
   selectProject,
   startNewSession,
   startTemporaryWorkspace,
@@ -67,10 +65,10 @@ import {
   type AgentResult,
   type AgentRunOptions,
   type CommandSummary,
-  type ModelDiscoveryResult,
   type McpForm,
   type ModelForm,
   type ModelSummary,
+  type WorkbenchMode,
   type PendingChange,
   type SessionRecord,
   type Snapshot,
@@ -110,9 +108,8 @@ const isBusy = workspace.field('isBusy')
 const isWindowDropActive = shallowRef(false)
 const isRefreshing = shallowRef(false)
 const notice = shallowRef('')
-const isDiscoveringModels = shallowRef(false)
-const modelDiscovery = shallowRef<ModelDiscoveryResult | null>(null)
-const modelDiscoveryError = shallowRef('')
+const providerDiscoveryRequest = shallowRef(0)
+const workbenchMode = shallowRef<WorkbenchMode>('codesys')
 const liveOverlay = workspace.field('liveOverlay')
 const diagnostics = workspace.field('diagnostics')
 const diagnosticNote = workspace.field('diagnosticNote')
@@ -132,6 +129,18 @@ const composerRef = shallowRef<ComponentPublicInstance<ThreadComposerExposed> | 
 const conversationRef = shallowRef<ComponentPublicInstance<ThreadConversationExposed> | null>(null)
 const { preference: theme } = useAppTheme()
 const { mode: accessMode, ready: accessModeReady, saving: accessModeSaving, update: saveComposerAccessMode } = useAccessMode(showNotice)
+
+async function onWorkbenchModeChange(mode: WorkbenchMode): Promise<void> {
+  if (mode === workbenchMode.value || isRefreshing.value || tasksRunning.value) return
+  try {
+    const project = await setWorkbenchMode(mode)
+    workbenchMode.value = mode
+    workspace.active.value.project = project
+    activeView.value = mode === 'codesys' ? 'overview' : 'chat'
+    await refresh()
+    showNotice(mode === 'codesys' ? '已切换到 CODESYS 模式。' : mode === 'stone' ? '已切换到 Stone 模式。' : '已切换到自由聊天模式。')
+  } catch (error) { showNotice(error instanceof Error ? error.message : String(error)) }
+}
 
 async function onAccessModeChange(mode: 'approval' | 'full'): Promise<void> {
   if (mode === accessMode.value || tasksRunning.value || accessModeSaving.value) return
@@ -201,9 +210,8 @@ const commands = computed(() => snapshot.value.commands.length > 0 ? snapshot.va
 const modelOptions = computed(() => {
   const configured = snapshot.value.models
     .filter((model) => model.enabled)
-    .map((model) => ({ id: model.id, name: model.name, model: model.model }))
-  if (configured.length > 0) return configured
-  return [{ id: snapshot.value.model.id, name: snapshot.value.model.name, model: snapshot.value.model.model }]
+    .map((model) => ({ id: model.id, name: model.name, model: model.model, providerName: model.provider_name, providerId: model.provider_id }))
+  return configured
 })
 const selectedModelProfile = computed<ModelSummary | null>(() => (
   snapshot.value.models.find((model) => model.id === selectedModelProfileId.value && model.enabled)
@@ -558,6 +566,7 @@ async function refresh(): Promise<void> {
     next.model = snapshot.value.model
     next.active_model_id = snapshot.value.active_model_id
     snapshot.value = next
+    workbenchMode.value = next.workbench_mode
     projectPathDraft.value = next.project.path || ''
     const activeModel = next.models.find((model) => model.id === next.active_model_id && model.enabled)
       ?? next.models.find((model) => model.enabled)
@@ -909,7 +918,7 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   if (text === '/stop') { await onInterrupt(false, thread); return }
   if (text === '/new') { await startNewThread(); return }
   if (text === '/clear' && !thread.isBusy) { workspace.create(thread.project); return }
-  if (text === '/model') { settingsCategory.value = 'models'; showSettings.value = true; await onDiscoverModels(modelFormFromSummary(snapshot.value.models.find((model) => model.id === thread.selectedModelProfileId) || snapshot.value.model)); return }
+  if (text === '/model') { settingsCategory.value = 'models'; providerDiscoveryRequest.value += 1; showSettings.value = true; return }
   if (text === '/skills' || text === '/mcp') { settingsCategory.value = text.slice(1); showSettings.value = true; return }
   if (text === '/tools') { activeView.value = 'skills'; showSettings.value = false; return }
   if (/^\/(approve|reject)\s+/u.test(text)) {
@@ -1175,6 +1184,7 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
       modelProfileId: requestModelProfileId,
       reasoningEffort: requestReasoningEffort,
       collaborationMode: requestCollaborationMode,
+      workbenchMode: workbenchMode.value,
       skills: payload.skills,
       attachments,
       references: payload.references,
@@ -1677,44 +1687,16 @@ async function onSaveModel(form: ModelForm): Promise<void> {
   } finally { isSavingModel.value = false }
 }
 
-async function onImportModels(form: ModelForm, ids: string[]): Promise<void> {
-  if (isSavingModel.value) return
-  isSavingModel.value = true
-  try {
-    const added = await importModels(form, ids)
-    await modelSettings.reload()
-    const first = added[0]
-    if (first) {
-      selectedModelProfileId.value = first.id
-      selectedModel.value = first.model
-      reasoningEffort.value = normalizeReasoningEffort(reasoningEffort.value, first)
-    }
-    showNotice(`已添加 ${added.length} 个模型，可在对话下方切换。`)
-  } catch (error) { showNotice(String(error)) }
-  finally { isSavingModel.value = false }
-}
-
-async function onDiscoverModels(form: ModelForm): Promise<void> {
-  modelDiscoveryError.value = ''
-  isDiscoveringModels.value = true
-  try {
-    // 获取模型也是明确提交连接设置的动作；先保存地址和凭据，再发起请求，
-    // 以前这里只更新连接检测时间，用户填写的新 URL/Key 从未真正落盘。
-    const saved = await saveModel(form)
-    selectedModelProfileId.value = saved.id
-    selectedModel.value = saved.model
-    await modelSettings.reload()
-    const result = await discoverModels({ ...form, id: saved.id })
-    modelDiscovery.value = result
-    showNotice(result.models.length > 0 ? `已获取 ${result.models.length} 个可用模型。` : '接口已响应，但没有返回可用模型。')
-  } catch (error) {
-    const errorText = error instanceof Error ? error.message : String(error)
-    modelDiscovery.value = null
-    modelDiscoveryError.value = errorText
-    showNotice('模型列表获取未完成，请查看设置面板中的原因。')
-  } finally {
-    await modelSettings.reload()
-    isDiscoveringModels.value = false
+async function onProvidersChanged(): Promise<void> {
+  await modelSettings.reload()
+  // 服务商停用后，快照虽然排除了其模型，工作区仍可能保存旧 profile ID。
+  // 同步本轮选择，避免按钮显示备用模型但发送时仍请求已停用的服务商。
+  if (!snapshot.value.models.some(model => model.id === selectedModelProfileId.value && model.enabled)) {
+    const model = snapshot.value.models.find(model => model.id === snapshot.value.active_model_id && model.enabled)
+      ?? snapshot.value.models.find(model => model.enabled)
+    selectedModelProfileId.value = model?.id ?? ''
+    selectedModel.value = model?.model ?? ''
+    if (model) reasoningEffort.value = normalizeReasoningEffort(reasoningEffort.value, model)
   }
 }
 
@@ -1755,7 +1737,7 @@ async function onDuplicateModel(id: string): Promise<void> {
 
 async function onDeleteModel(id: string): Promise<void> {
   const target = snapshot.value.models.find((model) => model.id === id)
-  if (!target || !await requestConfirm('删除模型', `删除模型配置“${target.name}”吗？本机保存的对应 Key 也会一并移除。`)) return
+  if (!target || !await requestConfirm('删除模型', `删除模型配置“${target.name}”吗？服务商连接配置和聊天记录会保留。`)) return
   try {
     await deleteModel(id)
     await refresh()
@@ -1966,7 +1948,7 @@ onUnmounted(() => {
     @drop="onWindowDrop"
   >
     <template #sidebar>
-      <WorkspaceSidebar :projects="sidebarProjects" :threads="sidebarThreads" :active-id="activeThreadId" :theme="theme" @update:theme="theme = $event"
+      <WorkspaceSidebar :projects="sidebarProjects" :threads="sidebarThreads" :active-id="activeThreadId" :theme="theme" :workbench-mode="workbenchMode" @update:theme="theme = $event" @update:workbench-mode="onWorkbenchModeChange"
         @new-thread="startNewThread" @select-thread="selectSidebarThread" @open-project="onOpenProject"
         @add-project="onPickProjectFolder" @remove-project="onRemoveProject" @rename-thread="renameSidebarThread" @delete-thread="deleteSidebarThread"
         @open-settings="showSettings = true" @open-skills="activeView = 'skills'; showSettings = false" @open-overview="activeView = 'overview'; showSettings = false" />
@@ -2012,9 +1994,9 @@ onUnmounted(() => {
             <button v-if="modelSettings.error.value" type="button" @click="modelSettings.reload()">重新读取</button>
           </p>
           <ModelSettingsPanel v-if="modelSettings.loaded.value" :models="snapshot.models" :active-model-id="snapshot.active_model_id" :selected-model-id="selectedModelProfileId" :is-saving="isSavingModel"
-            :discovery="modelDiscovery" :discovery-error="modelDiscoveryError" :is-discovering="isDiscoveringModels"
+            :discovery-request="providerDiscoveryRequest" @discovery-handled="providerDiscoveryRequest = 0"
             :current-context-tokens="workspace.active.value.session.context_tokens" :remaining-context-percent="tokenUsage?.remainingContextPercent ?? null" :auto-compaction-enabled="workspace.active.value.session.auto_compaction_enabled"
-            @save="onSaveModel" @discover="onDiscoverModels" @import="onImportModels" @set-active="onSetActiveModel" @toggle-enabled="onToggleModel" @duplicate="onDuplicateModel" @remove="onDeleteModel" />
+            @save="onSaveModel" @refresh="onProvidersChanged" @set-active="onSetActiveModel" @toggle-enabled="onToggleModel" @duplicate="onDuplicateModel" @remove="onDeleteModel" />
         </template>
       </SettingsPage>
       <section v-else class="content-root plc-content">

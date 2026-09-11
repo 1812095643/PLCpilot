@@ -6,6 +6,7 @@ export const openLocalPath = (path: string, mode: 'reveal' | 'default') => invok
 export const openWebUrl = (url: string) => invoke<void>('open_web_url', { url })
 
 export type ProviderKind = 'responses' | 'messages' | 'chatcompletions' | 'ollama'
+export type WorkbenchMode = 'codesys' | 'chat' | 'stone'
 
 export type ProjectContext = {
   path: string | null
@@ -44,6 +45,9 @@ export type WorkspaceProject = {
 }
 
 export type ModelSummary = {
+  provider_id?: string
+  provider_name?: string
+  selected?: boolean
   id: string
   name: string
   provider: ProviderKind
@@ -61,6 +65,15 @@ export type ModelSummary = {
   connection_status: 'unchecked' | 'connected' | 'error' | string
 }
 
+export type ModelProviderSummary = {
+  id: string
+  name: string
+  provider: ProviderKind
+  base_url: string
+  enabled: boolean
+  api_key_configured: boolean
+}
+
 export type DiscoveredModel = {
   id: string
   name: string
@@ -76,6 +89,7 @@ export type ModelDiscoveryResult = {
 }
 
 export type ModelForm = {
+  providerId?: string
   id: string
   name: string
   provider: ProviderKind
@@ -92,7 +106,7 @@ export type ModelForm = {
 export function modelFormFromSummary(model: ModelSummary): ModelForm {
   const allowed = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
   const levels = model.reasoning_levels.filter((level): level is ReasoningEffort => allowed.includes(level))
-  return { id: model.id, name: model.name, provider: model.provider, baseUrl: model.base_url, model: model.model, apiKey: '', contextWindow: model.context_window, maxTokens: model.max_tokens, reasoningLevels: levels.length ? levels : ['none'], enabled: model.enabled, isDefault: model.is_default }
+  return { id: model.id, providerId: model.provider_id, name: model.name, provider: model.provider, baseUrl: model.base_url, model: model.model, apiKey: '', contextWindow: model.context_window, maxTokens: model.max_tokens, reasoningLevels: levels.length ? levels : ['none'], enabled: model.selected ?? model.enabled, isDefault: model.is_default }
 }
 
 export type McpSummary = {
@@ -232,6 +246,7 @@ export type CodesysStatus = {
 }
 
 export type Snapshot = {
+  workbench_mode: WorkbenchMode
   app_version: string
   config_directory: string
   model: ModelSummary
@@ -309,6 +324,7 @@ export type AgentContextBinding = {
 }
 
 export type AgentRunOptions = {
+  workbenchMode?: WorkbenchMode
   /** 本轮临时使用的模型名称，不覆盖设置中的默认模型。 */
   model?: string
   /** 本轮选择的模型 profile ID；用于绑定接口、Key、上下文长度和能力。 */
@@ -398,6 +414,7 @@ export const EMPTY_PROJECT: ProjectContext = {
 }
 
 export const EMPTY_SNAPSHOT: Snapshot = {
+  workbench_mode: 'codesys',
   app_version: '0.1.0',
   config_directory: '',
   model: {
@@ -446,7 +463,8 @@ export const EMPTY_SNAPSHOT: Snapshot = {
 }
 
 export const getSnapshot = () => invoke<Snapshot>('get_snapshot')
-export type ModelSettingsSnapshot = Pick<Snapshot, 'models' | 'model' | 'active_model_id' | 'config_directory'>
+export const setWorkbenchMode = (mode: WorkbenchMode) => invoke<ProjectContext>('set_workbench_mode', { mode })
+export type ModelSettingsSnapshot = Pick<Snapshot, 'models' | 'model' | 'active_model_id' | 'config_directory'> & { providers: ModelProviderSummary[] }
 export const getModelSettings = () => invoke<ModelSettingsSnapshot>('get_model_settings')
 export const selectProject = (path: string) => invoke<ProjectContext>('select_project', { path })
 export const pickProjectFolder = () => invoke<string | null>('pick_project_folder')
@@ -487,6 +505,7 @@ export const searchComposerMentions = (cwd: string, query: string, limit = 24) =
 
 function modelConfigPayload(form: ModelForm) {
   return {
+    provider_id: form.providerId ?? '',
     id: form.id,
     name: form.name,
     provider: form.provider,
@@ -506,6 +525,7 @@ export const importModels = (form: ModelForm, modelIds: string[]) => invoke<Mode
 
 export const discoverModels = (form: ModelForm) => invoke<ModelDiscoveryResult>('discover_models', {
   config: {
+    provider_id: form.providerId ?? '',
     id: form.id,
     name: form.name,
     provider: form.provider,
@@ -524,6 +544,14 @@ export const setActiveModel = (id: string) => invoke<ModelSummary>('set_active_m
 export const setModelEnabled = (id: string, enabled: boolean) => invoke<ModelSummary[]>('set_model_enabled', { id, enabled })
 export const duplicateModel = (id: string) => invoke<ModelSummary>('duplicate_model', { id })
 export const deleteModel = (id: string) => invoke<ModelSummary[]>('delete_model', { id })
+export const getModelProviders = () => invoke<ModelProviderSummary[]>('get_model_providers')
+export const saveModelProvider = (provider: { id: string; name: string; provider: ProviderKind; baseUrl: string; apiKey: string; enabled: boolean }) => invoke<ModelProviderSummary>('save_model_provider', {
+  provider: { id: provider.id, name: provider.name, provider: provider.provider, base_url: provider.baseUrl, api_key: provider.apiKey.trim() || null, enabled: provider.enabled },
+})
+export const deleteModelProvider = (id: string) => invoke<void>('delete_model_provider', { id })
+export const setModelProviderEnabled = (id: string, enabled: boolean) => invoke<ModelProviderSummary[]>('set_model_provider_enabled', { id, enabled })
+export const discoverProviderModels = (id: string) => invoke<ModelDiscoveryResult>('discover_provider_models', { id })
+export const importProviderModels = (id: string, modelIds: string[]) => invoke<ModelSummary[]>('import_provider_models', { id, model_ids: modelIds })
 
 export const saveMcp = (form: McpForm) => invoke<McpSummary[]>('configure_mcp', {
   request: {
@@ -598,6 +626,7 @@ export const runAgent = async (
       model_profile_id: options.modelProfileId?.trim() || undefined,
       reasoning_effort: options.reasoningEffort || undefined,
       collaboration_mode: options.collaborationMode || undefined,
+      workbench_mode: options.workbenchMode || undefined,
       skills: options.skills?.map((skill) => skill.path).filter(Boolean) || [],
       attachments: options.attachments?.map((attachment) => ({
         id: attachment.id,

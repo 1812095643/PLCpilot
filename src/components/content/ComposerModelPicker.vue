@@ -5,7 +5,7 @@ import type { ReasoningEffort } from '../../types/codex'
 import MaxEffortParticles from './MaxEffortParticles.vue'
 
 const props = defineProps<{
-  models: Array<{ id: string; name: string; model: string }>
+  models: Array<{ id: string; name: string; model: string; providerName?: string; providerId?: string }>
   selectedModel: string
   selectedReasoningEffort: ReasoningEffort | ''
   reasoningEfforts: ReasoningEffort[]
@@ -49,7 +49,7 @@ const searchRef = useTemplateRef<HTMLInputElement>('search')
 const dialogId = useId()
 const filteredModels = computed(() => {
   const text = query.value.trim().toLowerCase()
-  return models.value.filter((model) => `${model.name} ${model.model}`.toLowerCase().includes(text))
+  return models.value.filter((model) => `${model.name} ${model.model} ${model.providerName ?? ''}`.toLowerCase().includes(text))
 })
 const defaultLevel = computed(() => levels.value.includes('medium') ? 'medium' : levels.value[0] ?? 'none')
 const SLIDER_THUMB_SIZE = 30
@@ -164,7 +164,7 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocumentPoin
         <div class="model-list" role="listbox" aria-label="可用模型">
           <button v-for="model in filteredModels" :key="model.id" type="button" class="model-option" role="option"
             :aria-selected="model.id === props.selectedModel" :title="`${model.name || model.model} · ${model.model}`" @click="selectModel(model.id)">
-            <span class="model-option-copy"><span>{{ model.name || model.model }}</span><small v-if="model.name && model.name !== model.model">{{ model.model }}</small></span>
+            <span class="model-option-copy"><span>{{ model.name || model.model }}</span><small v-if="model.providerName || (model.name && model.name !== model.model)">{{ model.providerName }}{{ model.name && model.name !== model.model ? ` · ${model.model}` : '' }}</small></span>
             <IconCheck v-if="model.id === props.selectedModel" aria-hidden="true" />
           </button>
           <p v-if="!filteredModels.length" class="model-empty">没有匹配的模型</p>

@@ -12,6 +12,7 @@ pub struct RunHandle {
 /// 固定本轮工程与会话快照；窗口切换仅改变导航，不改变运行中工具的工作目录。
 pub async fn isolate_run(root: &AppState, request: &AgentRequest) -> Result<AppState, AppError> {
     let mut runtime = root.inner.lock().await.clone();
+    runtime.workbench_mode = request.workbench_mode.unwrap_or(runtime.workbench_mode);
     runtime.pending.clear();
     runtime.patches.clear();
     if let Some(path) = request.workspace_path.as_deref() {
@@ -29,6 +30,7 @@ pub async fn isolate_run(root: &AppState, request: &AgentRequest) -> Result<AppS
             }
         } else { AgentSessionSummary::default() };
     }
+    runtime.project = workbench::project_context(&runtime.project, runtime.workbench_mode);
     let mut state = AppState::new(runtime);
     state.isolated = true;
     state.running = root.running.clone();
