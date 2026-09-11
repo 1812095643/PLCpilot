@@ -2,6 +2,11 @@ runtime-stage/
 tmp/plc-pilot-runtime-cache/
 output/PLC-Pilot-Portable/runtime/
 release-stage/
+stone-mcp/dist/
+stone-mcp/__pycache__/
+output/PLC-Pilot-STone-MCP-*.zip
+output/PLC-Pilot-STone-MCP-*.zip.sig
+output/PLC-Pilot-Portable/stone-mcp/
 output/PLC-Pilot-Portable-*.zip.sig
 output/PLC-Pilot-Portable-*-win-x64.zip
 output/PLC-Pilot-Portable/portable.json

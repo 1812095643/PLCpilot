@@ -42,7 +42,15 @@ async function remove(server: McpConfig): Promise<void> {
   await perform(() => deleteMcpServer(server.id))
 }
 async function probe(server: McpConfig): Promise<void> { await perform(async () => { tools.value = await probeMcpServer(server.id); feedback.value = `已发现 ${tools.value.length} 个工具。` }) }
-async function install(entry: McpCatalogEntry): Promise<void> { await perform(async () => { await installMcpCatalog(entry.id); feedback.value = `${entry.name} 已加入 MCP 配置。首次连接时会由 npx 获取真实包。` }) }
+async function install(entry: McpCatalogEntry): Promise<void> {
+  await perform(async () => {
+    await installMcpCatalog(entry.id)
+    // STone 随软件分发，不能沿用外部商店的 npx 下载提示，否则用户会误判安装状态。
+    feedback.value = entry.id === 'plc-pilot-stone'
+      ? 'STone MCP 已启用。官方 API 可离线检索；工程自动化需安装 STone，可在编辑服务的环境变量中设置 STONE_CLI_PATH。'
+      : `${entry.name} 已加入 MCP 配置。首次连接时会获取并启动对应服务。`
+  })
+}
 onMounted(() => void perform(async () => { await load(); catalog.value = await listMcpCatalog() }))
 </script>
 

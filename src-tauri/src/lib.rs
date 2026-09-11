@@ -48,6 +48,7 @@ mod agent_control;
 mod settings;
 mod updates;
 mod generic_tools;
+mod diagnostics;
 use attachments::{prepare_attachments, read_local_file, AttachmentInput, CodexImageInput};
 
 const CODESYS_SKILL: &str = include_str!("../../skills/codesys-agent/SKILL.md");
@@ -680,7 +681,12 @@ impl AgentStreamSender {
     }
 
     fn send_payload(&self, payload: AgentStreamPayload) {
-        let _ = self.app.emit("agent-stream", payload);
+        // 流式正文只记录长度/生命周期，避免逐 token 日志拖慢界面或保存整段对话。
+        if payload.event_type != "delta" && payload.event_type != "session" {
+            diagnostics::info("agent.stream", json!({ "request_id": payload.request_id, "sequence": payload.sequence,
+                "type": payload.event_type, "phase": payload.phase, "event": payload.event, "error": payload.error }));
+        }
+        if let Err(error) = self.app.emit("agent-stream", payload) { diagnostics::error("agent.emit.error", json!({"error": error.to_string()})); }
     }
 
     fn send_event(&self, event: AgentEvent) {
@@ -1167,6 +1173,7 @@ fn load_runtime_state() -> RuntimeState {
     let mut state = RuntimeState::default();
     let mut active_project_path = None;
     if let Err(error) = ensure_runtime_layout() {
+        diagnostics::error("config.directory.error", json!({"error": error.to_string()}));
         eprintln!("PLC Pilot 运行目录未准备好：{error}");
     }
     let path = config_file_path();
@@ -1191,10 +1198,11 @@ fn load_runtime_state() -> RuntimeState {
                     state.projects = config.projects;
                     active_project_path = config.active_project_path;
                 }
-                Err(error) => eprintln!("PLC Pilot 配置读取未完成：{error}"),
+                Err(error) => { diagnostics::error("config.parse.error", json!({"error": error.to_string()})); eprintln!("PLC Pilot 配置读取未完成：{error}"); },
             }
         }
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            diagnostics::error("config.read.error", json!({"error": error.to_string()}));
             eprintln!("PLC Pilot 配置文件读取未完成：{error}");
         }
         Err(_) => {}
@@ -1263,10 +1271,11 @@ fn load_runtime_state() -> RuntimeState {
                 }
             }
         }
-        Err(error) => eprintln!("PLC Pilot 凭据读取未完成：{error}"),
+        Err(error) => { diagnostics::error("config.credentials.error", json!({"error": error.to_string()})); eprintln!("PLC Pilot 凭据读取未完成：{error}"); },
     }
     if needs_config_migration {
         if let Err(error) = persist_runtime_state(&state) {
+            diagnostics::error("config.migrate.error", json!({"error": error.to_string()}));
             eprintln!("PLC Pilot 旧配置迁移未完成：{error}");
         }
     }
@@ -2324,28 +2333,38 @@ impl serde::Serialize for AppError {
     where
         S: serde::Serializer,
     {
+        diagnostics::error("app.command.error", json!({"error": self.to_string()}));
         serializer.serialize_str(&self.to_string())
     }
 }
 
 pub fn run() {
-    let state = AppState::new(load_runtime_state());
+    diagnostics::init();
+    let runtime = load_runtime_state();
+    diagnostics::register_secrets(&serde_json::to_value(&runtime.model).unwrap_or_default());
+    for model in &runtime.models { diagnostics::register_secrets(&serde_json::to_value(model).unwrap_or_default()); }
+    for server in &runtime.mcp_servers { diagnostics::register_secrets(&serde_json::to_value(server).unwrap_or_default()); }
+    diagnostics::info("app.config.loaded", json!({"models": runtime.models.len(), "mcp_servers": runtime.mcp_servers.len(), "config_directory": app_data_root(), "config_exists": config_file_path().is_file(), "auth_exists": auth_file_path().is_file()}));
+    let state = AppState::new(runtime);
 
     tauri::Builder::default()
         .manage(state)
         .manage(updates::UpdateManager::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            diagnostics::info("app.ready", json!({}));
             let state = app.state::<AppState>().inner().clone();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = start_local_rpc(handle, state).await {
+                    diagnostics::error("app.rpc.start.error", json!({"error": error.to_string()}));
                     eprintln!("PLC Pilot 本机桥接服务未启动：{error}");
                 }
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            diagnostics::record_frontend_diagnostic,
             updates::get_update_preferences,
             updates::save_update_preferences,
             updates::check_app_update,
@@ -2417,6 +2436,7 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("PLC Pilot 启动失败");
+    diagnostics::info("app.exit", json!({}));
 }
 
 #[tauri::command]
@@ -5158,6 +5178,23 @@ fn resolve_runtime_command(command: &str) -> String {
         .unwrap_or_else(|| trimmed.to_string())
 }
 
+/// MCP 配置保存相对资源标识，启动时再定位，避免升级/移动便携目录后路径失效。
+/// 发布版只允许包内资源；源码目录只在 debug 模式回退，防止构建机依赖掩盖漏包。
+fn resolve_mcp_argument(argument: &str) -> Result<String, AppError> {
+    if argument != "__PLC_PILOT_STONE_MCP__" { return Ok(argument.to_string()); }
+    if let Some(root) = std::env::current_exe().ok().and_then(|path| path.parent().map(PathBuf::from)) {
+        for candidate in [root.join("stone-mcp/stone-mcp-server.mjs"), root.join("resources/stone-mcp/stone-mcp-server.mjs")] {
+            if candidate.is_file() { return Ok(candidate.to_string_lossy().into_owned()); }
+        }
+    }
+    #[cfg(debug_assertions)]
+    {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../stone-mcp/dist/stone-mcp-server.mjs");
+        if path.is_file() { return Ok(path.to_string_lossy().into_owned()); }
+    }
+    Err(AppError::Configuration("安装目录缺少 STone MCP 资源，请重新安装完整的 PLC Pilot；开发模式请先运行 npm run build:stone-mcp。".into()))
+}
+
 fn bundled_runtime_path_env(existing: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
     let mut paths = Vec::new();
     let user_runtime = app_data_root().join("runtime");
@@ -5184,6 +5221,7 @@ fn bundled_runtime_path_env(existing: Option<std::ffi::OsString>) -> Option<std:
 
 /// 给 Agent 和 MCP 子进程配置相同的包内运行时与可写依赖目录，不改系统 PATH。
 fn configure_bundled_runtime(command: &mut Command, path_override: Option<std::ffi::OsString>) {
+    command.env("PLC_PILOT_LOG_DIR", diagnostics::root()).env("PLC_PILOT_RUN_ID", diagnostics::run_id());
     if let Some(path) = bundled_runtime_path_env(path_override) { command.env("PATH", path); }
     let root = app_data_root();
     if bundled_runtime_file("runtime/node/node.exe").is_some() {
@@ -5251,6 +5289,8 @@ async fn run_pi_host(
     }
     let project_cwd = agent_cwd(project);
     let cwd = dunce::simplified(&project_cwd);
+    diagnostics::register_secrets(&serde_json::to_value(model).unwrap_or_default());
+    diagnostics::info("agent.host.start", json!({"executable": agent_node_command(app), "script": script, "cwd": cwd, "request_id": request.request_id}));
     let mut command = Command::new(agent_node_command(app));
     configure_bundled_runtime(&mut command, None);
     command
@@ -5281,11 +5321,12 @@ async fn run_pi_host(
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
             while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                diagnostics::warn("agent.stderr", json!({"text": &line}));
                 let mut current = log.lock().await;
                 current.push_str(&line);
                 if current.len() > 8000 {
-                    let keep_from = current.len().saturating_sub(8000);
-                    *current = current[keep_from..].to_string();
+                    // stderr 含中文时按字节切片可能落在 UTF-8 字符中间并触发 panic。
+                    *current = diagnostics::clip(&current, 4000);
                 }
                 line.clear();
             }
@@ -5494,6 +5535,7 @@ async fn run_pi_host(
         }).await;
     }
     if let Some(task) = steering_task { task.abort(); }
+    diagnostics::info("agent.host.finish", json!({"request_id": request_id, "error": result.as_ref().err().map(ToString::to_string), "pid": child.id()}));
     let _ = child.kill().await;
     if let Err(AppError::Internal(message)) = &result {
         if message.starts_with("PI_HOST_UNAVAILABLE:") {
@@ -8934,6 +8976,21 @@ fn mcp_catalog_entries() -> Vec<McpCatalogEntry> {
     let command = if cfg!(windows) { "npx.cmd" } else { "npx" };
     vec![
         McpCatalogEntry {
+            id: "plc-pilot-stone".into(),
+            name: "CAREL STone（内置）".into(),
+            description: "STone 工程自动化与官方 API 参考：33 个 IronPython 方法、8 个 CLI 入口、1,138 个控制器 ST 库条目。".into(),
+            source: "PLC Pilot 封装 · CAREL 官方资料".into(),
+            license: "STone 自动化遵循 CAREL 许可".into(),
+            package: "PLC Pilot 内置".into(),
+            command: "node".into(),
+            args: vec!["__PLC_PILOT_STONE_MCP__".into()],
+            transport: "stdio".into(),
+            requires_workspace: false,
+            requires_credentials: false,
+            requires_codesys: false,
+            notes: "无需下载依赖。真实工程操作需安装 STone；可在环境变量中设置 STONE_CLI_PATH。没有 STone 时仍可检索官方 API。".into(),
+        },
+        McpCatalogEntry {
             id: "official-filesystem".into(),
             name: "Filesystem（官方）".into(),
             description: "官方 MCP 文件系统服务，安装后限制在当前 PLC 工程目录。".into(),
@@ -9379,6 +9436,15 @@ fn split_qualified_tool(value: &str) -> Option<(String, String)> {
 fn is_mutating_tool(name: &str) -> bool {
     if name == "exec_command" { return true; }
     let name = name.to_lowercase();
+    let local_name = name.rsplit("__").next().unwrap_or(&name);
+    if local_name.starts_with("stone_") {
+        // 原关键词判断漏掉 AddFile、Build、Connect、ClearBinaries、许可激活等
+        // 实际会修改工程/目标的 STone 调用。直接复用 MCP 目录生成的完整策略；
+        // 新增而未登记的 stone_ 工具默认要求审批，完全访问模式仍由既有流程处理。
+        static STONE_POLICY: std::sync::OnceLock<HashMap<String, bool>> = std::sync::OnceLock::new();
+        let policy = STONE_POLICY.get_or_init(|| serde_json::from_str(include_str!("../../stone-mcp/tool-policy.json")).expect("内置 STone 工具策略必须是有效 JSON"));
+        return policy.get(local_name).copied().unwrap_or(true);
+    }
     [
         "write",
         "edit",
@@ -9715,6 +9781,7 @@ struct McpClient {
 /// 导致 CODESYS 工程状态、打开项目和 ScriptEngine 上下文全部丢失。该会话只在
 /// 当前 Agent 轮次的 registry 中存在，轮次结束由 shutdown_all 释放，不形成常驻进程。
 struct McpSession {
+    server_id: String,
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
@@ -9732,7 +9799,7 @@ impl McpSession {
         let mut child = spawn_mcp(config).await?;
         let stdin = child.stdin.take().ok_or_else(|| AppError::Mcp("MCP stdin 不可用".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| AppError::Mcp("MCP stdout 不可用".into()))?;
-        let session = Self { child: Mutex::new(child), stdin: Mutex::new(stdin), stdout: Mutex::new(BufReader::new(stdout)), request_lock: Mutex::new(()), next_id: AtomicU64::new(2) };
+        let session = Self { server_id: config.id.clone(), child: Mutex::new(child), stdin: Mutex::new(stdin), stdout: Mutex::new(BufReader::new(stdout)), request_lock: Mutex::new(()), next_id: AtomicU64::new(2) };
         let initialize = json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": { "protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "plc-pilot", "version": APP_VERSION} }
@@ -9745,6 +9812,18 @@ impl McpSession {
     }
 
     async fn request_raw(&self, value: Value, expected_id: u64) -> Result<Value, AppError> {
+        let started = std::time::Instant::now();
+        diagnostics::register_secrets(&value);
+        diagnostics::info("mcp.request", json!({"server_id": self.server_id, "request_id": expected_id, "request": &value}));
+        let result = self.request_raw_inner(value, expected_id).await;
+        match &result {
+            Ok(value) => diagnostics::info("mcp.response", json!({"server_id": self.server_id, "request_id": expected_id, "duration_ms": started.elapsed().as_millis(), "response": value})),
+            Err(error) => diagnostics::error("mcp.request.error", json!({"server_id": self.server_id, "request_id": expected_id, "duration_ms": started.elapsed().as_millis(), "error": error.to_string()})),
+        }
+        result
+    }
+
+    async fn request_raw_inner(&self, value: Value, expected_id: u64) -> Result<Value, AppError> {
         let _guard = self.request_lock.lock().await;
         let mut stdin = self.stdin.lock().await;
         write_json_stdin(&mut stdin, value).await?;
@@ -9753,6 +9832,7 @@ impl McpSession {
         loop {
             let response = read_json_response(&mut *stdout).await?;
             if response.get("id").and_then(Value::as_u64) == Some(expected_id) { return Ok(response); }
+            diagnostics::info("mcp.notification", json!({"server_id": self.server_id, "request_id": expected_id, "notification": response}));
         }
     }
 
@@ -9764,7 +9844,9 @@ impl McpSession {
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolCallResult, AppError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let response = self.request_raw(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}), id).await?;
+        // STone 编译/测试可能持续数分钟。请求官方 MCP 进度通知，使读取超时按
+        // 实际收到的进度续期；最终结果仍只接受同一 request id，不把通知当返回值。
+        let response = self.request_raw(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":{"progressToken":id}}}), id).await?;
         if let Some(error) = response.get("error") { return Err(AppError::Mcp(error.to_string())); }
         Ok(ToolCallResult { content: response.get("result").and_then(|result| result.get("content")).and_then(Value::as_array).cloned().unwrap_or_default(), is_error: response.get("result").and_then(|result| result.get("isError")).and_then(Value::as_bool).unwrap_or(false) })
     }
@@ -9777,7 +9859,11 @@ impl McpSession {
 
 impl McpSessionRegistry {
     async fn call_tool(&self, config: &McpServerConfig, name: &str, arguments: Value) -> Result<ToolCallResult, AppError> {
-        let session = if let Some(session) = self.sessions.lock().await.get(&config.id).cloned() { session } else {
+        // Rust 2021 中 if let 条件里的临时 MutexGuard 会存活到整个 if/else 结束。
+        // 原先首次创建会话后，在 else 中再次获取同一把锁，导致 MCP 已启动却永远
+        // 发不出第一条工具调用。先用独立语句释放查询锁，再进行初始化和注册。
+        let existing_session = { self.sessions.lock().await.get(&config.id).cloned() };
+        let session = if let Some(session) = existing_session { session } else {
             let created = Arc::new(McpSession::start(config).await?);
             let mut sessions = self.sessions.lock().await;
             if let Some(existing) = sessions.get(&config.id).cloned() {
@@ -9854,6 +9940,20 @@ impl McpClient {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, AppError> {
+        let started = std::time::Instant::now();
+        let request_id = Uuid::new_v4().to_string();
+        diagnostics::register_secrets(&serde_json::to_value(&self.config).unwrap_or_default());
+        diagnostics::register_secrets(&params);
+        diagnostics::info("mcp.client.request", json!({"server_id": self.config.id, "request_id": request_id, "method": method, "params": &params, "transport": mcp_transport(&self.config)}));
+        let result = self.request_inner(method, params).await;
+        match &result {
+            Ok(value) => diagnostics::info("mcp.client.response", json!({"server_id": self.config.id, "request_id": request_id, "duration_ms": started.elapsed().as_millis(), "tool_count": value.get("tools").and_then(Value::as_array).map(Vec::len), "response": if method == "tools/list" { Value::Null } else { value.clone() }})),
+            Err(error) => diagnostics::error("mcp.client.error", json!({"server_id": self.config.id, "request_id": request_id, "duration_ms": started.elapsed().as_millis(), "error": error.to_string()})),
+        }
+        result
+    }
+
+    async fn request_inner(&self, method: &str, params: Value) -> Result<Value, AppError> {
         if mcp_transport(&self.config) == "http" {
             return self.request_http(method, params).await;
         }
@@ -10032,13 +10132,16 @@ fn parse_http_json(body: &str) -> Result<Value, AppError> {
 }
 
 async fn spawn_mcp(config: &McpServerConfig) -> Result<Child, AppError> {
+    diagnostics::register_secrets(&serde_json::to_value(config).unwrap_or_default());
     let command_path = resolve_runtime_command(&config.command);
+    let arguments = config.args.iter().map(|argument| resolve_mcp_argument(argument)).collect::<Result<Vec<_>, _>>()?;
+    diagnostics::info("mcp.process.start", json!({"server_id": config.id, "executable": command_path, "args": &arguments}));
     let mut command = Command::new(&command_path);
     let path_override = config.env.iter().find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
         .map(|(_, value)| std::ffi::OsString::from(value));
     configure_bundled_runtime(&mut command, path_override.clone());
     command
-        .args(&config.args)
+        .args(&arguments)
         .envs(&config.env)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
@@ -10049,9 +10152,38 @@ async fn spawn_mcp(config: &McpServerConfig) -> Result<Child, AppError> {
     }
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
-    command
-        .spawn()
-        .map_err(|error| AppError::Mcp(format!("启动 {} 未完成：{error}", config.command)))
+    let mut child = command.spawn().map_err(|error| {
+        diagnostics::error("mcp.process.start.error", json!({"server_id": config.id, "error": error.to_string()}));
+        AppError::Mcp(format!("启动 {} 未完成：{error}", config.command))
+    })?;
+    let pid = child.id();
+    diagnostics::info("mcp.process.started", json!({"server_id": config.id, "pid": pid}));
+    // 原来只创建 stderr 管道而不读取：既丢失厂商诊断，又可能在缓冲区满时阻塞 MCP。
+    // 读取所有服务的 stderr；按完整行过滤凭据，异常字节使用替换字符保留其余诊断。
+    if let Some(mut stderr) = child.stderr.take() {
+        let server_id = config.id.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 8192];
+            let mut pending = Vec::new();
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        pending.extend_from_slice(&buffer[..count]);
+                        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                            diagnostics::warn("mcp.stderr", json!({"server_id": server_id, "pid": pid, "text": String::from_utf8_lossy(&pending[..end])}));
+                            pending.drain(..=end);
+                        }
+                        if pending.len() > 128 * 1024 { diagnostics::warn("mcp.stderr.truncated", json!({"server_id": server_id, "pid": pid, "bytes": pending.len()})); pending.clear(); }
+                    },
+                    Err(error) => { diagnostics::error("mcp.stderr.error", json!({"server_id": server_id, "pid": pid, "error": error.to_string()})); break; },
+                }
+            }
+            if !pending.is_empty() { diagnostics::warn("mcp.stderr", json!({"server_id": server_id, "pid": pid, "text": String::from_utf8_lossy(&pending)})); }
+            diagnostics::info("mcp.stderr.closed", json!({"server_id": server_id, "pid": pid}));
+        });
+    }
+    Ok(child)
 }
 
 async fn write_json_stdin(stdin: &mut ChildStdin, value: Value) -> Result<(), AppError> {
@@ -10070,6 +10202,7 @@ async fn write_json(child: &mut Child, value: Value) -> Result<(), AppError> {
 }
 
 async fn kill_child_tree(child: &mut Child) {
+    diagnostics::info("process.stop", json!({"pid": child.id()}));
     #[cfg(windows)]
     if let Some(pid) = child.id() {
         let mut command = Command::new("taskkill");
@@ -10141,6 +10274,7 @@ where
                 return Ok(value);
             }
             // 允许服务把诊断文本误写到 stdout；找到下一条 JSON-RPC 消息后继续。
+            diagnostics::warn("mcp.non_protocol_stdout", json!({"text": first}));
         }
     })
     .await
@@ -11051,5 +11185,45 @@ mod tests {
         assert!(matches!(resolve_local_path(&file_path, "unknown"), Err(AppError::Configuration(_))));
         assert!(matches!(resolve_local_path("not-a-local-path.txt", "reveal"), Err(AppError::Configuration(_))));
         assert!(matches!(resolve_local_path(&directory.path().join("missing.txt").to_string_lossy(), "reveal"), Err(AppError::Configuration(_))));
+    }
+
+    #[test]
+    fn stone_tools_use_complete_approval_policy() {
+        let policy: HashMap<String, bool> = serde_json::from_str(include_str!("../../stone-mcp/tool-policy.json")).unwrap();
+        assert_eq!(policy.len(), 53);
+        for (name, expected) in policy {
+            assert_eq!(is_mutating_tool(&name), expected, "{name}");
+            assert_eq!(is_mutating_tool(&format!("mcp__plc-pilot-stone__{name}")), expected, "{name}");
+        }
+        assert!(is_mutating_tool("stone_project_add_file"));
+        assert!(is_mutating_tool("stone_target_clear_binaries"));
+        assert!(is_mutating_tool("stone_unknown_operation"));
+        assert!(!is_mutating_tool("stone_api_search"));
+    }
+
+    #[tokio::test]
+    async fn stone_builtin_bundle_works_through_actual_app_mcp_client() {
+        let log_directory = tempfile::tempdir().expect("创建隔离日志目录");
+        let entry = mcp_catalog_entries().into_iter().find(|entry| entry.id == "plc-pilot-stone").unwrap();
+        let server = McpServerConfig { id: entry.id, name: entry.name, command: entry.command, args: entry.args,
+            env: HashMap::from([("STONE_CLI_PATH".into(), "C:\\plc-pilot-not-installed\\SToneCLI.exe".into()), ("PLC_PILOT_LOG_DIR".into(), log_directory.path().to_string_lossy().into_owned())]), enabled: true, transport: entry.transport, url: None, headers: HashMap::new() };
+        let tools = McpClient::new(server.clone()).list_tools().await.expect("包内 MCP 应可独立发现工具");
+        assert_eq!(tools.len(), 53);
+        let sessions = McpSessionRegistry::default();
+        let result = timeout(Duration::from_secs(15), sessions.call_tool(&server, "stone_environment", json!({}))).await.expect("首次工具调用不得死锁").expect("读取真实 MCP 环境工具");
+        assert!(!result.is_error);
+        let text = result.content[0].get("text").and_then(Value::as_str).unwrap();
+        let environment: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(environment["automationAvailable"], false);
+        assert_eq!(environment["coverage"]["controllerItems"], 1138);
+        let status = timeout(Duration::from_secs(15), sessions.call_tool(&server, "stone_session_status", json!({}))).await.expect("复用工具调用不得死锁").expect("复用 MCP 会话");
+        assert!(!status.is_error);
+        assert_eq!(sessions.sessions.lock().await.len(), 1);
+        let error_result = sessions.call_tool(&server, "stone_solution_build", json!({})).await.expect("厂商未安装应返回工具错误");
+        assert!(error_result.is_error);
+        let log_text = fs::read_dir(log_directory.path().join("stone-mcp")).unwrap().filter_map(Result::ok)
+            .map(|entry| fs::read_to_string(entry.path()).unwrap()).collect::<String>();
+        assert!(log_text.contains("tool.error") && log_text.contains("没有找到 SToneCLI"));
+        sessions.shutdown_all().await;
     }
 }

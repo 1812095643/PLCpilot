@@ -42,6 +42,8 @@ jobs:
           if (!$env:TAURI_SIGNING_PRIVATE_KEY) { throw '请先配置 TAURI_SIGNING_PRIVATE_KEY 仓库密钥。' }
           npm run build
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node --test shared/diagnostics.test.mjs stone-mcp/test/stone.test.mjs agent-host/context-memory.test.mjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --manifest-path src-tauri/Cargo.toml --lib
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npx tauri build --config '{"build":{"beforeBuildCommand":""}}'
@@ -51,12 +53,17 @@ jobs:
           $version = (Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
           npx tauri signer sign "output/PLC-Pilot-Portable-$version-win-x64.zip"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run package:stone-mcp
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $stoneVersion = (Get-Content stone-mcp/package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          npx tauri signer sign "output/PLC-Pilot-STone-MCP-$stoneVersion.zip"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node scripts/prepare-release.mjs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
           name: Windows-发布文件
-          path: release-stage/*
+          path: release-stage/
           retention-days: 7
       - name: 上传完整产物后发布
         env:
@@ -70,7 +77,8 @@ jobs:
             gh release create $tag --verify-tag --draft --title "PLC Pilot $tag" --notes-file release-notes.md
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
           }
-          $assets = @(Get-ChildItem release-stage -File | ForEach-Object FullName)
+          $version = (Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          $assets = @(Get-ChildItem (Join-Path release-stage $version) -File | ForEach-Object FullName)
           gh release upload $tag @assets --clobber
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           gh release edit $tag --draft=false --latest

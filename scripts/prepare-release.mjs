@@ -10,7 +10,7 @@ const cargo = await readFile(join(root, 'src-tauri/Cargo.toml'), 'utf8')
 if (config.version !== version || !cargo.includes(`version = "${version}"`)) throw new Error('前端、Tauri、Rust 的发布版本必须一致。')
 if (process.env.GITHUB_REF_NAME && process.env.GITHUB_REF_NAME !== `v${version}`) throw new Error('发布标签必须与 package.json 中的版本一致。')
 
-const destination = join(root, 'release-stage')
+const destination = join(root, 'release-stage', version)
 await mkdir(destination, { recursive: true })
 const notes = (await readFile(join(root, 'release-notes.md'), 'utf8')).trim()
 const manifest = { version, notes, pub_date: new Date().toISOString(), platforms: {} }
@@ -36,6 +36,8 @@ manifest.platforms['windows-x86_64-nsis'] = await installer('nsis', '.exe', `PLC
 manifest.platforms['windows-x86_64-msi'] = await installer('msi', '.msi', `PLC-Pilot-${version}-x64.msi`)
 manifest.platforms['windows-x86_64'] = manifest.platforms['windows-x86_64-nsis']
 manifest.platforms['windows-x86_64-portable'] = await prepareAsset(join(root, `output/PLC-Pilot-Portable-${version}-win-x64.zip`), `PLC-Pilot-Portable-${version}-win-x64.zip`)
+const { version: stoneVersion } = JSON.parse(await readFile(join(root, 'stone-mcp/package.json'), 'utf8'))
+await prepareAsset(join(root, `output/PLC-Pilot-STone-MCP-${stoneVersion}.zip`), `PLC-Pilot-STone-MCP-${stoneVersion}.zip`)
 await writeFile(join(destination, 'latest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
 await writeFile(join(destination, 'SHA256SUMS.txt'), `${checksums.join('\n')}\n`)
 console.log(`已生成 ${version} 的安装版、便携版及签名更新清单。`)

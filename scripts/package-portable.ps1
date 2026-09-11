@@ -5,13 +5,14 @@ $portableDirectory = Join-Path $projectRoot 'output\PLC-Pilot-Portable'
 $runtimeSource = Join-Path $projectRoot 'runtime-stage'
 $releaseExecutable = Join-Path $projectRoot 'src-tauri\target\release\plc-pilot.exe'
 $agentBundle = Join-Path $projectRoot 'agent-host\pi-agent-host.bundle.mjs'
+$stoneSource = Join-Path $projectRoot 'stone-mcp\dist'
 # Windows PowerShell 5 默认按本地代码页读文本；JSON 含中文时必须显式使用 UTF-8。
 $version = (Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Encoding UTF8 -Raw | ConvertFrom-Json).version
 $archive = Join-Path $projectRoot ('output\PLC-Pilot-Portable-' + $version + '-win-x64.zip')
 
 # 便携包曾在安装包重建后仍保留旧 EXE；构建链现在统一复制本次 release，
 # 并重建 runtime 目录，防止旧版 Python 路径和缓存混入新包。
-foreach ($required in @($releaseExecutable, $agentBundle, (Join-Path $runtimeSource 'runtime-manifest.json'))) {
+foreach ($required in @($releaseExecutable, $agentBundle, (Join-Path $runtimeSource 'runtime-manifest.json'), (Join-Path $stoneSource 'stone-mcp-server.mjs'), (Join-Path $stoneSource 'bridge.py'), (Join-Path $stoneSource 'data\official-api.json.gz'))) {
     if (!(Test-Path -LiteralPath $required -PathType Leaf)) { throw ('缺少构建产物：' + $required) }
 }
 New-Item -ItemType Directory -Path $portableDirectory -Force | Out-Null
@@ -27,6 +28,9 @@ if (Test-Path -LiteralPath $runtimeTarget) {
 Copy-Item -LiteralPath $runtimeSource -Destination $runtimeTarget -Recurse
 Copy-Item -LiteralPath $releaseExecutable -Destination (Join-Path $portableDirectory 'plc-pilot.exe') -Force
 Copy-Item -LiteralPath $agentBundle -Destination (Join-Path $portableDirectory 'pi-agent-host.bundle.mjs') -Force
+$stoneTarget = Join-Path $portableDirectory 'stone-mcp'
+New-Item -ItemType Directory -Path $stoneTarget -Force | Out-Null
+Get-ChildItem -LiteralPath $stoneSource | Copy-Item -Destination $stoneTarget -Recurse -Force
 # EXE 会被 Tauri 写入安装器类型；独立标记才能可靠区分便携目录与安装版。
 @{ product = 'PLC Pilot'; version = $version; format = 1 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $portableDirectory 'portable.json') -Encoding UTF8
 Compress-Archive -LiteralPath $portableDirectory -DestinationPath $archive -CompressionLevel Optimal -Force

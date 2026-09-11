@@ -1,0 +1,10 @@
+{
+  "name": "@plc-pilot/stone-mcp",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "基于 CAREL 官方资料的 STone 工程自动化与完整 API 参考 MCP",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node entry.mjs", "test": "node --test test/*.test.mjs" },
+  "dependencies": { "@modelcontextprotocol/sdk": "1.30.0" }
+}

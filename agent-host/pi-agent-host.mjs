@@ -4,6 +4,15 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { hideProcessWindows, createApprovedTools, executeApprovedCommand, abortApprovedCommand, recordApproval } from "./builtin-tools.mjs";
 import { createProjectMemory, createContextExtension, contextSettings, redactContext } from "./context-memory.mjs";
+import { createDiagnosticLogger, registerDiagnosticSecrets, observeProcess } from "../shared/diagnostics.mjs";
+
+const diagnosticLog = createDiagnosticLogger("agent-host");
+observeProcess(diagnosticLog);
+let diagnosticRequest = null;
+let diagnosticStarted = Date.now();
+let diagnosticChunks = 0;
+let diagnosticCharacters = 0;
+let diagnosticLastStream = 0;
 
 import { InMemoryCredentialStore, Type } from "@earendil-works/pi-ai";
 import {
@@ -45,6 +54,22 @@ let previousGlobalFetch = null;
 const nativeFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
 
 function writeMessage(message) {
+  if (message.type === "delta") {
+    diagnosticChunks += 1;
+    diagnosticCharacters += String(message.delta ?? "").length;
+    if (diagnosticChunks === 1 || Date.now() - diagnosticLastStream >= 5000) {
+      diagnosticLastStream = Date.now();
+      diagnosticLog.info("agent.streaming", { requestId: diagnosticRequest, chunks: diagnosticChunks, characters: diagnosticCharacters, elapsedMs: Date.now() - diagnosticStarted });
+    }
+  } else if (message.type === "event") {
+    const event = message.event;
+    diagnosticLog.info("agent.activity", { requestId: diagnosticRequest, kind: event.kind, id: event.id, title: event.title, status: event.status, tool: event.tool,
+      detail: ["tool", "command", "approval", "safety", "retry"].includes(event.kind) ? event.detail : undefined });
+  } else if (["ready", "error", "result", "tool_request", "stream_start", "thinking"].includes(message.type)) {
+    diagnosticLog[message.type === "error" ? "error" : "info"](`agent.${message.type}`, { requestId: diagnosticRequest, phase: message.phase,
+      error: message.message, tool: message.tool_name, toolCallId: message.tool_call_id, arguments: message.arguments,
+      characters: String(message.text ?? "").length, chunks: diagnosticChunks, elapsedMs: Date.now() - diagnosticStarted });
+  }
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
@@ -169,6 +194,7 @@ function retryAwareFetch(input, init) {
   retryStatusCode = null;
   const result = nativeFetch(input, init);
   return Promise.resolve(result).then((response) => {
+    diagnosticLog.info("model.http.response", { requestId: diagnosticRequest, status: response.status, url: typeof input === "string" ? input : input?.url, contentType: response.headers.get("content-type") });
     if (!response.ok) {
       retryStatusCode = response.status;
       retryAfterHintMs = parseRetryAfterMs(response.headers);
@@ -392,10 +418,16 @@ function makeToolDefinition(tool, sendToolRequest) {
 
 function waitForTool(request, signal) {
   return new Promise((resolve, reject) => {
+    // STone 的构建/测试支持显式长超时；原固定 120 秒会在厂商仍在编译时提前
+    // 丢弃结果。仅对 STone 按其已校验的 timeoutMs 加收尾余量，保留其他工具契约。
+    const requestedTimeout = Number(request.arguments?.timeoutMs);
+    const timeoutMs = String(request.tool_name).startsWith("stone_") && Number.isFinite(requestedTimeout)
+      ? Math.max(TOOL_TIMEOUT_MS, Math.min(3600000, Math.max(1000, requestedTimeout)) + 60000)
+      : TOOL_TIMEOUT_MS;
     const timer = setTimeout(() => {
       pendingToolRequests.delete(request.request_id);
-      reject(new Error("PLC 工具响应超过 120 秒仍未返回"));
-    }, TOOL_TIMEOUT_MS);
+      reject(new Error(`PLC 工具响应超过 ${Math.round(timeoutMs / 1000)} 秒仍未返回`));
+    }, timeoutMs);
     const abort = () => {
       clearTimeout(timer);
       pendingToolRequests.delete(request.request_id);
@@ -938,6 +970,18 @@ async function runCompact(config) {
 }
 
 async function handleCommand(command) {
+  registerDiagnosticSecrets(command);
+  if (command.type === "run") {
+    diagnosticRequest = command.request_id ?? null;
+    diagnosticStarted = Date.now(); diagnosticChunks = 0; diagnosticCharacters = 0;
+    diagnosticLog.info("agent.run", { requestId: diagnosticRequest, cwd: command.cwd, action: command.action,
+      provider: command.model?.provider, model: command.model?.model, baseUrl: command.model?.base_url,
+      messageCharacters: String(command.message ?? "").length, attachments: command.attachments?.length ?? 0, mcpTools: command.mcp_tools?.length ?? 0 });
+  } else if (command.type === "tool_result") {
+    diagnosticLog.info("agent.tool.result", { requestId: diagnosticRequest, toolRequestId: command.request_id, isError: command.is_error, decision: command.decision, content: command.content });
+  } else if (["abort", "shutdown", "steer", "record_approval", "execute_approved"].includes(command.type)) {
+    diagnosticLog.info(`agent.${command.type}`, { requestId: diagnosticRequest, arguments: command.arguments });
+  }
   if (command.type === "steer") {
     pendingSteering.push(command);
     await flushSteering();

@@ -1,14 +1,19 @@
 {
   "name": "plc-pilot",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "面向 CODESYS 3.5.22 的 Codex 风格 PLC 桌面工作台",
   "type": "module",
+  "workspaces": ["stone-mcp"],
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build:agent-host": "node scripts/build-agent-host.mjs",
     "prepare-runtime": "node scripts/prepare-runtime.mjs",
-    "build": "npm run build:agent-host && npm run prepare-runtime && vue-tsc --noEmit -p tsconfig.app.json && vite build",
+    "build:stone-mcp": "node scripts/build-stone-mcp.mjs",
+    "test:stone-mcp": "node --test stone-mcp/test/*.test.mjs",
+    "test:diagnostics": "node --test shared/diagnostics.test.mjs",
+    "package:stone-mcp": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-stone-mcp.ps1",
+    "build": "npm run build:agent-host && npm run build:stone-mcp && npm run prepare-runtime && vue-tsc --noEmit -p tsconfig.app.json && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
@@ -22,6 +27,7 @@
     "@tabler/icons-vue": "^3.46.0",
     "@tauri-apps/api": "^2.8.0",
     "highlight.js": "^11.11.1",
+    "pino": "10.3.1",
     "vue": "^3.5.13"
   },
   "devDependencies": {
