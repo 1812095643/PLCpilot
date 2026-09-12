@@ -27,6 +27,10 @@ use walkdir::WalkDir;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// 工具发现只负责建立工具目录，不应像真实工具调用一样等待数十秒。
+/// 不可用服务会保留诊断并在后台再次尝试，不阻塞模式切换和首字节响应。
+const MCP_DISCOVERY_TIMEOUT_SECONDS: u64 = 3;
+const MCP_DISCOVERY_GRACE_MILLISECONDS: u64 = 1_200;
 const MAX_AGENT_TURNS: usize = 8;
 const PI_HOST_TIMEOUT_SECONDS: u64 = 240;
 const MAX_SESSION_PREVIEW_MESSAGES: usize = 80;
@@ -879,6 +883,8 @@ pub struct AppState {
     pub abort_requested: Arc<AtomicBool>,
     pub abort_notify: Arc<tokio::sync::Notify>,
     pub running: Arc<Mutex<HashMap<String, agent_runtime::RunHandle>>>,
+    /// 按工作模式和 MCP 配置缓存工具目录，避免快照和每轮 Agent 重复握手。
+    pub mcp_catalog: Arc<Mutex<McpCatalogCache>>,
     pub isolated: bool,
 }
 
@@ -890,9 +896,20 @@ impl AppState {
             abort_requested: Arc::new(AtomicBool::new(false)),
             abort_notify: Arc::new(tokio::sync::Notify::new()),
             running: Arc::new(Mutex::new(HashMap::new())),
+            mcp_catalog: Arc::new(Mutex::new(McpCatalogCache::default())),
             isolated: false,
         }
     }
+}
+
+#[derive(Default)]
+pub struct McpCatalogCache {
+    fingerprint: String,
+    loading: bool,
+    ready: bool,
+    summaries: Vec<McpSummary>,
+    tools: Vec<McpTool>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -2896,7 +2913,15 @@ async fn configure_mcp_inner(
     state.inner.lock().await.mcp_servers = request.servers;
     let persisted = state.inner.lock().await.clone();
     persist_runtime_state(&persisted)?;
-    Ok(summarize_mcp_servers(state.inner.clone()).await)
+    let mode = persisted.workbench_mode;
+    let servers = persisted
+        .mcp_servers
+        .iter()
+        .filter(|server| workbench::tool_allowed(mode, &server.id, ""))
+        .cloned()
+        .collect::<Vec<_>>();
+    *state.mcp_catalog.lock().await = McpCatalogCache::default();
+    Ok(snapshot_mcp_catalog(&state.mcp_catalog, mode, &servers).await.0)
 }
 
 #[tauri::command]
@@ -3546,9 +3571,9 @@ async fn sync_current_project_inner(state: &AppState) -> Result<ProjectContext, 
     if state.isolated { return Ok(current); }
     let mode = state.inner.lock().await.workbench_mode;
     if mode != workbench::WorkbenchMode::Codesys {
-        let project = workbench::project_context(&current, mode);
-        state.inner.lock().await.project = project.clone();
-        return Ok(project);
+        // 自由聊天/Stone 的后台同步不需要每 4 秒重扫工作区；用户可用 `/scan`
+        // 或显式工程操作触发一次真实扫描，消息提交也只使用已准备好的上下文。
+        return Ok(current);
     }
     let synced = sync_project_from_codesys(current.clone());
     if current.path.as_ref().zip(synced.path.as_ref()).is_some_and(|(current, synced)| !session_paths_equal(current, synced)) { return Ok(current); }
@@ -4163,17 +4188,19 @@ async fn list_mcp_tools(state: State<'_, AppState>) -> Result<Vec<ToolSummary>, 
 }
 
 async fn list_mcp_tools_inner(state: &AppState) -> Result<Vec<ToolSummary>, AppError> {
-    let servers = state.inner.lock().await.mcp_servers.clone();
-    let mut all_tools = builtin_tools()
-        .into_iter()
-        .map(tool_summary_from_mcp)
-        .collect::<Vec<_>>();
-    for server in servers.into_iter().filter(|server| server.enabled) {
-        if let Ok(tools) = McpClient::new(server.clone()).list_tools().await {
-            all_tools.extend(tools.into_iter().map(tool_summary_from_mcp));
-        }
-    }
-    Ok(all_tools)
+    let (mode, servers) = {
+        let guard = state.inner.lock().await;
+        let mode = guard.workbench_mode;
+        let servers = guard
+            .mcp_servers
+            .iter()
+            .filter(|server| workbench::tool_allowed(mode, &server.id, ""))
+            .cloned()
+            .collect::<Vec<_>>();
+        (mode, servers)
+    };
+    let (_, tools) = snapshot_mcp_catalog(&state.mcp_catalog, mode, &servers).await;
+    Ok(tools)
 }
 
 #[tauri::command]
@@ -4585,12 +4612,11 @@ async fn run_agent_inner(
         ));
     }
 
-    // 每次 Agent 请求都重新合并原生 CODESYS 快照，确保工程切换、编辑器和选区变化不会沿用旧上下文。
-    // CODESYS 宿主还会把刚采集的 snapshot_id 注入请求；若文件在请求间隙被替换，
-    // 直接拒绝本轮而不把上一工程内容交给模型。
+    // Agent 请求使用已由工程操作/后台同步准备好的上下文；不在首字节前重新扫描
+    // 工作区或等待 Bridge。CODESYS 宿主仍会通过 snapshot_id/project_key 绑定校验
+    // 编辑器选区，显式同步由 sync_current_project 负责。
     let mode = request.workbench_mode.unwrap_or(state.inner.lock().await.workbench_mode);
-    let current_project = if mode == workbench::WorkbenchMode::Codesys { sync_current_project_inner(state).await? }
-        else { workbench::project_context(&state.inner.lock().await.project, mode) };
+    let current_project = state.inner.lock().await.project.clone();
     if mode == workbench::WorkbenchMode::Codesys { validate_codesys_context_binding(&current_project, request.codesys_context.as_ref())?; }
     if mode != workbench::WorkbenchMode::Codesys && matches!(request.message.trim(), "/compile" | "/diagnostics" | "/diag") {
         request.message = if mode == workbench::WorkbenchMode::Stone { "请使用 STone 官方工具检查当前工程并执行真实编译，先确认解决方案路径和安装环境，依照审批流程运行并返回官方诊断。".into() }
@@ -4678,7 +4704,18 @@ async fn run_agent_inner(
             .await);
         }
         "/mcp" => {
-            let summaries = summarize_mcp_servers(state.inner.clone()).await;
+            let (mode, servers) = {
+                let guard = state.inner.lock().await;
+                let mode = guard.workbench_mode;
+                let servers = guard
+                    .mcp_servers
+                    .iter()
+                    .filter(|server| workbench::tool_allowed(mode, &server.id, ""))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (mode, servers)
+            };
+            let summaries = snapshot_mcp_catalog(&state.mcp_catalog, mode, &servers).await.0;
             let text = if summaries.is_empty() {
                 "尚未配置 MCP 服务。".to_string()
             } else {
@@ -4706,8 +4743,18 @@ async fn run_agent_inner(
             return Ok(agent_result_from_state(state, text, Vec::new(), Vec::new()).await);
         }
         "/tools" => {
-            let servers = state.inner.lock().await.mcp_servers.clone();
-            let tools = list_tools_for_servers(&servers).await;
+            let (mode, servers) = {
+                let guard = state.inner.lock().await;
+                let mode = guard.workbench_mode;
+                let servers = guard
+                    .mcp_servers
+                    .iter()
+                    .filter(|server| workbench::tool_allowed(mode, &server.id, ""))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (mode, servers)
+            };
+            let tools = snapshot_mcp_catalog(&state.mcp_catalog, mode, &servers).await.1;
             let text = if tools.is_empty() {
                 "当前没有发现可调用的 MCP 工具。请检查服务配置和连接日志。".to_string()
             } else {
@@ -5033,7 +5080,7 @@ async fn run_agent_inner(
     validate_model_config(&model)?;
 
     let mut events = Vec::new();
-    let mut tools = discover_tools(&servers, &mut events).await;
+    let mut tools = discover_tools_cached(state, &servers, mode, &mut events).await;
     tools.retain(|tool| workbench::tool_allowed(mode, &tool.server_id, &tool.name));
     for event in events.clone() {
         if let Some(stream) = stream.as_ref() {
@@ -6055,6 +6102,251 @@ async fn discover_tools(servers: &[McpServerConfig], events: &mut Vec<AgentEvent
         }
     }
     tools
+}
+
+fn mcp_catalog_fingerprint(mode: workbench::WorkbenchMode, servers: &[McpServerConfig]) -> String {
+    let mut value = format!("{mode:?};");
+    for server in servers {
+        value.push_str(&server.id);
+        value.push('|');
+        value.push_str(if server.enabled { "1" } else { "0" });
+        value.push('|');
+        value.push_str(&server.transport);
+        value.push('|');
+        value.push_str(&server.command);
+        value.push('|');
+        value.push_str(&server.args.join("\u{1f}"));
+        value.push('|');
+        value.push_str(server.url.as_deref().unwrap_or_default());
+        value.push(';');
+    }
+    value
+}
+
+fn builtin_mcp_summary() -> McpSummary {
+    McpSummary {
+        id: BUILTIN_SERVER_ID.to_string(),
+        name: "PLC Pilot 内置工具".to_string(),
+        command: String::new(),
+        enabled: true,
+        connected: true,
+        tool_count: builtin_tools().len(),
+        last_error: None,
+        transport: "builtin".to_string(),
+        url: None,
+        last_checked: Some(now_iso()),
+    }
+}
+
+fn pending_mcp_summaries(servers: &[McpServerConfig]) -> Vec<McpSummary> {
+    let mut summaries = vec![builtin_mcp_summary()];
+    summaries.extend(servers.iter().map(|server| McpSummary {
+        id: server.id.clone(),
+        name: server.name.clone(),
+        command: server.command.clone(),
+        enabled: server.enabled,
+        connected: false,
+        tool_count: 0,
+        last_error: None,
+        transport: mcp_transport(server),
+        url: server.url.clone(),
+        last_checked: None,
+    }));
+    summaries
+}
+
+fn push_mcp_catalog_events(events: &mut Vec<AgentEvent>, summaries: &[McpSummary]) {
+    for summary in summaries.iter().filter(|summary| summary.id != BUILTIN_SERVER_ID) {
+        let status = if summary.connected { "done" } else { "warning" };
+        let title = if summary.connected {
+            format!("发现 {} 个 {} 工具", summary.tool_count, summary.name)
+        } else {
+            format!("无法连接 {}", summary.name)
+        };
+        events.push(AgentEvent::new(
+            &format!("mcp-{}", summary.id),
+            "mcp",
+            &title,
+            summary.last_error.clone(),
+            status,
+            Some(summary.id.clone()),
+        ));
+    }
+}
+
+async fn discover_mcp_catalog(servers: &[McpServerConfig]) -> (Vec<McpSummary>, Vec<McpTool>) {
+    let builtin = builtin_tools();
+    let mut summaries = vec![builtin_mcp_summary()];
+    let mut tools = builtin;
+    let mut tasks = Vec::new();
+    for server in servers.iter().filter(|server| server.enabled) {
+        let server = server.clone();
+        tasks.push(tokio::spawn(async move {
+            let result = timeout(
+                Duration::from_secs(MCP_DISCOVERY_TIMEOUT_SECONDS),
+                McpClient::new(server.clone()).list_tools(),
+            )
+            .await;
+            let (summary, tools) = match result {
+                Ok(Ok(server_tools)) => {
+                    let tool_count = server_tools.len();
+                    (
+                        McpSummary {
+                            id: server.id.clone(),
+                            name: server.name.clone(),
+                            command: server.command.clone(),
+                            enabled: true,
+                            connected: true,
+                            tool_count,
+                            last_error: None,
+                            transport: mcp_transport(&server),
+                            url: server.url.clone(),
+                            last_checked: Some(now_iso()),
+                        },
+                        server_tools,
+                    )
+                }
+                Ok(Err(error)) => (
+                    McpSummary {
+                        id: server.id.clone(),
+                        name: server.name.clone(),
+                        command: server.command.clone(),
+                        enabled: true,
+                        connected: false,
+                        tool_count: 0,
+                        last_error: Some(error.to_string()),
+                        transport: mcp_transport(&server),
+                        url: server.url.clone(),
+                        last_checked: Some(now_iso()),
+                    },
+                    Vec::new(),
+                ),
+                Err(_) => (
+                    McpSummary {
+                        id: server.id.clone(),
+                        name: server.name.clone(),
+                        command: server.command.clone(),
+                        enabled: true,
+                        connected: false,
+                        tool_count: 0,
+                        last_error: Some(format!("MCP 工具发现超过 {} 秒，已转入后台重试", MCP_DISCOVERY_TIMEOUT_SECONDS)),
+                        transport: mcp_transport(&server),
+                        url: server.url.clone(),
+                        last_checked: Some(now_iso()),
+                    },
+                    Vec::new(),
+                ),
+            };
+            (summary, tools)
+        }));
+    }
+    for task in tasks {
+        if let Ok((summary, server_tools)) = task.await {
+            tools.extend(server_tools);
+            summaries.push(summary);
+        }
+    }
+    for server in servers.iter().filter(|server| !server.enabled) {
+        summaries.push(McpSummary {
+            id: server.id.clone(),
+            name: server.name.clone(),
+            command: server.command.clone(),
+            enabled: false,
+            connected: false,
+            tool_count: 0,
+            last_error: None,
+            transport: mcp_transport(server),
+            url: server.url.clone(),
+            last_checked: Some(now_iso()),
+        });
+    }
+    (summaries, tools)
+}
+
+fn schedule_mcp_catalog_discovery(
+    cache: Arc<Mutex<McpCatalogCache>>,
+    fingerprint: String,
+    servers: Vec<McpServerConfig>,
+) {
+    tokio::spawn(async move {
+        let (summaries, tools) = discover_mcp_catalog(&servers).await;
+        let mut guard = cache.lock().await;
+        if guard.fingerprint != fingerprint {
+            return;
+        }
+        guard.summaries = summaries;
+        guard.tools = tools;
+        guard.loading = false;
+        guard.ready = true;
+        guard.notify.notify_waiters();
+    });
+}
+
+async fn discover_tools_cached(
+    state: &AppState,
+    servers: &[McpServerConfig],
+    mode: workbench::WorkbenchMode,
+    events: &mut Vec<AgentEvent>,
+) -> Vec<McpTool> {
+    let fingerprint = mcp_catalog_fingerprint(mode, servers);
+    let (ready, loading, tools, summaries, notify, start_background) = {
+        let mut guard = state.mcp_catalog.lock().await;
+        if guard.fingerprint != fingerprint {
+            guard.fingerprint = fingerprint.clone();
+            guard.ready = false;
+            guard.loading = false;
+            guard.summaries.clear();
+            guard.tools.clear();
+        }
+        let start_background = !guard.loading && !guard.ready;
+        if start_background {
+            guard.loading = true;
+        }
+        (guard.ready, guard.loading, guard.tools.clone(), guard.summaries.clone(), guard.notify.clone(), start_background)
+    };
+    if start_background {
+        schedule_mcp_catalog_discovery(state.mcp_catalog.clone(), fingerprint, servers.to_vec());
+    }
+    if !ready && loading {
+        // 首轮最多给已启动的后台发现 1.2 秒完成；超时直接使用内置工具，
+        // 不把 MCP 的冷启动或网络故障传递为模型首字节前的长等待。
+        let _ = timeout(Duration::from_millis(MCP_DISCOVERY_GRACE_MILLISECONDS), notify.notified()).await;
+        let guard = state.mcp_catalog.lock().await;
+        if guard.ready && guard.fingerprint == mcp_catalog_fingerprint(mode, servers) {
+            events.push(AgentEvent::new(
+                "mcp-cache",
+                "mcp",
+                "已加载当前模式的 MCP 工具目录",
+                Some("后台握手完成，复用已发现的工具。".to_string()),
+                "done",
+                None,
+            ));
+            push_mcp_catalog_events(events, &guard.summaries);
+            return guard.tools.clone();
+        }
+    }
+    if ready {
+        events.push(AgentEvent::new(
+            "mcp-cache",
+            "mcp",
+            "已复用当前模式的 MCP 工具目录",
+            Some("跳过重复 initialize/tools/list，直接开始本轮模型处理。".to_string()),
+            "done",
+            None,
+        ));
+        push_mcp_catalog_events(events, &summaries);
+        return tools;
+    }
+    let builtin = builtin_tools();
+    events.push(AgentEvent::new(
+        "mcp-builtin",
+        "mcp",
+        &format!("已加载 {} 个 PLC 内置工具", builtin.len()),
+        Some("外部 MCP 正在后台连接；本轮不等待不可用服务的超时。".to_string()),
+        "done",
+        Some(BUILTIN_SERVER_ID.to_string()),
+    ));
+    builtin
 }
 
 fn tool_summary_from_mcp(tool: McpTool) -> ToolSummary {
@@ -8156,11 +8448,10 @@ async fn snapshot_from_app_state(state: &State<'_, AppState>) -> Result<AppSnaps
 }
 
 async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, AppError> {
-    // CODESYS 脚本命令会把当前主工程写入桥接快照；每次刷新先合并该快照，避免侧栏停留在旧的手动路径。
-    let current_project = state.inner.lock().await.project.clone();
+    // 快照是界面控制面的轻量读取，不能在这里递归扫描工作区或等待 CODESYS
+    // Bridge。大目录和未启动的 Bridge 都可能让原来的启动/模式切换卡住数十秒；
+    // 工程扫描由显式 scan_project、sync_current_project 和后台同步器负责。
     let mode = state.inner.lock().await.workbench_mode;
-    let synced_project = if mode == workbench::WorkbenchMode::Codesys { sync_project_from_codesys(current_project) } else { workbench::project_context(&current_project, mode) };
-    state.inner.lock().await.project = synced_project;
     let guard = state.inner.lock().await;
     let model = model_summary(&guard.model);
     let models = guard.models.iter().map(model_summary).collect::<Vec<_>>();
@@ -8177,9 +8468,10 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
     let session = guard.session.clone();
     let project_for_skills = project.clone();
     drop(guard);
-    // 一次刷新只探测每个 MCP 服务一次，避免启动两遍 stdio 进程并让有状态的
-    // HTTP MCP 服务收到重复初始化请求。
-    let (mcp_servers, mut tools) = inspect_mcp_servers(&servers).await;
+    // 快照读取是界面控制面，不能启动或等待 MCP 的 initialize/tools/list。
+    // 首次读取只返回内置工具和“按需连接”状态；Agent 轮次需要工具目录时再
+    // 懒加载 MCP，完成后由后续快照和轮次复用缓存。
+    let (mcp_servers, mut tools) = snapshot_mcp_catalog(&state.mcp_catalog, mode, &servers).await;
     tools.retain(|tool| workbench::tool_allowed(mode, &tool.server_id, &tool.name));
     Ok(AppSnapshot {
         workbench_mode: mode,
@@ -8199,6 +8491,28 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
         pending_changes,
         session,
     })
+}
+
+async fn snapshot_mcp_catalog(
+    cache: &Arc<Mutex<McpCatalogCache>>,
+    mode: workbench::WorkbenchMode,
+    servers: &[McpServerConfig],
+) -> (Vec<McpSummary>, Vec<ToolSummary>) {
+    let fingerprint = mcp_catalog_fingerprint(mode, servers);
+    let (ready, summaries, tools) = {
+        let mut guard = cache.lock().await;
+        if guard.fingerprint != fingerprint {
+            guard.fingerprint = fingerprint.clone();
+            guard.ready = false;
+            guard.loading = false;
+            guard.summaries.clear();
+            guard.tools.clear();
+        }
+        (guard.ready, guard.summaries.clone(), guard.tools.clone())
+    };
+    let summaries = if ready { summaries } else { pending_mcp_summaries(servers) };
+    let tools = if ready { tools } else { builtin_tools() };
+    (summaries, tools.into_iter().map(tool_summary_from_mcp).collect())
 }
 
 fn model_summary(config: &ModelConfig) -> ModelSummary {

@@ -139,7 +139,7 @@ async function onWorkbenchModeChange(mode: WorkbenchMode): Promise<void> {
     // 不能把它填入空白会话，否则首次发送会误用旧工程而跳过目录初始化。
     if (workspace.active.value.project.path) workspace.active.value.project = project
     activeView.value = mode === 'codesys' ? 'overview' : 'chat'
-    await refresh()
+    void refresh().catch(() => undefined)
     showNotice(mode === 'codesys' ? '已切换到 CODESYS 模式。' : mode === 'stone' ? '已切换到 Stone 模式。' : '已切换到自由聊天模式。')
   } catch (error) { showNotice(error instanceof Error ? error.message : String(error)) }
 }
@@ -560,8 +560,9 @@ async function refresh(): Promise<void> {
   if (isRefreshing.value) return
   isRefreshing.value = true
   try {
-    await modelSettings.reload()
-    const next = await getSnapshot()
+    // 模型连接配置和工作区快照互不依赖，按 Codex 控制面思路并行读取；
+    // 之前串行等待会把两个本地 IPC 请求的耗时叠加到模式切换反馈上。
+    const [, next] = await Promise.all([modelSettings.reload(), getSnapshot()])
     // MCP 探测期间可能已保存/导入模型。完整快照只合并其他数据，模型以独立
     // 接口为准，避免较晚返回的旧快照把新配置和对话选择器回滚。
     next.models = snapshot.value.models
@@ -1920,11 +1921,7 @@ let stopWindowDrop: (() => void) | undefined
 let syncTimer: number | undefined
 
 onMounted(async () => {
-  await modelSettings.reload()
-  if (modelSettings.loaded.value) {
-    selectedModelProfileId.value = snapshot.value.active_model_id
-    selectedModel.value = snapshot.value.model.model
-  }
+  // refresh 已并行读取模型配置和界面快照；启动阶段不再重复请求一次模型设置。
   await refresh()
   try {
     const restored = await workspace.restore()

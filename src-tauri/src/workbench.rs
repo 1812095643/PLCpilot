@@ -38,6 +38,35 @@ pub fn project_context(project: &ProjectContext, mode: WorkbenchMode) -> Project
     result
 }
 
+/// 模式切换时只调整上下文边界，不做目录扫描。
+///
+/// 自由聊天和 Stone 不应继承 CODESYS 编辑器快照、选区和源对象列表，但这些
+/// 字段的清理不能阻塞下拉框交互；真正的文件扫描由 `/scan` 或显式工程操作完成。
+pub fn project_context_for_mode(project: &ProjectContext, mode: WorkbenchMode) -> ProjectContext {
+    if mode == WorkbenchMode::Codesys { return project.clone(); }
+    let mut result = project.clone();
+    result.source_root = None;
+    result.snapshot_id = None;
+    result.project_key = None;
+    result.version = None;
+    result.file_count = 0;
+    result.pou_count = 0;
+    result.source_files.clear();
+    result.active_object = None;
+    result.active_object_guid = None;
+    result.active_file = None;
+    result.active_file_relative = None;
+    result.active_text = None;
+    result.selected_text = None;
+    result.selection_start = 0;
+    result.selection_length = 0;
+    result.active_editor_available = false;
+    result.active_text_truncated = false;
+    result.scan_status = if result.path.is_some() { "pending".into() } else { "idle".into() };
+    result.scan_message = Some("切换模式后按需扫描工作目录。".into());
+    result
+}
+
 pub fn system_prompt(project: &ProjectContext, mode: WorkbenchMode) -> String {
     if mode == WorkbenchMode::Codesys { return build_system_prompt(project); }
     let introduction = if mode == WorkbenchMode::Chat {
@@ -56,7 +85,10 @@ pub async fn set_workbench_mode(mode: WorkbenchMode, state: State<'_, AppState>)
     let mut guard = state.inner.lock().await;
     let mut next = guard.clone();
     next.workbench_mode = mode;
-    next.project = project_context(&next.project, mode);
+    // 模式切换是导航动作，不应同步扫描整个工作区或等待 CODESYS Bridge。
+    // 这里只清理不属于当前模式的 CODESYS 快照字段；文件扫描由显式工程操作
+    // 负责，本轮 Agent 启动时直接使用这份轻量上下文即可立即进入模型流程。
+    next.project = project_context_for_mode(&next.project, mode);
     if mode == WorkbenchMode::Stone && !next.mcp_servers.iter().any(|server| server.id == "plc-pilot-stone") {
         let entry = mcp_catalog_entries().into_iter().find(|entry| entry.id == "plc-pilot-stone").ok_or_else(|| AppError::Mcp("未找到内置 STone MCP 资源。".into()))?;
         next.mcp_servers.push(McpServerConfig { id: entry.id, name: entry.name, command: entry.command, args: entry.args, env: HashMap::new(), enabled: true, transport: entry.transport, url: None, headers: HashMap::new() });
@@ -64,6 +96,7 @@ pub async fn set_workbench_mode(mode: WorkbenchMode, state: State<'_, AppState>)
     persist_runtime_state(&next)?;
     let project = next.project.clone();
     *guard = next;
+    *state.mcp_catalog.lock().await = McpCatalogCache::default();
     Ok(project)
 }
 
@@ -94,5 +127,27 @@ mod tests {
         let project = ProjectContext { path: Some(directory.path().to_string_lossy().into()), snapshot_id: Some("codesys-snapshot".into()), version: Some("SP22".into()), ..ProjectContext::default() };
         let result = project_context(&project, WorkbenchMode::Stone);
         assert_eq!(result.source_files.len(), 2); assert!(result.snapshot_id.is_none() && result.version.is_none());
+    }
+
+    #[test]
+    fn mode_switch_clears_codesys_fields_without_scanning() {
+        let project = ProjectContext {
+            path: Some("C:\\workspace\\machine.project".into()),
+            source_root: Some("C:\\workspace\\source".into()),
+            snapshot_id: Some("snapshot".into()),
+            project_key: Some("project".into()),
+            version: Some("SP22".into()),
+            source_files: vec!["MAIN.st".into()],
+            file_count: 42,
+            pou_count: 3,
+            active_file: Some("MAIN.st".into()),
+            selected_text: Some("x".into()),
+            ..ProjectContext::default()
+        };
+        let result = project_context_for_mode(&project, WorkbenchMode::Chat);
+        assert_eq!(result.path, project.path);
+        assert!(result.snapshot_id.is_none() && result.project_key.is_none() && result.version.is_none());
+        assert!(result.source_files.is_empty() && result.active_file.is_none() && result.selected_text.is_none());
+        assert_eq!(result.scan_status, "pending");
     }
 }

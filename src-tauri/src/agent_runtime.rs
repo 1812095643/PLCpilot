@@ -30,10 +30,12 @@ pub async fn isolate_run(root: &AppState, request: &AgentRequest) -> Result<AppS
             }
         } else { AgentSessionSummary::default() };
     }
-    runtime.project = workbench::project_context(&runtime.project, runtime.workbench_mode);
+    // 运行隔离只复制已准备好的工程上下文，不在发送消息的控制面递归扫描目录。
+    // 目录扫描由显式工程操作和后台同步完成，避免每条消息都重复遍历大型工作区。
     let mut state = AppState::new(runtime);
     state.isolated = true;
     state.running = root.running.clone();
+    state.mcp_catalog = root.mcp_catalog.clone();
     let request_id = request.request_id.clone().unwrap_or_default();
     let thread_id = request.client_thread_id.clone().unwrap_or_else(|| "desktop-default".into());
     let mut running = root.running.lock().await;
