@@ -36,6 +36,7 @@ pub async fn isolate_run(root: &AppState, request: &AgentRequest) -> Result<AppS
     state.isolated = true;
     state.running = root.running.clone();
     state.mcp_catalog = root.mcp_catalog.clone();
+    state.approvals = root.approvals.clone();
     let request_id = request.request_id.clone().unwrap_or_default();
     let thread_id = request.client_thread_id.clone().unwrap_or_else(|| "desktop-default".into());
     let mut running = root.running.lock().await;

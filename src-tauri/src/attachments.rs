@@ -152,6 +152,7 @@ fn mime_type_for_name(name: &str) -> String {
         "xls" => "application/vnd.ms-excel",
         "xlsb" => "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "pdf" => "application/pdf",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -273,6 +274,7 @@ pub fn prepare_attachments(attachments: &mut Vec<AttachmentInput>) {
                 extract_spreadsheet_text(&decoded)
             }
             "docx" => extract_docx_text(&decoded),
+            "pptx" => extract_pptx_text(&decoded),
             "ods" => extract_ods_text(&decoded),
             "pdf" => extract_pdf_text(&decoded),
             _ => None,
@@ -457,6 +459,48 @@ fn extract_docx_text(bytes: &[u8]) -> Option<Result<String, String>> {
     }
 }
 
+/// 从 PPTX 的每张幻灯片 XML 中提取文本。PPTX 是 OOXML 压缩包，
+/// 只读取 `ppt/slides/slide*.xml`，按文件名中的编号排序，避免把关系文件
+/// 或演示文稿元数据误当成正文交给模型。
+fn extract_pptx_text(bytes: &[u8]) -> Option<Result<String, String>> {
+    let mut archive = match ZipArchive::new(Cursor::new(bytes)) {
+        Ok(archive) => archive,
+        Err(error) => return Some(Err(format!("PowerPoint 文件无法读取：{error}"))),
+    };
+    let mut names = (0..archive.len())
+        .filter_map(|index| archive.by_index(index).ok().map(|entry| entry.name().to_string()))
+        .filter(|name| {
+            let file = name.strip_prefix("ppt/slides/slide").unwrap_or_default();
+            file.ends_with(".xml") && file[..file.len().saturating_sub(4)].parse::<u32>().is_ok()
+        })
+        .collect::<Vec<_>>();
+    names.sort_by_key(|name| {
+        name.strip_prefix("ppt/slides/slide")
+            .and_then(|value| value.strip_suffix(".xml"))
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
+    if names.is_empty() {
+        return Some(Err("PowerPoint 中没有可读取的幻灯片".to_string()));
+    }
+    let mut output = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let xml = match read_zip_entry(bytes, name) {
+            Some(xml) => xml,
+            None => continue,
+        };
+        let text = xml_text(&xml);
+        if !text.trim().is_empty() {
+            output.push(format!("幻灯片 {}：\n{}", index + 1, text.trim()));
+        }
+    }
+    if output.is_empty() {
+        Some(Err("PowerPoint 中没有可读取的正文".to_string()))
+    } else {
+        Some(Ok(output.join("\n\n")))
+    }
+}
+
 fn extract_ods_text(bytes: &[u8]) -> Option<Result<String, String>> {
     let xml = read_zip_entry(bytes, "content.xml")?;
     let text = xml_text(&xml);
@@ -555,5 +599,17 @@ mod tests {
         assert!(text.contains("工作表 PLC"));
         assert!(text.contains("点位\t值"));
         assert!(text.contains("温度\t42"));
+    }
+
+    #[test]
+    fn pptx_attachment_is_converted_to_slide_text() {
+        let options = zip::write::SimpleFileOptions::default();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer.start_file("ppt/slides/slide1.xml", options).expect("写入测试幻灯片");
+        writer.write_all(br#"<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:t>Stone API</a:t><a:t>Overview</a:t></p:sld>"#).expect("写入测试幻灯片正文");
+        let bytes = writer.finish().expect("完成测试幻灯片").into_inner();
+        let text = super::extract_pptx_text(&bytes).expect("识别演示文稿").expect("解析演示文稿");
+        assert!(text.contains("幻灯片 1"));
+        assert!(text.contains("Stone API"));
     }
 }

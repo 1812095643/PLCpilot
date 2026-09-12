@@ -118,6 +118,8 @@ const settingsCategory = shallowRef('models')
 const showCommandPalette = shallowRef(false)
 const showAbout = shallowRef(false)
 const showReward = shallowRef(false)
+/** 防止审批期间重复点击，同时不影响正在运行的 Agent busy 状态。 */
+const approvingChangeIds = shallowRef<Set<string>>(new Set())
 const GITHUB_REPOSITORY_URL = 'https://github.com/1812095643/PLCpilot'
 type AppDialog = { kind: 'confirm' | 'prompt'; title: string; message: string; value: string; resolve: (value: boolean | string | null) => void } | null
 const appDialog = shallowRef<AppDialog>(null)
@@ -704,6 +706,22 @@ function upsertLiveAgentEvent(event: AgentEvent, turnIndex: number, thread = wor
   messages.value = next
 }
 
+function syncPendingChangeFromEvent(event: AgentEvent, thread: WorkspaceThread): void {
+  const change = event.pending_change
+  if (!change) return
+  const index = thread.pendingChanges.findIndex((item) => item.id === change.id)
+  if (change.status === 'pending') {
+    thread.pendingChanges = index >= 0
+      ? thread.pendingChanges.map((item) => item.id === change.id ? change : item)
+      : [...thread.pendingChanges, change]
+  } else if (index >= 0) {
+    thread.pendingChanges = thread.pendingChanges.filter((item) => item.id !== change.id)
+  }
+  if (thread === workspace.active.value) {
+    snapshot.value = { ...snapshot.value, pending_changes: thread.pendingChanges }
+  }
+}
+
 function appendAgentResult(
   result: AgentResult,
   userText: string,
@@ -1043,6 +1061,9 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     if (item.kind === 'retry' && item.status === 'running') {
       messages.value = messages.value.map((message) => message.commandExecution?.kind === 'retry' && message.commandExecution.status === 'inProgress' ? { ...message, commandExecution: { ...message.commandExecution, status: 'completed', exitCode: 0 } } : message)
     }
+    // 审批事件在工具暂停的瞬间携带完整摘要；不能等 result，否则 Agent
+    // 可能已经结束，用户会错过可点击的批准/拒绝按钮。
+    syncPendingChangeFromEvent(item, thread)
     splitLiveAssistantBeforeActivity(item, pendingTurnIndex, thread, currentStreamingText(requestId), resetTextStream, requestId)
     upsertLiveAgentEvent(item, pendingTurnIndex, thread, timelineOrder)
     if (item.kind === 'progress') {
@@ -1655,34 +1676,44 @@ async function onDeleteSession(record: SessionRecord): Promise<void> {
 }
 
 async function onApprove(change: PendingChange): Promise<void> {
-  const thread = workspace.active.value
-  if (thread.isBusy) { showNotice('请等待该会话结束或停止当前任务后再审批。'); return }
-  thread.isBusy = true
-  thread.streamingRequestId = `approval-${change.id}`
+  const thread = workspace.threads.value.find((item) => item.pendingChanges.some((pending) => pending.id === change.id))
+    ?? workspace.active.value
+  if (approvingChangeIds.value.has(change.id)) return
+  approvingChangeIds.value = new Set(approvingChangeIds.value).add(change.id)
   try {
     const turnIndex = Math.max(0, thread.messages.filter((message) => message.role === 'user').length - 1)
     const result = await approveChange(change.id, (event) => upsertLiveAgentEvent(event, turnIndex, thread))
     thread.pendingChanges = thread.pendingChanges.filter((pending) => pending.id !== change.id)
+    if (thread === workspace.active.value) snapshot.value = { ...snapshot.value, pending_changes: thread.pendingChanges }
     if (change.tool_name !== 'exec_command') thread.messages = [...thread.messages, eventToMessage({ id: change.id, kind: 'tool', title: result.is_error ? '动作返回诊断' : '已完成审批动作', detail: JSON.stringify(result.content, null, 2), status: result.is_error ? 'error' : 'done', tool: change.tool_name }, turnIndex, thread.project.project_directory || thread.project.path || '')]
     showNotice(result.is_error ? '动作返回诊断，请查看工具详情。' : '审批动作已执行。')
     await refresh()
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
   } finally {
-    thread.isBusy = false
-    thread.streamingRequestId = ''
-    thread.liveOverlay = null
+    const next = new Set(approvingChangeIds.value)
+    next.delete(change.id)
+    approvingChangeIds.value = next
   }
 }
 
 async function onReject(change: PendingChange): Promise<void> {
+  const thread = workspace.threads.value.find((item) => item.pendingChanges.some((pending) => pending.id === change.id))
+    ?? workspace.active.value
+  if (approvingChangeIds.value.has(change.id)) return
+  approvingChangeIds.value = new Set(approvingChangeIds.value).add(change.id)
   try {
     await rejectChange(change.id)
-    workspace.active.value.pendingChanges = workspace.active.value.pendingChanges.filter((pending) => pending.id !== change.id)
+    thread.pendingChanges = thread.pendingChanges.filter((pending) => pending.id !== change.id)
+    if (thread === workspace.active.value) snapshot.value = { ...snapshot.value, pending_changes: thread.pendingChanges }
     showNotice('已拒绝这次工程修改。')
     await refresh()
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
+  } finally {
+    const next = new Set(approvingChangeIds.value)
+    next.delete(change.id)
+    approvingChangeIds.value = next
   }
 }
 
@@ -2042,7 +2073,7 @@ onUnmounted(() => {
             <article v-for="change in pendingChanges" :key="change.id" class="plc-approval-card">
               <div class="plc-approval-copy"><strong>{{ change.title }}</strong><small>{{ change.description }}</small><code>{{ change.id }}</code></div>
               <details class="plc-approval-diff"><summary>查看 Diff</summary><pre>{{ change.diff }}</pre></details>
-              <div class="plc-approval-actions"><button type="button" class="plc-button plc-button-quiet" @click="onReject(change)">拒绝</button><button type="button" class="plc-button plc-button-primary" @click="onApprove(change)">批准并写入</button></div>
+              <div class="plc-approval-actions"><button type="button" class="plc-button plc-button-quiet" :disabled="approvingChangeIds.has(change.id)" @click="onReject(change)">拒绝</button><button type="button" class="plc-button plc-button-primary" :disabled="approvingChangeIds.has(change.id)" @click="onApprove(change)">{{ approvingChangeIds.has(change.id) ? '处理中…' : '批准并写入' }}</button></div>
             </article>
           </section>
 

@@ -1,3 +1,12 @@
+0.1.10 功能修复：审批实时交互与 Office 原生读写。
+
+- Agent 运行期间立即显示审批卡片；批准、拒绝不再等待对话结束，异步状态同步避免重复执行和“待审批动作不存在”。
+- 完全访问模式直接执行已授权工具，不生成审批卡片；普通审批模式仍在写入前复核目标文件状态。
+- 内置 Documents、Spreadsheets、Presentations、PDF Skills，分别覆盖 Word、Excel、PowerPoint 和 PDF 的真实读取与基础创建/覆盖。
+- 使用 Rust 原生 OOXML/PDF 生成器，不要求目标电脑安装 openpyxl、python-docx、python-pptx 或 reportlab；Office 写入仍遵守审批和 SHA-256 外部修改保护。
+- Office 文件可从附件选择器直接添加；新增 PowerPoint 按幻灯片顺序提取正文。
+- Composer 移除“立即调整方向”按钮，运行中 Enter 排队、Ctrl+Enter 立即调整方向；侧边栏搜索按钮右对齐并显示结果数量和高亮反馈，同时移除重复的新建临时会话按钮。
+
 0.1.9 性能补丁：缩短模式切换和首轮对话等待。
 
 - 模式切换不再同步扫描整个工程目录，先完成界面切换，工程扫描按需执行。

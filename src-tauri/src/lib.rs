@@ -52,6 +52,7 @@ mod agent_control;
 mod settings;
 mod updates;
 mod generic_tools;
+mod office_tools;
 mod diagnostics;
 mod model_providers;
 mod workbench;
@@ -62,6 +63,10 @@ const PLC_SAFETY_SKILL: &str = include_str!("../../skills/plc-safety/SKILL.md");
 const IEC_ST_SKILL: &str = include_str!("../../skills/iec61131-st/SKILL.md");
 const CODESYS_DEBUGGING_SKILL: &str = include_str!("../../skills/codesys-debugging/SKILL.md");
 const PLC_COMMISSIONING_SKILL: &str = include_str!("../../skills/plc-commissioning/SKILL.md");
+const DOCUMENTS_SKILL: &str = include_str!("../../skills/documents/SKILL.md");
+const SPREADSHEETS_SKILL: &str = include_str!("../../skills/spreadsheets/SKILL.md");
+const PRESENTATIONS_SKILL: &str = include_str!("../../skills/presentations/SKILL.md");
+const PDF_SKILL: &str = include_str!("../../skills/pdf/SKILL.md");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -626,6 +631,10 @@ pub struct AgentEvent {
     pub retry_delay_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_status: Option<u16>,
+    /// 待审批动作的完整摘要；实时事件到达时前端即可渲染审批卡片，
+    /// 不必等 Agent 轮次结束后再从最终结果补齐。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_change: Option<PendingChangeSummary>,
 }
 
 /// 单次 Agent 调用专用的实时 IPC 消息。
@@ -885,6 +894,9 @@ pub struct AppState {
     pub running: Arc<Mutex<HashMap<String, agent_runtime::RunHandle>>>,
     /// 按工作模式和 MCP 配置缓存工具目录，避免快照和每轮 Agent 重复握手。
     pub mcp_catalog: Arc<Mutex<McpCatalogCache>>,
+    /// 隔离 Agent 状态与桌面控制面共享的审批注册表。审批动作在工具暂停时
+    /// 立即登记，用户无需等待当前轮次结束即可批准或拒绝。
+    pub approvals: Arc<Mutex<HashMap<String, PendingChange>>>,
     pub isolated: bool,
 }
 
@@ -897,6 +909,7 @@ impl AppState {
             abort_notify: Arc::new(tokio::sync::Notify::new()),
             running: Arc::new(Mutex::new(HashMap::new())),
             mcp_catalog: Arc::new(Mutex::new(McpCatalogCache::default())),
+            approvals: Arc::new(Mutex::new(HashMap::new())),
             isolated: false,
         }
     }
@@ -2291,6 +2304,7 @@ fn builtin_tools() -> Vec<McpTool> {
         },
     ];
     tools.extend(generic_tools::tools());
+    tools.extend(office_tools::tools());
     tools
 }
 
@@ -4239,16 +4253,21 @@ async fn approve_change(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<ToolCallResult, AppError> {
-    let pending = state.inner.lock().await.pending.get(&id).cloned().ok_or_else(|| AppError::Mcp("待审批动作不存在。".into()))?;
+    let pending = pending_change_for_state(&state, &id)
+        .await
+        .ok_or_else(|| AppError::Mcp("待审批动作不存在。".into()))?;
     if pending.summary.tool_name == "exec_command" {
         if pending.summary.status != "pending" { return Err(AppError::Mcp("这个动作已经处理过了。".into())); }
         if let Some(item) = state.inner.lock().await.pending.get_mut(&id) { item.summary.status = "applying".into(); }
+        if let Some(item) = state.approvals.lock().await.get_mut(&id) { item.summary.status = "applying".into(); }
         let stream = AgentStreamSender::new(format!("approval-{id}"), app.clone());
         stream.send_event(AgentEvent::new(&id, "command", "正在运行 PowerShell 命令", Some(pending.arguments["command"].as_str().unwrap_or_default().into()), "running", Some("powershell".into())));
         let result = generic_tools::host_action(&app, &state, &pending, "execute_approved", Some(&stream), None).await;
         let (status, detail) = match &result { Ok(result) => (if result.is_error { "error" } else { "done" }, serde_json::to_string_pretty(&result.content).unwrap_or_default()), Err(error) => ("error", error.to_string()) };
         stream.send_event(AgentEvent::new(&id, "command", &format!("已运行命令 {}", pending.arguments["command"].as_str().unwrap_or_default()), Some(detail), status, Some("powershell".into())));
-        if let Some(item) = state.inner.lock().await.pending.get_mut(&id) { item.summary.status = if status == "done" { "approved" } else { "error" }.into(); }
+        let final_status = if status == "done" { "approved" } else { "error" };
+        if let Some(item) = state.inner.lock().await.pending.get_mut(&id) { item.summary.status = final_status.into(); }
+        if let Some(item) = state.approvals.lock().await.get_mut(&id) { item.summary.status = final_status.into(); }
         return result;
     }
     let result = approve_change_inner(id, &state).await?;
@@ -4258,31 +4277,52 @@ async fn approve_change(
     Ok(result)
 }
 
+/// 审批动作可能由隔离 Agent 状态创建，但按钮始终运行在桌面根状态。
+/// 先查共享注册表，再回退到本地 pending，整个过程保持异步，避免在 Tokio
+/// 线程中使用 block_on 或 try_lock 导致死锁和偶发“动作不存在”。
+async fn pending_change_for_state(state: &AppState, id: &str) -> Option<PendingChange> {
+    if let Some(item) = state.approvals.lock().await.get(id).cloned() {
+        return Some(item);
+    }
+    state.inner.lock().await.pending.get(id).cloned()
+}
+
+async fn set_pending_change_status(state: &AppState, id: &str, status: &str) {
+    if let Some(item) = state.inner.lock().await.pending.get_mut(id) {
+        item.summary.status = status.to_string();
+    }
+    if let Some(item) = state.approvals.lock().await.get_mut(id) {
+        item.summary.status = status.to_string();
+    }
+}
+
 async fn approve_change_inner(id: String, state: &AppState) -> Result<ToolCallResult, AppError> {
-    let pending = state
-        .inner
-        .lock()
+    let pending = pending_change_for_state(state, &id)
         .await
-        .pending
-        .get(&id)
-        .cloned()
         .ok_or_else(|| AppError::Mcp("待审批动作不存在或已经处理".to_string()))?;
     if pending.summary.status != "pending" {
         return Err(AppError::Mcp("这个动作已经处理过了".to_string()));
     }
+    // 先占用动作，防止用户快速双击或多个窗口同时批准造成重复写入。
+    set_pending_change_status(state, &id, "applying").await;
     let result = if pending.summary.server_id == BUILTIN_SERVER_ID {
-        apply_builtin_pending_change(state, &pending).await?
+        apply_builtin_pending_change(state, &pending).await
     } else {
         let server = find_server(state, &pending.summary.server_id).await?;
         McpClient::new(server)
             .call_tool(&pending.summary.tool_name, pending.arguments)
-            .await?
+            .await
     };
-    let mut guard = state.inner.lock().await;
-    if let Some(item) = guard.pending.get_mut(&id) {
-        item.summary.status = if result.is_error { "error" } else { "approved" }.to_string();
+    match result {
+        Ok(result) => {
+            set_pending_change_status(state, &id, if result.is_error { "error" } else { "approved" }).await;
+            Ok(result)
+        }
+        Err(error) => {
+            set_pending_change_status(state, &id, "error").await;
+            Err(error)
+        }
     }
-    Ok(result)
 }
 
 #[tauri::command]
@@ -4291,12 +4331,13 @@ async fn reject_change(id: String, state: State<'_, AppState>) -> Result<(), App
 }
 
 async fn reject_change_inner(id: String, state: &AppState) -> Result<(), AppError> {
-    let mut guard = state.inner.lock().await;
-    let item = guard
-        .pending
-        .get_mut(&id)
+    let pending = pending_change_for_state(state, &id)
+        .await
         .ok_or_else(|| AppError::Mcp("待审批动作不存在或已经处理".to_string()))?;
-    item.summary.status = "rejected".to_string();
+    if pending.summary.status != "pending" {
+        return Err(AppError::Mcp("这个动作已经处理过了".to_string()));
+    }
+    set_pending_change_status(state, &id, "rejected").await;
     Ok(())
 }
 
@@ -4504,15 +4545,7 @@ async fn run_agent_legacy(
     }
     mcp_sessions.shutdown_all().await;
 
-    let pending_changes = state
-        .inner
-        .lock()
-        .await
-        .pending
-        .values()
-        .filter(|item| item.summary.status == "pending")
-        .map(|item| item.summary.clone())
-        .collect();
+    let pending_changes = pending_change_summaries(state).await;
     Ok(AgentRunResult {
         text: if final_text.trim().is_empty() {
             "模型没有返回文字结果，请检查接口配置或工具诊断。".to_string()
@@ -4554,8 +4587,15 @@ async fn run_agent(
         // 每个运行实例独立持有会话与 cwd；审批产物按全局唯一 ID 汇回桌面，
         // 不能用整个 RuntimeState 覆盖当前窗口，否则切换项目会串会话和模型。
         let runtime = state.inner.lock().await;
+        // 审批按钮操作的是根状态，共享表中的状态可能已经在本轮结束前变成
+        // approved/rejected；合并时以共享表为准，不能用隔离状态里的旧 pending
+        // 覆盖用户刚完成的审批结果。
+        let shared_pending = state.approvals.lock().await.clone();
         let mut global = root.inner.lock().await;
-        for (id, pending) in &runtime.pending { global.pending.entry(id.clone()).or_insert_with(|| pending.clone()); }
+        for (id, pending) in &runtime.pending {
+            let latest = shared_pending.get(id).cloned().unwrap_or_else(|| pending.clone());
+            global.pending.insert(id.clone(), latest);
+        }
         for (id, patch) in &runtime.patches { global.patches.entry(id.clone()).or_insert_with(|| patch.clone()); }
         drop(global);
         drop(runtime);
@@ -5131,20 +5171,30 @@ async fn agent_result_from_state(
     events: Vec<AgentEvent>,
     diagnostics: Vec<DiagnosticItem>,
 ) -> AgentRunResult {
-    let guard = state.inner.lock().await;
-    let pending_changes = guard
-        .pending
-        .values()
-        .filter(|item| item.summary.status == "pending")
-        .map(|item| item.summary.clone())
-        .collect();
+    let pending_changes = pending_change_summaries(state).await;
+    let session = state.inner.lock().await.session.clone();
     AgentRunResult {
         text,
         events,
         pending_changes,
         diagnostics,
-        session: guard.session.clone(),
+        session,
     }
+}
+
+/// 合并隔离状态和桌面控制面的审批视图。
+/// 用户可以在 Agent 仍运行时处理动作，因此最终结果必须读取共享表的最新
+/// 状态，避免已经批准的动作在 result 里又被渲染成待审批卡片。
+async fn pending_change_summaries(state: &AppState) -> Vec<PendingChangeSummary> {
+    let local = state.inner.lock().await.pending.clone();
+    let shared = state.approvals.lock().await.clone();
+    local
+        .values()
+        .filter_map(|item| {
+            let latest = shared.get(&item.summary.id).unwrap_or(item);
+            (latest.summary.status == "pending").then(|| latest.summary.clone())
+        })
+        .collect()
 }
 
 fn agent_host_path(app: &AppHandle) -> PathBuf {
@@ -5694,8 +5744,8 @@ async fn process_pi_tool_request(
         }));
     }
     if server_id == BUILTIN_SERVER_ID {
-        if matches!(tool_name.as_str(), "propose_edit" | "propose_write" | "apply_patch" | "exec_command") {
-            let proposal = if tool_name == "propose_edit" { propose_builtin_edit(state, arguments).await } else { generic_tools::propose(state, &tool_name, arguments).await };
+        if matches!(tool_name.as_str(), "propose_edit" | "propose_write" | "apply_patch" | "exec_command" | "write_office_document") {
+            let proposal = if tool_name == "propose_edit" { propose_builtin_edit(state, arguments).await } else if tool_name == "write_office_document" { office_tools::propose(state, arguments).await } else { generic_tools::propose(state, &tool_name, arguments).await };
             match proposal {
                 Ok(summary) => {
                     if full_access {
@@ -5706,21 +5756,25 @@ async fn process_pi_tool_request(
                             apply_builtin_pending_change(state, &pending).await
                         };
                         let (is_error, content) = match result { Ok(result) => (result.is_error, result.content), Err(error) => (true, vec![json!({"type":"text","text":error.to_string()})]) };
-                        if let Some(item) = state.inner.lock().await.pending.get_mut(&summary.id) { item.summary.status = if is_error { "error" } else { "approved" }.into(); }
+                        let status = if is_error { "error" } else { "approved" };
+                        if let Some(item) = state.inner.lock().await.pending.get_mut(&summary.id) { item.summary.status = status.into(); }
+                        if let Some(item) = state.approvals.lock().await.get_mut(&summary.id) { item.summary.status = status.into(); }
                         push_event_with_stream(app, events, AgentEvent::new(&call_id, "safety", if is_error { "完全访问执行未完成" } else { "完全访问已执行" }, Some(summary.title.clone()), if is_error { "error" } else { "done" }, Some(qualified.clone())), stream);
                         return Ok(json!({"type":"tool_result","request_id":request_id,"content":content,"is_error":is_error,"decision":if is_error {"error"} else {"executed"}}));
                     }
+                    let mut approval_event = AgentEvent::new(
+                        &call_id,
+                        "approval",
+                        "已生成待审批动作",
+                        Some(summary.title.clone()),
+                        "waiting",
+                        Some(qualified),
+                    );
+                    approval_event.pending_change = Some(summary.clone());
                     push_event_with_stream(
                         app,
                         events,
-                        AgentEvent::new(
-                            &call_id,
-                            "approval",
-                            "已生成待审批动作",
-                            Some(summary.title.clone()),
-                            "waiting",
-                            Some(qualified),
-                        ),
+                        approval_event,
                         stream,
                     );
                     return Ok(json!({
@@ -5847,24 +5901,22 @@ async fn process_pi_tool_request(
             risk: if is_forbidden_tool(&tool_name) { "高风险在线/进程操作，必须确认目标设备和影响范围".to_string() } else { "需要人工审批".to_string() },
             status: "pending".to_string(),
         };
-        state.inner.lock().await.pending.insert(
-            id,
-            PendingChange {
-                summary: summary.clone(),
-                arguments,
-            },
+        let pending = PendingChange { summary: summary.clone(), arguments };
+        state.inner.lock().await.pending.insert(id.clone(), pending.clone());
+        state.approvals.lock().await.insert(id, pending);
+        let mut approval_event = AgentEvent::new(
+            &call_id,
+            "approval",
+            "已拦截需要审批的工程修改",
+            Some(summary.title.clone()),
+            "waiting",
+            Some(qualified),
         );
+        approval_event.pending_change = Some(summary.clone());
         push_event_with_stream(
             app,
             events,
-            AgentEvent::new(
-                &call_id,
-                "approval",
-                "已拦截需要审批的工程修改",
-                Some(summary.title.clone()),
-                "waiting",
-                Some(qualified),
-            ),
+            approval_event,
             stream,
         );
         return Ok(json!({
@@ -7210,6 +7262,7 @@ async fn call_builtin_tool(
             if let Some(error) = file.error { return Err(AppError::Project(error)); }
             Ok(json_content(&json!({"name":file.name,"size":file.size,"mime_type":file.mime_type,"text":file.text_content}), false))
         }
+        "read_office_document" => office_tools::read(state, arguments).await,
         "search_project" => Ok(json_content(
             &search_builtin_project(&project, &arguments)?,
             false,
@@ -7317,13 +7370,14 @@ async fn propose_builtin_edit(
         "after": after,
         "thread_id": state.inner.lock().await.session.session_id,
     });
-    state.inner.lock().await.pending.insert(
-        id,
-        PendingChange {
-            summary: summary.clone(),
-            arguments: stored_arguments,
-        },
-    );
+    let pending = PendingChange {
+        summary: summary.clone(),
+        arguments: stored_arguments,
+    };
+    state.inner.lock().await.pending.insert(id.clone(), pending.clone());
+    // Agent 轮次运行在隔离 AppState 中；共享注册表让桌面审批控制面可以在
+    // 轮次未结束时读取并处理这条动作，行为与 Codex 的 pending approval 一致。
+    state.approvals.lock().await.insert(id, pending);
     Ok(summary)
 }
 
@@ -7337,6 +7391,7 @@ async fn apply_builtin_pending_change(
     state: &AppState,
     pending: &PendingChange,
 ) -> Result<ToolCallResult, AppError> {
+    if pending.summary.tool_name == "write_office_document" { return office_tools::apply(pending); }
     if matches!(pending.summary.tool_name.as_str(), "apply_patch" | "propose_write") { return generic_tools::apply_patch(pending); }
     if pending.summary.tool_name == "exec_command" { return Err(AppError::Configuration("请在桌面审批卡片中确认命令。".into())); }
     let project = if let Some(path) = pending.arguments.get("project_path").and_then(Value::as_str) { resolve_project_path(path)? } else { state.inner.lock().await.project.clone() };
@@ -8439,6 +8494,10 @@ fn builtin_skill_content(id: &str) -> Option<&'static str> {
         "iec61131-st" => Some(IEC_ST_SKILL),
         "codesys-debugging" => Some(CODESYS_DEBUGGING_SKILL),
         "plc-commissioning" => Some(PLC_COMMISSIONING_SKILL),
+        "documents" => Some(DOCUMENTS_SKILL),
+        "spreadsheets" => Some(SPREADSHEETS_SKILL),
+        "presentations" => Some(PRESENTATIONS_SKILL),
+        "pdf" => Some(PDF_SKILL),
         _ => None,
     }
 }
@@ -8458,7 +8517,7 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
     let active_model_id = guard.active_model_id.clone();
     let project = guard.project.clone();
     let projects = guard.projects.clone();
-    let pending_changes = guard
+    let mut pending_changes: Vec<PendingChangeSummary> = guard
         .pending
         .values()
         .filter(|item| item.summary.status == "pending")
@@ -8468,6 +8527,13 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
     let session = guard.session.clone();
     let project_for_skills = project.clone();
     drop(guard);
+    // Agent 运行在隔离状态时，根状态尚未合并其 pending；共享审批表仍然是
+    // 当前最及时的来源，刷新或切换页面时也必须保留实时审批卡片。
+    for item in state.approvals.lock().await.values() {
+        if item.summary.status == "pending" && !pending_changes.iter().any(|current| current.id == item.summary.id) {
+            pending_changes.push(item.summary.clone());
+        }
+    }
     // 快照读取是界面控制面，不能启动或等待 MCP 的 initialize/tools/list。
     // 首次读取只返回内置工具和“按需连接”状态；Agent 轮次需要工具目录时再
     // 懒加载 MCP，完成后由后续快照和轮次复用缓存。
@@ -9320,6 +9386,10 @@ fn builtin_skills() -> Vec<SkillSummary> {
             path: None,
             content_available: true,
         },
+        SkillSummary { id: "documents".into(), name: "Documents · Word".into(), description: "读取和生成 Word 文档，使用原生 Office 工具。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
+        SkillSummary { id: "spreadsheets".into(), name: "Spreadsheets · Excel".into(), description: "读取和生成 Excel 工作簿，支持多工作表行列数据。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
+        SkillSummary { id: "presentations".into(), name: "Presentations · PowerPoint".into(), description: "读取和生成 PowerPoint 幻灯片标题与正文。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
+        SkillSummary { id: "pdf".into(), name: "PDF".into(), description: "读取 PDF 文本层并生成基础文本 PDF。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
     ]
 }
 
@@ -9519,6 +9589,10 @@ fn skill_catalog_entries(project: &ProjectContext) -> Vec<SkillCatalogEntry> {
         SkillCatalogEntry { id: "iec61131-st".into(), name: "IEC 61131-3 Structured Text".into(), description: "遵循 CODESYS ST 类型、库和实例生命周期约定。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("iec61131-st"), free: true },
         SkillCatalogEntry { id: "codesys-debugging".into(), name: "CODESYS 诊断与编译".into(), description: "区分工程扫描、编译、Bridge 和运行时诊断，优先真实编译器。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("codesys-debugging"), free: true },
         SkillCatalogEntry { id: "plc-commissioning".into(), name: "PLC 投运与交付".into(), description: "按可回退、失效安全和人工审批约束设计投运步骤。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("plc-commissioning"), free: true },
+        SkillCatalogEntry { id: "documents".into(), name: "Documents · Word".into(), description: "读取和生成 Word 文档，使用原生 Office 工具。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("documents"), free: true },
+        SkillCatalogEntry { id: "spreadsheets".into(), name: "Spreadsheets · Excel".into(), description: "读取和生成 Excel 工作簿，支持多工作表行列数据。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("spreadsheets"), free: true },
+        SkillCatalogEntry { id: "presentations".into(), name: "Presentations · PowerPoint".into(), description: "读取和生成 PowerPoint 幻灯片标题与正文。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("presentations"), free: true },
+        SkillCatalogEntry { id: "pdf".into(), name: "PDF".into(), description: "读取 PDF 文本层并生成基础文本 PDF。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("pdf"), free: true },
     ]
 }
 
@@ -9587,7 +9661,7 @@ fn build_system_prompt(project: &ProjectContext) -> String {
         }
     }
     format!(
-        "你是 PLC Pilot，一个面向 CODESYS 3.5 的本地工程 Agent；具体 Service Pack 以当前检测到的 Profile 为准。\n\n{project_line}\n{location_line}\n{scan_line}\n{editor_line}\n\n强制边界：\n- 先读取工程上下文，再提出修改。\n- 任何写代码、删除、重命名、安装库、覆盖工程的工具调用必须等待用户审批。\n- 默认禁止 PLC 下载、RUN/STOP、在线写变量、Force/Unforce、Reset。\n- PowerShell 命令只能通过 exec_command 或 powershell 提交，等待用户审批后执行。\n- 不能把未连接的 CODESYS 或未完成的编译说成已完成。\n- 生成 Structured Text 时遵循扫描周期、互锁、状态机和失效安全要求。\n- 每次回答先给结论，再列已执行工具、证据、风险和下一步。\n\n已加载 Skills：\n{}",
+        "你是 PLC Pilot，一个面向 CODESYS 3.5 的本地工程 Agent；具体 Service Pack 以当前检测到的 Profile 为准。\n\n{project_line}\n{location_line}\n{scan_line}\n{editor_line}\n\n强制边界：\n- 先读取工程上下文，再提出修改。\n- 任何写代码、删除、重命名、安装库、覆盖工程的工具调用必须等待用户审批。\n- 默认禁止 PLC 下载、RUN/STOP、在线写变量、Force/Unforce、Reset。\n- PowerShell 命令只能通过 exec_command 或 powershell 提交，等待用户审批后执行。\n- Word、Excel、PowerPoint、PDF 使用内置 read_office_document / write_office_document；写入仍须审批，不能声称保留未解析的复杂格式。\n- 不能把未连接的 CODESYS 或未完成的编译说成已完成。\n- 生成 Structured Text 时遵循扫描周期、互锁、状态机和失效安全要求。\n- 每次回答先给结论，再列已执行工具、证据、风险和下一步。\n\n已加载 Skills：\n{}",
         skill_sections.join("\n\n")
     )
 }
@@ -10098,6 +10172,7 @@ impl AgentEvent {
             retry_max_attempts: None,
             retry_delay_ms: None,
             retry_status: None,
+            pending_change: None,
         }
     }
 

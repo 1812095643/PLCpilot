@@ -27,7 +27,9 @@ const search = shallowRef('')
 const searchOpen = shallowRef(false)
 const collapsed = shallowRef(new Set<string>())
 const visibleLimit = shallowRef(40)
-const filtered = computed(() => props.threads.filter((thread) => `${thread.name} ${thread.cwd}`.toLowerCase().includes(search.value.toLowerCase())))
+const normalizedSearch = computed(() => search.value.trim().toLowerCase())
+const filtered = computed(() => props.threads.filter((thread) => !normalizedSearch.value || `${thread.name} ${thread.cwd}`.toLowerCase().includes(normalizedSearch.value)))
+const searchSummary = computed(() => normalizedSearch.value ? `找到 ${filtered.value.length} 个会话` : '搜索项目和会话')
 function projectDirectory(project: WorkspaceProject): string {
   return /\.(project|projectarchive)$/iu.test(project.path) ? getPathParent(project.path) : project.path
 }
@@ -41,8 +43,8 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
 
 <template>
   <aside class="workspace-sidebar">
-    <header><strong class="sidebar-brand" aria-label="PLC Pilot"><span class="sidebar-brand-plc">PLC</span><span class="sidebar-brand-pilot">Pilot</span></strong><WorkbenchModePicker :model-value="props.workbenchMode" @update:model-value="emit('update:workbench-mode', $event)" /><button title="搜索会话" aria-label="搜索会话" @click="searchOpen = !searchOpen"><IconTablerSearch /></button><button title="新建临时会话" aria-label="新建临时会话" @click="emit('new-thread')"><IconTablerFilePencil /></button></header>
-    <input v-if="searchOpen" v-model="search" class="sidebar-search" aria-label="搜索项目和会话" placeholder="搜索会话" />
+    <header><strong class="sidebar-brand" aria-label="PLC Pilot"><span class="sidebar-brand-plc">PLC</span><span class="sidebar-brand-pilot">Pilot</span></strong><WorkbenchModePicker :model-value="props.workbenchMode" @update:model-value="emit('update:workbench-mode', $event)" /><span class="sidebar-header-spacer" /><button title="搜索会话" aria-label="搜索会话" :aria-expanded="searchOpen" @click="searchOpen = !searchOpen"><IconTablerSearch /></button></header>
+    <div v-if="searchOpen" class="sidebar-search-wrap"><input v-model="search" class="sidebar-search" aria-label="搜索项目和会话" placeholder="搜索项目、会话或工作目录" autofocus /><span class="sidebar-search-summary" aria-live="polite">{{ searchSummary }}</span></div>
     <button class="sidebar-nav" @click="emit('new-thread')"><IconTablerFilePencil /><span>新对话</span></button>
     <button class="sidebar-nav" @click="emit('open-overview')"><IconTablerFolder /><span>工程概览</span></button>
     <button class="sidebar-nav" @click="emit('open-skills')"><IconTablerBolt /><span>Skills 与工具</span></button>
@@ -51,14 +53,14 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
       <section v-for="group in groups" :key="group.project.id" class="project-group">
         <div class="project-heading"><button class="fold-button" :aria-label="`${collapsed.has(group.project.id) ? '展开' : '收起'} ${group.project.name}`" @click="toggle(group.project.id)"><IconTablerChevronDown :class="{ collapsed: collapsed.has(group.project.id) }" /></button><button class="project-name" :title="normalizePathForUi(group.project.path)" @click="emit('open-project', group.project)">{{ group.project.name }}</button><button class="row-action" :aria-label="`在 ${group.project.name} 新建会话`" title="新建项目会话" @click="emit('new-thread', group.project)"><IconTablerFilePencil /></button><button class="row-action" :aria-label="`移除项目 ${group.project.name}`" title="移除项目入口" @click="emit('remove-project', group.project)"><IconTablerTrash /></button></div>
         <div v-if="!collapsed.has(group.project.id)" class="project-threads">
-          <div v-for="thread in group.threads.slice(0, visibleLimit)" :key="thread.id" class="thread-row" :class="{ active: activeId === thread.id }">
+          <div v-for="thread in group.threads.slice(0, visibleLimit)" :key="thread.id" class="thread-row" :class="{ active: activeId === thread.id, 'search-match': normalizedSearch }">
             <button class="thread-main" :title="thread.status || thread.name" @click="emit('select-thread', thread.id)"><span class="thread-state" :class="{ running: thread.busy }" /><span>{{ thread.name }}</span></button>
             <button v-if="thread.persisted && !thread.busy" class="row-action" title="重命名会话" :aria-label="`重命名 ${thread.name}`" @click="emit('rename-thread', thread.id)"><IconTablerFilePencil /></button><button v-if="!thread.busy" class="row-action" title="删除会话" :aria-label="`删除 ${thread.name}`" @click="emit('delete-thread', thread.id)"><IconTablerTrash /></button>
           </div>
         </div>
       </section>
       <div v-if="ungrouped.length > 0" class="group-heading"><span>其他会话</span><button title="新建临时会话" aria-label="添加临时会话" @click="emit('new-thread')"><IconTablerFilePencil /></button></div>
-      <div v-for="thread in ungrouped.slice(0, visibleLimit)" :key="thread.id" class="thread-row" :class="{ active: activeId === thread.id }">
+      <div v-for="thread in ungrouped.slice(0, visibleLimit)" :key="thread.id" class="thread-row" :class="{ active: activeId === thread.id, 'search-match': normalizedSearch }">
         <button class="thread-main" :title="`${thread.status || thread.name}\n${normalizePathForUi(thread.cwd)}`" @click="emit('select-thread', thread.id)"><span class="thread-state" :class="{ running: thread.busy }" /><span>{{ thread.name }}</span></button><button v-if="thread.persisted && !thread.busy" class="row-action" title="重命名会话" :aria-label="`重命名 ${thread.name}`" @click="emit('rename-thread', thread.id)"><IconTablerFilePencil /></button><button v-if="!thread.busy" class="row-action" title="删除会话" :aria-label="`删除 ${thread.name}`" @click="emit('delete-thread', thread.id)"><IconTablerTrash /></button>
       </div>
       <button v-if="filtered.length > visibleLimit" class="sidebar-nav load-more" @click="visibleLimit += 40">更多会话</button>
@@ -79,7 +81,10 @@ button:hover { background: var(--sidebar-hover); }
 button:focus-visible, input:focus-visible { outline: 2px solid #007acc; outline-offset: -2px; }
 svg { width: 16px; height: 16px; flex: 0 0 auto; }
 .sidebar-nav { width: 100%; min-height: 32px; gap: 9px; justify-content: flex-start; padding: 0 9px; font-size: 13px; }
+.sidebar-header-spacer { flex: 1; }
+.sidebar-search-wrap { display: grid; gap: 3px; padding: 0 4px 4px; }
 .sidebar-search { width: 100%; border: 1px solid var(--sidebar-muted); border-radius: 4px; padding: 6px 8px; background: transparent; color: inherit; }
+.sidebar-search-summary { color: var(--sidebar-muted); font-size: 10px; padding-left: 2px; }
 .sidebar-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; padding-top: 12px; }
 .group-heading { display: flex; align-items: center; justify-content: space-between; color: var(--sidebar-muted); min-height: 36px; padding: 0 4px 0 9px; font-size: 12px; }
 .project-group { padding-bottom: 8px; }
@@ -91,6 +96,7 @@ svg { width: 16px; height: 16px; flex: 0 0 auto; }
 .project-threads { padding-left: 12px; }
 .thread-row:hover { background: var(--sidebar-hover); }
 .thread-row.active { background: var(--sidebar-active); }
+.thread-row.search-match { animation: sidebar-search-highlight 420ms ease both; }
 .thread-main { flex: 1; min-width: 0; justify-content: flex-start; gap: 8px; padding: 0 7px; height: 30px; font-size: 12px; }
 .thread-main > span:last-child { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .thread-state { flex: 0 0 5px; width: 5px; height: 5px; border-radius: 50%; background: var(--sidebar-muted); opacity: .6; }
@@ -104,5 +110,6 @@ footer .sidebar-nav { flex: 1; min-width: 0; width: auto; }
 :global(.dark .workspace-sidebar) { --sidebar-bg: #181818; --sidebar-text: #d4d4d4; --sidebar-muted: #929292; --sidebar-hover: #252526; --sidebar-active: #303030; }
 :global(.dark .sidebar-brand), :global(.dark .sidebar-brand-plc), :global(.dark .sidebar-brand-pilot) { color: #fff; }
 @keyframes sidebar-spin { to { transform: rotate(360deg); } }
+@keyframes sidebar-search-highlight { from { box-shadow: inset 2px 0 0 #007acc; background: var(--sidebar-hover); } to { box-shadow: inset 0 0 0 transparent; } }
 @media (prefers-reduced-motion: reduce) { .thread-state.running { animation: none; } }
 </style>

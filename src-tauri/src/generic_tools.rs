@@ -86,7 +86,11 @@ pub async fn propose(state: &AppState, tool: &str, mut arguments: Value) -> Resu
     arguments["expected_files"] = json!(expected);
     let id = Uuid::new_v4().to_string();
     let summary = PendingChangeSummary { id: id.clone(), title: if tool == "exec_command" { "审批后运行 PowerShell 命令".into() } else { format!("审批后应用文件修改（{} 个文件）", expected.len()) }, description: cwd.to_string_lossy().into_owned(), diff: preview, server_id: BUILTIN_SERVER_ID.into(), tool_name: tool.into(), risk: "需要人工审批".into(), status: "pending".into() };
-    state.inner.lock().await.pending.insert(id, PendingChange { summary: summary.clone(), arguments });
+    let pending = PendingChange { summary: summary.clone(), arguments };
+    state.inner.lock().await.pending.insert(id.clone(), pending.clone());
+    // Agent 使用隔离状态运行，但审批按钮属于桌面控制面；同时登记共享注册表，
+    // 让用户在模型轮次仍处于 busy 时就能操作这条动作。
+    state.approvals.lock().await.insert(id, pending);
     Ok(summary)
 }
 

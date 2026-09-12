@@ -377,10 +377,18 @@ function onKeydown(event: KeyboardEvent): void {
     }
   }
   if (handleSlashCommandKeydown(event)) return
+  // 与 Codex 的发送队列语义一致：运行中 Enter 只排队，Ctrl/Cmd+Enter
+  // 立即把新方向交给当前 Agent。两种操作都不需要占用额外按钮。
+  if (event.key === 'Enter' && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey
+    && props.isTurnInProgress) {
+    event.preventDefault()
+    submitCurrent('steer')
+    return
+  }
   if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey
     && props.sendWithEnter !== false) {
     event.preventDefault()
-    submitCurrent()
+    submitCurrent(props.isTurnInProgress ? 'queue' : 'steer')
   }
 }
 
@@ -936,7 +944,7 @@ defineExpose<ThreadComposerExposed>({
           @click="onCursorChange"
         />
         <div class="plc-composer-hint">
-          <span>Enter 发送 · Shift+Enter 换行</span>
+          <span>{{ isTurnInProgress ? 'Enter 排队 · Ctrl+Enter 调整方向 · Shift+Enter 换行' : 'Enter 发送 · Shift+Enter 换行' }}</span>
               <span><code>@</code> 引用文件、文件夹或历史会话</span>
         </div>
       </div>
@@ -946,7 +954,7 @@ defineExpose<ThreadComposerExposed>({
           <button type="button" class="plc-composer-attach" aria-label="添加附件" title="添加图片或文件" :disabled="isInteractionDisabled" @click="openFilePicker">
             <IconTablerPaperclip aria-hidden="true" />
           </button>
-          <input ref="fileInputRef" class="plc-composer-file-input" type="file" multiple accept="image/*,.c,.cc,.cpp,.css,.csv,.h,.hpp,.html,.iecst,.ini,.java,.js,.json,.log,.md,.mjs,.py,.rs,.sql,.st,.svg,.toml,.ts,.tsx,.txt,.vue,.xml,.yaml,.yml" @change="onFileInputChange" />
+          <input ref="fileInputRef" class="plc-composer-file-input" type="file" multiple accept="image/*,.c,.cc,.cpp,.css,.csv,.docx,.h,.hpp,.html,.iecst,.ini,.java,.js,.json,.log,.md,.mjs,.pdf,.pptx,.py,.rs,.sql,.st,.svg,.toml,.ts,.tsx,.txt,.vue,.xls,.xlsb,.xlsm,.xlsx,.xltm,.xltx,.xml,.yaml,.yml" @change="onFileInputChange" />
           <ComposerSearchDropdown
             class="plc-composer-dropdown"
             :options="skillOptions"
@@ -985,17 +993,6 @@ defineExpose<ThreadComposerExposed>({
             @click="submitCurrent('queue')"
           >
             <IconTablerArrowUp aria-hidden="true" />
-          </button>
-          <button
-            v-if="isTurnInProgress"
-            type="button"
-            class="plc-composer-stop"
-            :disabled="!canSubmit"
-            aria-label="立即调整方向"
-            title="立即调整方向，当前操作完成后采用新指令"
-            @click="submitCurrent('steer')"
-          >
-            <IconTablerBolt aria-hidden="true" />
           </button>
           <button
             v-if="isTurnInProgress"

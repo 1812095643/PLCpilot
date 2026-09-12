@@ -271,6 +271,8 @@ export type AgentEvent = {
   detail: string | null
   status: string
   tool: string | null
+  /** 工具在 Agent 运行期间创建的待审批动作，事件到达即显示卡片。 */
+  pending_change?: PendingChange | null
   /** 重试事件的 1-based 重试序号。 */
   retry_attempt?: number | null
   /** 本轮允许的最大重试次数。 */
