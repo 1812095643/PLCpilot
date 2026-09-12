@@ -135,7 +135,9 @@ async function onWorkbenchModeChange(mode: WorkbenchMode): Promise<void> {
   try {
     const project = await setWorkbenchMode(mode)
     workbenchMode.value = mode
-    workspace.active.value.project = project
+    // 空白临时会话尚未绑定目录；切换模式返回的是运行时的上一个工程，
+    // 不能把它填入空白会话，否则首次发送会误用旧工程而跳过目录初始化。
+    if (workspace.active.value.project.path) workspace.active.value.project = project
     activeView.value = mode === 'codesys' ? 'overview' : 'chat'
     await refresh()
     showNotice(mode === 'codesys' ? '已切换到 CODESYS 模式。' : mode === 'stone' ? '已切换到 Stone 模式。' : '已切换到自由聊天模式。')
@@ -270,8 +272,8 @@ const agentContext = computed(() => ({
   active_file: currentProject.value.active_file,
 }))
 
-// 临时会话也有真实工作目录，和用户导入的文件夹一样按项目分组；只有
-// 旧版本遗留的无路径线程才落到侧栏底部的“其他会话”。
+// 临时会话首次发送后才拥有工作目录并按项目分组；尚未发送的空白会话
+// 保持无路径，与旧版本遗留的无路径线程一起显示在“其他会话”。
 const sidebarProjects = computed(() => snapshot.value.projects)
 const sidebarThreads = computed<SidebarThread[]>(() => {
   const locals = workspace.threads.value.map((thread) => ({
@@ -1165,6 +1167,17 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   }
 
   try {
+    // 原先点击新对话或启动应用便创建临时目录，误点也会留下空文件夹。
+    // 现在仅在消息通过空内容检查、会话已进入忙碌状态后创建，并固定到
+    // 本次发送的 thread；等待期间切换会话不会把目录绑定到另一个线程。
+    // 初始化异常复用下方的消息保留和重试流程，后续发送直接复用该目录。
+    if (!thread.project.path) {
+      thread.project = await startTemporaryWorkspace()
+      if (thread === workspace.active.value) {
+        snapshot.value = { ...snapshot.value, project: thread.project }
+        projectPathDraft.value = thread.project.path || ''
+      }
+    }
     const history = baseMessages
       .filter((item) => item.role === 'user' || item.role === 'assistant')
       .map((item) => ({
@@ -1788,11 +1801,14 @@ function chooseCommand(command: string, supportsArgs: boolean): void {
 
 async function startNewThread(project?: WorkspaceProject): Promise<void> {
   try {
-    const context = project ? await selectProject(project.path) : await startTemporaryWorkspace()
+    // 点击新对话只建立内存中的空白线程；临时工作目录由首条真实消息触发，
+    // 这样习惯性点击新对话不会在文档目录留下空的日期/时间文件夹。
+    const context = project ? await selectProject(project.path) : { ...EMPTY_SNAPSHOT.project }
     workspace.create(context)
     showSettings.value = false
     snapshot.value = { ...snapshot.value, project: context }
-    await refresh()
+    projectPathDraft.value = context.path || ''
+    if (project) await refresh()
     activeView.value = 'chat'
     showNotice('已新建会话，工程文件没有改动。')
   } catch (error) {
@@ -1913,9 +1929,13 @@ onMounted(async () => {
   try {
     const restored = await workspace.restore()
     if (!restored) workspace.active.value.project = snapshot.value.project
-    if (!workspace.active.value.project.path) workspace.active.value.project = await startTemporaryWorkspace()
-    else await selectProject(workspace.active.value.project.path)
+    // 空白会话或未发送草稿在重启后继续保持无路径，首次发送再创建目录。
+    if (workspace.active.value.project.path) await selectProject(workspace.active.value.project.path)
     await refresh()
+    // refresh 读取的是桌面运行时的全局工程；恢复空白临时线程时应继续以
+    // 当前线程上下文为准，不能因为启动刷新把它误替换成旧工程。
+    snapshot.value = { ...snapshot.value, project: workspace.active.value.project }
+    projectPathDraft.value = workspace.active.value.project.path || ''
   } catch (error) { showNotice(`恢复会话工作区未完成：${String(error)}`) }
   window.addEventListener('keydown', onKeyDown)
   await setupNativeWindowDrop()
