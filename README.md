@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  面向 CODESYS 工程的本地优先 AI Agent 工作台
+  连接 CODESYS、CAREL STone 与日常开发任务的本地优先 AI Agent 工作台
 </p>
 
 <p align="center">
@@ -12,9 +12,11 @@
   <a href="https://github.com/1812095643/PLCpilot/releases"><img src="https://img.shields.io/github/downloads/1812095643/PLCpilot/total" alt="下载量"></a>
 </p>
 
-PLC Pilot 把模型服务商、CODESYS 工程、MCP、Skills、审批、会话和诊断放进同一个 Windows 桌面工作流。它适合 PLC 工程师、自动化调试工程师和需要维护 IEC 61131-3 Structured Text 项目的软件工程师。
+PLC Pilot 是一个面向工业自动化与日常开发的 Windows 桌面 AI Agent 工作台，支持 CODESYS、CAREL STone 和自由聊天三种模式。你可以用它分析与修改控制工程、检索厂商接口，也可以处理通用编程、Office 文档和文件任务。
 
-本项目是独立项目，公开源代码；它不是 OpenAI 官方产品，也不要求把聊天窗口嵌入 CODESYS。交互结构参考 Codex 等本地 Agent 工作台，PLC 工程扫描、审批边界和本机运行时由 PLC Pilot 自己实现。
+多服务商模型、MCP、Skills、审批、会话和诊断共用一套工作流。PLC 工程师、自动化调试工程师和软件开发者可以按任务切换模式，并通过 MCP 与 Skills 扩展工具能力。
+
+PLC Pilot 作为独立桌面应用运行。交互结构参考 Codex 等本地 Agent 工作台，工业软件接入、审批与本机运行时由本项目维护；本项目与 OpenAI、CODESYS、CAREL 无官方隶属关系。
 
 ## 下载
 
@@ -33,7 +35,7 @@ PLC Pilot 把模型服务商、CODESYS 工程、MCP、Skills、审批、会话�
 1. 下载并安装 PLC Pilot，或完整解压便携版 ZIP。
 2. 打开“设置 → 模型”，添加一个服务商 URL 和 API Key，然后获取模型并勾选要在对话框中使用的模型。
 3. 在左上角选择工作模式：`CODESYS`、`自由聊天` 或 `Stone`。
-4. 在 CODESYS 模式中导入工程文件夹或 `.project` 文件；也可以直接发送第一条消息，让 PLC Pilot 创建临时会话工作目录。
+4. 根据任务选择工作目录：CODESYS 模式可导入工程文件夹或 `.project` 文件，Stone 模式选择 STone 工程目录，自由聊天可直接提问或附加文件。没有选择目录时，首次发送消息会自动创建临时会话工作目录。
 5. 描述任务。Agent 会先读取上下文、显示工具和命令状态；涉及写入、编译、下载或在线操作时，默认等待审批。
 
 首次使用建议保持“审批模式”。确认工具行为和工程范围后，再在设置中显式启用“完全访问模式”。
