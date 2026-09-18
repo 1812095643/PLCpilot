@@ -7,6 +7,8 @@ export type RetrySettings = { max_retries: number; base_delay_ms: number; max_de
 export type ContextSettings = { auto_compact: boolean; project_memory: boolean; auto_memory: boolean }
 export type Preferences = { custom_skills: Array<{ id: string; path: string }>; disabled_skills: string[]; retry: RetrySettings; theme?: ThemePreference | null; access_mode: 'approval' | 'full'; context_management: ContextSettings }
 export const getPreferences = () => invoke<Preferences>('get_preferences')
+export const getStartupEnabled = () => invoke<boolean>('get_startup_enabled')
+export const setStartupEnabled = (enabled: boolean) => invoke<boolean>('set_startup_enabled', { enabled })
 export const saveThemePreference = (theme: ThemePreference) => invoke<void>('save_theme_preference', { theme })
 export const saveRetrySettings = (retry: RetrySettings) => invoke<void>('save_retry_settings', { retry })
 export const saveContextSettings = (contextManagement: ContextSettings) => invoke<void>('save_context_settings', { context_management: contextManagement })

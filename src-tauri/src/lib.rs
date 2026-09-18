@@ -57,6 +57,7 @@ mod diagnostics;
 mod model_providers;
 mod workbench;
 mod session_preview_cache;
+mod startup;
 use attachments::{prepare_attachments, read_local_file, AttachmentInput, CodexImageInput};
 
 const CODESYS_SKILL: &str = include_str!("../../skills/codesys-agent/SKILL.md");
@@ -2411,6 +2412,7 @@ pub fn run() {
         .manage(state)
         .manage(updates::UpdateManager::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::Builder::new().app_name("PLC Pilot").build())
         .setup(|app| {
             diagnostics::info("app.ready", json!({}));
             let state = app.state::<AppState>().inner().clone();
@@ -2438,6 +2440,8 @@ pub fn run() {
             updates::check_app_update,
             updates::download_app_update,
             updates::install_app_update,
+            startup::get_startup_enabled,
+            startup::set_startup_enabled,
             get_snapshot,
             get_model_settings,
             import_models,

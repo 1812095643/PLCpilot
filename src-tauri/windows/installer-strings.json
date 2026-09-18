@@ -1,0 +1,21 @@
+{
+  "upstream": {
+    "version": "2.11.4",
+    "url": "https://raw.githubusercontent.com/tauri-apps/tauri/tauri-cli-v2.11.4/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi",
+    "sha256": "20f4ecc730defb71f1342eaeaec4021df13be3d843abba0effe88ea5835fa079",
+    "msiUrl": "https://raw.githubusercontent.com/tauri-apps/tauri/tauri-cli-v2.11.4/crates/tauri-bundler/src/bundle/windows/msi/main.wxs",
+    "msiSha256": "e371a01628a06730828f9bd24111feacb8bec53c250ccec4b46df756fe0a0198"
+  },
+  "languages": {
+    "2052": {
+      "PlcStartWithWindows": "开机自启",
+      "PlcRunNow": "立即启动 PLC Pilot",
+      "PlcStartupSaveError": "开机自启设置未能保存。你可以稍后在软件的“设置 → 通用”中调整。"
+    },
+    "1033": {
+      "PlcStartWithWindows": "Start PLC Pilot when I sign in to Windows",
+      "PlcRunNow": "Launch PLC Pilot now",
+      "PlcStartupSaveError": "The startup preference could not be saved. You can change it later in Settings > General."
+    }
+  }
+}

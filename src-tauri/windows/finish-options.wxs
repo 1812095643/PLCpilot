@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <Property Id="PLC_CREATE_DESKTOP" Value="1" Secure="yes" />
+    <Property Id="PLC_AUTOSTART" Secure="yes" />
+    <Property Id="PLC_STARTUP_PRESENT" Secure="yes" />
+    <Binary Id="PlcOptionsScript" SourceFile="$(sys.SOURCEFILEDIR)msi-options.js" />
+    <CustomAction Id="PlcReadInstallOptions" BinaryKey="PlcOptionsScript" JScriptCall="readInstallOptions" Return="check" />
+    <CustomAction Id="PlcApplyInstallOptions" BinaryKey="PlcOptionsScript" JScriptCall="applyInstallOptions" Return="check" />
+    <CustomAction Id="PlcRestoreStartup" BinaryKey="PlcOptionsScript" JScriptCall="restoreStartup" Return="check" />
+    <CustomAction Id="PlcRemoveStartup" BinaryKey="PlcOptionsScript" JScriptCall="removeStartup" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="PlcReadInstallOptions" Before="InstallInitialize">1</Custom>
+      <Custom Action="PlcRemoveStartup" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="PlcRestoreStartup" After="InstallFinalize">NOT REMOVE AND PLC_STARTUP_PRESENT</Custom>
+    </InstallExecuteSequence>
+    <UI>
+      <Dialog Id="PlcFinishDialog" Width="370" Height="270" Title="PLC Pilot 安装完成">
+        <Control Id="Background" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="yes" Text="!(loc.ExitDialogBitmap)" />
+        <Control Id="Title" Type="Text" X="135" Y="24" Width="220" Height="38" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Bigger}PLC Pilot 已安装" />
+        <Control Id="Description" Type="Text" X="135" Y="72" Width="220" Height="30" Transparent="yes" NoPrefix="yes" Text="选择下面的选项，然后点击“完成”。" />
+        <Control Id="RunNow" Type="CheckBox" X="135" Y="112" Width="220" Height="18" Property="WIXUI_EXITDIALOGOPTIONALCHECKBOX" CheckBoxValue="1" Text="立即启动 PLC Pilot" />
+        <Control Id="DesktopShortcut" Type="CheckBox" X="135" Y="140" Width="220" Height="18" Property="PLC_CREATE_DESKTOP" CheckBoxValue="1" Text="创建桌面快捷方式" />
+        <Control Id="Autostart" Type="CheckBox" X="135" Y="168" Width="220" Height="18" Property="PLC_AUTOSTART" CheckBoxValue="1" Text="开机自启" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Finish" Type="PushButton" X="294" Y="244" Width="66" Height="17" Default="yes" Cancel="yes" Text="完成" />
+      </Dialog>
+      <Publish Dialog="PlcFinishDialog" Control="Finish" Event="DoAction" Value="PlcApplyInstallOptions" Order="1">1</Publish>
+      <Publish Dialog="PlcFinishDialog" Control="Finish" Event="DoAction" Value="LaunchApplication" Order="2">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1</Publish>
+      <Publish Dialog="PlcFinishDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999">1</Publish>
+      <InstallUISequence>
+        <Custom Action="PlcReadInstallOptions" After="CostFinalize">1</Custom>
+        <Show Dialog="ExitDialog" OnExit="success">REMOVE</Show>
+        <Show Dialog="PlcFinishDialog" OnExit="success">NOT REMOVE</Show>
+      </InstallUISequence>
+      <AdminUISequence>
+        <Show Dialog="ExitDialog" OnExit="success" />
+      </AdminUISequence>
+    </UI>
+  </Fragment>
+</Wix>

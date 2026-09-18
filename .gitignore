@@ -2,6 +2,8 @@ runtime-stage/
 tmp/plc-pilot-runtime-cache/
 output/PLC-Pilot-Portable/runtime/
 release-stage/
+src-tauri/windows/generated/
+tmp/installer-template-cache/
 stone-mcp/dist/
 stone-mcp/__pycache__/
 output/PLC-Pilot-STone-MCP-*.zip
