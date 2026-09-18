@@ -66,7 +66,7 @@ async function copy(): Promise<void> {
 
 <style scoped>
 .activity-entry { --activity-muted:#74777e; --activity-text:#33373e; --activity-panel:#f6f7f8; --activity-edge:#dcdfe2; min-width:0; width:100%; }
-:global(.dark) .activity-entry { --activity-muted:#92969e; --activity-text:#c4c8ce; --activity-panel:#252629; --activity-edge:#3b3d42; }
+:global(.dark .activity-entry) { --activity-muted:#92969e; --activity-text:#c4c8ce; --activity-panel:#252629; --activity-edge:#3b3d42; }
 .activity-heading { display:flex; align-items:center; gap:6px; width:100%; min-width:0; min-height:22px; padding:1px 0; border:0; background:transparent; color:var(--activity-muted); text-align:left; font-size:12px; line-height:18px; cursor:pointer; }
 .activity-heading:disabled { cursor:default; }.activity-heading:hover:not(:disabled) { color:var(--activity-text); }.activity-icon,.activity-chevron { flex-shrink:0; }
 .activity-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:450; }.activity-chevron { transition:transform 180ms ease; transform:rotate(-90deg); }.activity-chevron.expanded { transform:rotate(0deg); }

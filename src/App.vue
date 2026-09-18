@@ -22,7 +22,7 @@ import type { ComposerDraftPayload, ThreadComposerExposed, SubmitPayload } from 
 import { useWorkspaceThreads, type WorkspaceThread } from './composables/useWorkspaceThreads'
 import { useAppTheme } from './composables/useAppTheme'
 import { useAccessMode } from './composables/useAccessMode'
-import { hasTurnResponseText } from './utils/conversationTurns'
+import { hasTurnResponseText, insertTimelineActivity } from './utils/conversationTurns'
 import { useModelSettings } from './composables/useModelSettings'
 import IconTablerBolt from './components/icons/IconTablerBolt.vue'
 import IconTablerSettings from './components/icons/IconTablerSettings.vue'
@@ -683,64 +683,22 @@ function isVisibleActivityEvent(event: AgentEvent): boolean {
     || (event.kind === 'mcp' && ['warning', 'error', 'blocked'].includes(event.status))
 }
 
-function splitLiveAssistantBeforeActivity(
-  event: AgentEvent,
-  turnIndex: number,
-  thread: WorkspaceThread,
-  streamedText: string,
-  resetStream: (requestId: string) => void,
-  requestId: string,
-): void {
-  if (!['tool', 'command', 'approval', 'safety', 'progress', 'steering'].includes(event.kind)) return
-  const { messages, streamingAssistantId } = workspace.refs(thread)
-  const eventId = event.id ? `turn-${turnIndex}:${event.id}` : ''
-  if (eventId && messages.value.some((message) => message.id === eventId)) return
-  const activeId = streamingAssistantId.value
-  if (activeId && streamedText.trim()) {
-    messages.value = messages.value.map((message) => message.id === activeId ? { ...message, text: streamedText } : message)
-  }
-  // 文本流 composable 只有一个当前缓冲。工具/命令后必须清空它，后续 delta
-  // 才会进入 upsertLiveAgentEvent 新建的 assistant 段，而不是把前文再写一遍。
-  resetStream(requestId)
-}
-
 /**
- * 将单次工具生命周期固定在一行中：start 首次插入，update/end 依据同一 ID 原位替换。
- * 新的工具首次出现时插在当前文本段之后，并创建下一段 live assistant；同一
- * toolCallId 的 update/end 只原位替换，因而不会把已经输出的文本重新挪到顶部。
+ * 工具、重试和其他可见活动共用同一条插入链路，避免遗漏某种事件的正文边界。
+ * 首次事件保存所有已收到的 delta；结束状态只更新原记录，不清空当前正文。
  */
 function upsertLiveAgentEvent(event: AgentEvent, turnIndex: number, thread = workspace.active.value, timelineOrder?: number): void {
   const { messages, streamingAssistantId } = workspace.refs(thread)
   if (!isVisibleActivityEvent(event)) return
   const nextMessage = eventToMessage(event, turnIndex, thread.project.project_directory || thread.project.path || '', timelineOrder)
-  const next = [...messages.value]
-  const existingIndex = next.findIndex((message) => message.id === nextMessage.id)
-  if (existingIndex >= 0) {
-    // 生命周期更新不能重新计算顺序；保留第一次出现时的时间线位置。
-    nextMessage.timelineOrder = next[existingIndex].timelineOrder ?? timelineOrder
-    next[existingIndex] = nextMessage
-  } else {
-    const assistantIndex = next.findIndex((message) => message.id === streamingAssistantId.value)
-    const insertIndex = assistantIndex >= 0 ? assistantIndex + 1 : next.length
-    nextMessage.timelineOrder = timelineOrder
-    next.splice(insertIndex, 0, nextMessage)
-    // 工具后续返回的 delta 必须进入新的文本段，否则 watcher 会把文字继续写到
-    // 工具之前的 assistant 节点，视觉上就会再次出现“工具在顶部”的错位。
-    if (assistantIndex >= 0 && (event.kind === 'tool' || event.kind === 'command' || event.kind === 'approval' || event.kind === 'safety' || event.kind === 'progress' || event.kind === 'steering')) {
-      const nextAssistant: UiMessage = {
-        id: newId('assistant-live'),
-        role: 'assistant',
-        text: '',
-        messageType: 'agentMessage.live',
-        turnId: `turn-${turnIndex}`,
-        turnIndex,
-        timelineOrder: timelineOrder === undefined ? undefined : timelineOrder + 0.001,
-      }
-      next.splice(insertIndex + 1, 0, nextAssistant)
-      streamingAssistantId.value = nextAssistant.id
-    }
+  const requestId = thread.streamingRequestId
+  const next = insertTimelineActivity(messages.value, nextMessage, streamingAssistantId.value,
+    thread.textStream.currentText(requestId), () => newId('assistant-live'))
+  messages.value = next.messages
+  streamingAssistantId.value = next.assistantId
+  if (next.split) {
+    thread.textStream.reset(requestId)
   }
-  messages.value = next
 }
 
 function syncPendingChangeFromEvent(event: AgentEvent, thread: WorkspaceThread): void {
@@ -777,7 +735,8 @@ function appendAgentResult(
   const { messages, liveOverlay, diagnostics, diagnosticNote } = workspace.refs(thread)
   const queuedMessages = messages.value.filter(isQueuedMessage)
   const currentMessages = messages.value.filter((item) => !isQueuedMessage(item))
-  const turnIndex = currentMessages.filter((item) => item.role === 'user').length - 1
+  const turnIndex = currentMessages.find((item) => item.id === thread.streamingAssistantId)?.turnIndex
+    ?? currentMessages.filter((item) => item.role === 'user').length - 1
   const resultMessages = result.events
     .filter(isVisibleActivityEvent)
     .map((event, index) => eventToMessage(event, turnIndex, thread.project.project_directory || thread.project.path || '', index))
@@ -808,9 +767,7 @@ function appendAgentResult(
   }
   const activityEventIds = resultMessages.filter((message) => message.commandExecution).map((message) => message.id)
   if ((activityEventIds.length > 0 || activityDurationMs > 0) && !currentMessages.some((message) => message.messageType === 'worked' && message.turnId === `turn-${turnIndex}`)) {
-    // worked 只承担耗时分隔线。工具节点已经按真实发生位置渲染，不能再把
-    // activityEventIds 绑定到 worked，否则 ThreadConversation 会隐藏原工具并
-    // 在分隔线处重复展开，重新制造“工具集中在顶部”的问题。
+    // 分隔线只保存耗时。完成后的折叠由视图按完整轮次控制，展开仍使用原时间线。
     const workedMessage: UiMessage = { id: newId('worked'), role: 'system', text: '处理完成', messageType: 'worked', activityDurationMs: Math.max(0, Math.round(activityDurationMs)), turnId: `turn-${turnIndex}`, turnIndex }
     const userIndex = currentMessages.findIndex((message) => message.role === 'user' && message.turnIndex === turnIndex)
     const firstTurnIndex = currentMessages.findIndex((message) => message.turnIndex === turnIndex)
@@ -980,7 +937,7 @@ function resumeSubmitQueue(): void {
 
 async function onSubmit(payload: SubmitPayload, thread = workspace.active.value): Promise<void> {
   const { messages, isBusy, liveOverlay, pendingResponseAnnotations, streamingRequestId, streamingAssistantId, selectedModel, selectedModelProfileId, reasoningEffort, collaborationMode } = workspace.refs(thread)
-  const { displayedText: streamingText, currentText: currentStreamingText, start: startTextStream, reset: resetTextStream, append: appendTextDelta, flush: flushTextStream, stop: stopTextStream } = thread.textStream
+  const { displayedText: streamingText, start: startTextStream, reset: resetTextStream, append: appendTextDelta, flush: flushTextStream, stop: stopTextStream } = thread.textStream
   const text = payload.text.trim()
   if (text === '/stop') { await onInterrupt(false, thread); return }
   if (text === '/new') { await startNewThread(); return }
@@ -1088,7 +1045,6 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   function showAgentEvent(item: AgentEvent, timelineOrder?: number): void {
     if (item.kind === 'steering') {
       thread.queuedSubmits = thread.queuedSubmits.filter((input) => input.id !== item.id)
-      splitLiveAssistantBeforeActivity(item, pendingTurnIndex, thread, currentStreamingText(requestId), resetTextStream, requestId)
       upsertLiveAgentEvent(item, pendingTurnIndex, thread, timelineOrder)
       return
     } else if (item.kind === 'steering_error') {
@@ -1105,13 +1061,9 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
       }
       return
     }
-    if (item.kind === 'retry' && item.status === 'running') {
-      messages.value = messages.value.map((message) => message.commandExecution?.kind === 'retry' && message.commandExecution.status === 'inProgress' ? { ...message, commandExecution: { ...message.commandExecution, status: 'completed', exitCode: 0 } } : message)
-    }
     // 审批事件在工具暂停的瞬间携带完整摘要；不能等 result，否则 Agent
     // 可能已经结束，用户会错过可点击的批准/拒绝按钮。
     syncPendingChangeFromEvent(item, thread)
-    splitLiveAssistantBeforeActivity(item, pendingTurnIndex, thread, currentStreamingText(requestId), resetTextStream, requestId)
     upsertLiveAgentEvent(item, pendingTurnIndex, thread, timelineOrder)
     if (item.kind === 'progress') {
       // 已落定的中途说明使用独立正文。清理同一段 live 文本，下一次生成再续写，
@@ -1122,9 +1074,7 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     if (item.kind === 'retry') {
       stopThinkingTimer()
       if (item.status === 'running' || item.status === 'warning') {
-        // 上一次失败流可能已经产生半截文字；重连等待开始时清理该尝试，
-        // 下一次 assistant stream_start 会再次确认边界。
-        resetTextStream(requestId)
+        // 已收到的部分正文由时间线保留，恢复后的 delta 写入重试记录后面的新段。
         const attempt = item.retry_attempt ?? 1
         const maxAttempts = item.retry_max_attempts ?? 5
         const wait = item.retry_delay_ms === null || item.retry_delay_ms === undefined

@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { hideProcessWindows, createApprovedTools, executeApprovedCommand, abortApprovedCommand, recordApproval } from "./builtin-tools.mjs";
 import { createProjectMemory, createContextExtension, contextSettings, redactContext } from "./context-memory.mjs";
+import { createRetryEvents } from "./retry-events.mjs";
 import { createDiagnosticLogger, registerDiagnosticSecrets, observeProcess } from "../shared/diagnostics.mjs";
 
 const diagnosticLog = createDiagnosticLogger("agent-host");
@@ -75,7 +76,7 @@ function writeMessage(message) {
 
 function sendEvent(event) {
   writeMessage({ type: "event", event });
-  if (activeSession && ["tool", "command", "approval", "safety", "progress", "compaction", "steering"].includes(event.kind)) {
+  if (activeSession && ["tool", "command", "approval", "safety", "progress", "compaction", "steering", "retry"].includes(event.kind)) {
     // 把第一次 running 事件也落盘。SessionManager 读取时按 event.id 原位合并
     // 后续状态，因此保留的是工具首次发起的 JSONL 位置，而不是完成位置。
     activeSession.sessionManager.appendCustomEntry("plc-pilot.activity", { turn_index: activeTurnIndex, event });
@@ -219,13 +220,9 @@ function retryReason(errorMessage) {
   return status ? `HTTP ${status}` : "连接或超时";
 }
 
-function emitRetryEvent({ attempt, delayMs = 0, statusCode = null, status = "running", title, detail }) {
-  const event = makeEvent("retry", title, detail, status, null, `retry-${attempt}`);
-  event.retry_attempt = attempt;
-  event.retry_max_attempts = retryPreferences.max_retries;
-  event.retry_delay_ms = delayMs;
-  event.retry_status = statusCode;
-  sendEvent(event);
+const retryEvents = createRetryEvents(sendEvent);
+function emitRetryEvent(options) {
+  retryEvents({ ...options, maxAttempts: retryPreferences.max_retries });
 }
 
 function lastAssistantError(session) {
@@ -628,7 +625,7 @@ function handleSessionEvent(event) {
   }
   if (event.type === "auto_retry_start") {
     const statusCode = extractHttpStatus(event.errorMessage) ?? retryStatusCode;
-    const title = `模型请求重试：第 ${event.attempt}/${event.maxAttempts} 次`;
+    const title = `正在重新连接 ${event.attempt}/${event.maxAttempts}`;
     const detail = `${retryReason(event.errorMessage)}，等待 ${formatRetryDelay(event.delayMs)} 后再次请求。原因：${event.errorMessage}`;
     emitRetryEvent({
       attempt: event.attempt,
@@ -642,7 +639,7 @@ function handleSessionEvent(event) {
   if (event.type === "auto_retry_end") {
     const statusCode = extractHttpStatus(event.finalError) ?? retryStatusCode;
     const title = event.success
-      ? `模型请求重试完成（第 ${event.attempt}/${retryPreferences.max_retries} 次）`
+      ? `已重新连接 ${event.attempt}/${retryPreferences.max_retries}`
       : `模型请求重试已耗尽（第 ${event.attempt}/${retryPreferences.max_retries} 次）`;
     const detail = event.success
       ? "后续请求已恢复。"

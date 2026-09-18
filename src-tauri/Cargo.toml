@@ -1,7 +1,7 @@
 [package]
 name = "plc-pilot"
-version = "0.1.11"
-description = "PLC Pilot 面向 CODESYS 的独立桌面 Agent 工作台"
+version = "0.1.12"
+description = "PLC Pilot 支持 CODESYS、CAREL STone 与自由聊天的独立桌面 Agent 工作台"
 authors = ["PLC Pilot"]
 edition = "2021"
 

@@ -42,7 +42,7 @@ jobs:
           if (!$env:TAURI_SIGNING_PRIVATE_KEY) { throw '请先配置 TAURI_SIGNING_PRIVATE_KEY 仓库密钥。' }
           npm run build
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          node --test shared/diagnostics.test.mjs stone-mcp/test/stone.test.mjs agent-host/context-memory.test.mjs
+          node --test shared/diagnostics.test.mjs stone-mcp/test/stone.test.mjs agent-host/context-memory.test.mjs agent-host/retry-events.test.mjs src/utils/conversationTurns.test.mjs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --manifest-path src-tauri/Cargo.toml --lib
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

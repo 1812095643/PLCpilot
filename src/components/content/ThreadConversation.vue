@@ -25,12 +25,13 @@
       </li>
       <template v-for="message in visibleMessages" :key="message.id">
        <li
-         v-if="!hiddenGroupedCommandIds.has(message.id) && !hiddenWorkedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
+         v-if="!hiddenGroupedCommandIds.has(message.id) && !history.hiddenIds.value.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
          class="conversation-item"
          :data-role="message.role"
          :data-message-type="message.messageType || ''"
          :data-message-id="message.id"
          :data-live-tail="message.id === latestLiveAssistantId ? 'true' : 'false'"
+         :data-process-entry="history.processIds.value.has(message.id) ? 'true' : undefined"
         >
         <div v-if="isCommandMessage(message)" class="message-row" data-role="system">
           <ConversationActivityGroup :messages="getCommandBlockForLatest(message)" />
@@ -178,8 +179,12 @@
               <article v-if="message.text.length > 0" class="message-card" :data-role="message.role">
                 <span v-if="message.messageType === 'queued' || message.messageType === 'queued-steering'" class="message-queued-badge">{{ message.messageType === 'queued-steering' ? '调整中' : '排队中' }}</span>
                 <div v-if="message.messageType === 'worked'" class="turn-activity-summary">
-                  <p class="turn-duration">{{ message.activityDurationMs ? formatWorkedDuration(message.activityDurationMs) : '处理完成' }}</p>
-                  <ConversationActivityGroup v-if="getCommandsForWorked(message).length > 0" :messages="getCommandsForWorked(message)" />
+                  <ConversationTurnSummary
+                    :label="message.activityDurationMs ? formatWorkedDuration(message.activityDurationMs) : '操作过程'"
+                    :expanded="history.expanded.value.has(message.id)"
+                    :has-details="Boolean(history.byHeader.value.get(message.id)?.processIds.size)"
+                    @toggle="toggleCompletedProcess(message)"
+                  />
                 </div>
                 <div v-else-if="isPlanMessage(message)" class="plan-card" :data-streaming="message.messageType === 'plan.live'">
                   <div class="plan-card-header">
@@ -861,6 +866,8 @@ import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 import SessionTimeline, { type SessionTimelineTurn } from './SessionTimeline.vue'
 import ConversationActivityGroup from './ConversationActivityGroup.vue'
+import ConversationTurnSummary from './ConversationTurnSummary.vue'
+import { useCompletedResponses } from '../../composables/useCompletedResponses'
 import EmptyConversationWelcome from './EmptyConversationWelcome.vue'
 import { IconWifi, IconBrain } from '@tabler/icons-vue'
 
@@ -869,7 +876,6 @@ type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
 const expandedCommandIds = ref<Set<string>>(new Set())
 const collapsedAutoCommandIds = ref<Set<string>>(new Set())
 const expandedCommandGroupIds = ref<Set<string>>(new Set())
-const expandedWorkedIds = ref<Set<string>>(new Set())
 const expandedFileChangeSummaryIds = ref<Set<string>>(new Set())
 const activeDiffViewerSummary = ref<TurnFileChangeSummary | null>(null)
 const activeDiffViewerChangeKey = ref('')
@@ -1058,15 +1064,6 @@ const hiddenGroupedCommandIds = computed(() => {
   return next
 })
 
-const hiddenWorkedCommandIds = computed(() => {
-  const next = new Set<string>()
-  for (const message of props.messages) {
-    if (message.messageType !== 'worked') continue
-    for (const command of getCommandsForWorked(message)) next.add(command.id)
-  }
-  return next
-})
-
 function readPlanExplanation(message: UiMessage): string {
   return readPlanData(message)?.explanation ?? ''
 }
@@ -1204,19 +1201,18 @@ function commandOutputFormat(message: UiMessage): string {
   }
 }
 
-function toggleWorkedExpand(message: UiMessage): void {
-  const next = new Set(expandedWorkedIds.value)
-  if (next.has(message.id)) next.delete(message.id)
-  else next.add(message.id)
-  expandedWorkedIds.value = next
-}
-
-function isWorkedExpanded(message: UiMessage): boolean {
-  return expandedWorkedIds.value.has(message.id)
-}
-
-function workedDetailsId(message: UiMessage): string {
-  return `worked-details-${message.id.replace(/[^a-zA-Z0-9_-]/gu, '-')}`
+async function toggleCompletedProcess(message: UiMessage): Promise<void> {
+  const container = conversationListRef.value
+  const anchor = container && Array.from(container.querySelectorAll<HTMLElement>('[data-message-id]'))
+    .find((element) => element.dataset.messageId === message.id)
+  const top = anchor?.getBoundingClientRect().top
+  // 查看过程时停止自动追尾，保持点击的标题不动，避免展开长任务后跳到页底。
+  autoFollowOutput.value = false
+  if (bottomLockFrame) cancelAnimationFrame(bottomLockFrame)
+  bottomLockFrame = 0
+  history.toggle(message.id)
+  await nextTick()
+  if (container && anchor && top !== undefined) container.scrollTop += anchor.getBoundingClientRect().top - top
 }
 
 function formatWorkedDuration(durationMs: number): string {
@@ -1304,22 +1300,6 @@ function pruneCommandIdSet(source: Set<string>, validIds: Set<string>): Set<stri
     if (validIds.has(id)) next.add(id)
   }
   return next.size === source.size ? source : next
-}
-
-function getCommandsForWorked(workedMessage: UiMessage): UiMessage[] {
-  const eventIds = new Set(workedMessage.activityEventIds ?? [])
-  if (eventIds.size > 0) {
-    return props.messages.filter((message) => eventIds.has(message.id) && isCommandMessage(message))
-  }
-
-  const workedIndex = props.messages.indexOf(workedMessage)
-  const result: UiMessage[] = []
-  for (let i = workedIndex - 1; i >= 0; i--) {
-    const m = props.messages[i]
-    if (m.messageType === 'commandExecution') result.unshift(m)
-    else if (m.role === 'user' || m.messageType === 'worked') break
-  }
-  return result
 }
 
 const props = defineProps<{
@@ -1512,12 +1492,11 @@ const LOAD_MORE_SCROLL_THRESHOLD_PX = 200
 const renderWindowStart = ref(0)
 const isLoadingMore = ref(false)
 const hiddenDuplicateProgressIds = computed(() => duplicateProgressIds(props.messages))
+const history = useCompletedResponses(props, renderWindowStart)
 
 const visibleMessages = computed(() => {
-  // 消息数组本身就是唯一时间线。旧实现为了把耗时显示在用户消息后面，
-  // 在这里重新插入 worked，连带把工具视觉上固定到轮次开头；现在完全保留
-  // 实时归并和历史恢复后的原始顺序。
-  return props.messages.slice(renderWindowStart.value).filter((message) => {
+  // 折叠只控制过程可见性，展开时仍复用原时间线的正文、批注和工具详情渲染。
+  return history.timeline.value.filter((message) => {
   if (hiddenDuplicateProgressIds.value.has(message.id)) return false
   // 流式回复建立时先插入空 assistant 占位；浮动状态行已经承担反馈，
   // 空占位不能参与列表布局，否则重试/思考之间会出现一整行无意义空白。
@@ -1527,12 +1506,12 @@ const visibleMessages = computed(() => {
     && !(message.references?.length))
   })
 })
-const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
+const hasMoreAbove = computed(() => history.start.value > 0 || props.hasMorePersistedAbove === true)
 
 const responseFooters = computed(() => responseFooterAnchors(
   props.messages,
   new Set(visibleMessages.value.filter((message) => !hiddenGroupedCommandIds.value.has(message.id)
-    && !hiddenWorkedCommandIds.value.has(message.id) && !hiddenFileChangeMessageIds.value.has(message.id)).map((message) => message.id)),
+    && !history.hiddenIds.value.has(message.id) && !hiddenFileChangeMessageIds.value.has(message.id)).map((message) => message.id)),
   Boolean(props.isTurnInProgress),
 ))
 
@@ -1895,6 +1874,11 @@ const copyableResponseContentByAnchorId = computed<Record<string, string>>(() =>
     next[response.anchorMessageId] = content
   }
 
+  // 完成轮的复制入口对应正式答复，展开过程也不会把中途说明混入结果。
+  for (const group of history.groups.value.values()) {
+    next[group.final.id] = buildCopyableMessageContent(group.final)
+  }
+
   for (const [anchorMessageId, summary] of Object.entries(anchoredFileChangeSummaryByAnchorId.value)) {
     if (summary.source !== 'metadata') continue
     const fileChangeCopy = buildFileChangeCopyText(summary)
@@ -2151,7 +2135,7 @@ function removeAnnotation(annotation: UiResponseTextAnnotation): void {
   closeCommentComposer()
 }
 
-function openResponseAnnotation(annotation: UiResponseTextAnnotation): void {
+async function openResponseAnnotation(annotation: UiResponseTextAnnotation): Promise<void> {
   const message = props.messages.find((candidate) => candidate.id === annotation.sourceMessageId)
     ?? (annotation.sourceMessageKey
       ? props.messages.find((candidate) => messageStableKey(candidate) === annotation.sourceMessageKey)
@@ -2160,6 +2144,7 @@ function openResponseAnnotation(annotation: UiResponseTextAnnotation): void {
       ? [...props.messages].reverse().find((candidate) => candidate.role === 'assistant' && candidate.turnIndex === annotation.sourceTurnIndex)
       : undefined)
   if (!message || message.role !== 'assistant') return
+  await jumpToTimelineMessage(message.id)
   const marker = Array.from(document.querySelectorAll<HTMLElement>('.response-annotation-marker'))
     .find((candidate) => candidate.dataset.annotationId === annotation.id) ?? null
   openExistingAnnotationEditor(message, annotation, marker)
@@ -4051,6 +4036,7 @@ async function jumpToTimelineMessage(messageId: string): Promise<void> {
   if (targetIndex < renderWindowStart.value) {
     renderWindowStart.value = Math.max(0, targetIndex - 6)
   }
+  history.reveal(messageId)
   await nextTick()
   const container = conversationListRef.value
   if (!container) return
@@ -4076,8 +4062,8 @@ async function loadMoreAbove(): Promise<void> {
   const prevScrollTop = container.scrollTop
 
   try {
-    if (renderWindowStart.value > 0) {
-      renderWindowStart.value = Math.max(0, renderWindowStart.value - LOAD_MORE_CHUNK)
+    if (history.start.value > 0) {
+      renderWindowStart.value = Math.max(0, history.start.value - LOAD_MORE_CHUNK)
     } else if (props.hasMorePersistedAbove === true) {
       await props.loadEarlierMessages?.(threadIdAtStart)
     }
@@ -4194,6 +4180,10 @@ watch(
   },
   { deep: true },
 )
+
+watch(() => props.isTurnInProgress, async (running) => {
+  if (!running) await scheduleConversationScroll()
+})
 
 watch(
   () => props.isLoading,
@@ -4863,7 +4853,9 @@ onBeforeUnmount(() => {
   @apply w-full max-w-full px-0 py-0 bg-transparent border-none rounded-none;
 }
 
-.turn-duration { margin:2px 0 6px; padding-bottom:8px; border-bottom:1px solid color-mix(in srgb,currentColor 12%,transparent); color:#858990; font-size:12px; line-height:20px; }
+.conversation-item[data-process-entry='true'] { animation: process-appear 160ms ease-out; }
+@keyframes process-appear { from { opacity:0; } to { opacity:1; } }
+@media(prefers-reduced-motion:reduce) { .conversation-item[data-process-entry='true'] { animation:none; } }
 .conversation-item[data-message-type='agentMessage.commentary'] .message-text { font-size:13px; line-height:1.75; }
 .conversation-item-overlay .live-overlay-inline { padding-top:0; padding-bottom:0; }
 

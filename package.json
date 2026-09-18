@@ -1,8 +1,8 @@
 {
   "name": "plc-pilot",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "private": true,
-  "description": "面向 CODESYS 3.5.22 的 Codex 风格 PLC 桌面工作台",
+  "description": "支持 CODESYS、CAREL STone 与自由聊天的本地 AI Agent 工作台",
   "type": "module",
   "workspaces": ["stone-mcp"],
   "scripts": {
