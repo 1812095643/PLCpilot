@@ -134,12 +134,12 @@ pub async fn discover_provider_models(id: String, state: State<'_, AppState>) ->
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn import_provider_models(id: String, model_ids: Vec<String>, state: State<'_, AppState>) -> Result<Vec<ModelSummary>, AppError> {
+pub async fn import_provider_models(id: String, models: Vec<DiscoveredModel>, state: State<'_, AppState>) -> Result<Vec<ModelSummary>, AppError> {
     let mut guard = state.inner.lock().await;
     let mut next = guard.clone();
     let provider = next.model_providers.iter().find(|provider| provider.id == id).ok_or_else(|| AppError::Configuration("请先保存服务商。".into()))?;
     let config = provider_model(provider);
-    let imported = merge_discovered_models(&mut next, config, model_ids)?;
+    let imported = merge_discovered_models_with_metadata(&mut next, config, models)?;
     persist_runtime_state(&next)?;
     *guard = next;
     Ok(imported)

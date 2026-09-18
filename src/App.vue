@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, shallowRef, watch, type ComponentPublicInstance } from 'vue'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import DesktopLayout from './components/layout/DesktopLayout.vue'
+import AppSplashScreen from './components/layout/AppSplashScreen.vue'
 import WindowTitleBar from './components/layout/WindowTitleBar.vue'
 import SidebarThreadControls from './components/sidebar/SidebarThreadControls.vue'
 import WorkspaceSidebar, { type SidebarThread } from './components/sidebar/WorkspaceSidebar.vue'
@@ -89,6 +90,8 @@ import type { Diagnostic } from './api/plcBridge'
 type View = 'chat' | 'overview' | 'skills'
 
 const snapshot = shallowRef<Snapshot>(EMPTY_SNAPSHOT)
+const appReady = shallowRef(false)
+const showAppSplash = shallowRef(true)
 const modelSettings = useModelSettings(snapshot)
 const isSavingModel = shallowRef(false)
 const workspace = useWorkspaceThreads()
@@ -327,6 +330,38 @@ function newId(prefix: string): string {
   return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`
 }
 
+function deriveSessionTitle(text: string, attachments: UiAttachment[] = []): string {
+  const normalized = text
+    .replace(/^\/(?:plan|compact)\b/iu, '')
+    .replace(/\s+/gu, ' ')
+    .replace(/^[@#]+/u, '')
+    .trim()
+  if (!normalized) {
+    const firstAttachment = attachments[0]?.name?.trim()
+    return firstAttachment ? `分析 ${firstAttachment.slice(0, 24)}${firstAttachment.length > 24 ? '…' : ''}` : '新对话'
+  }
+  if (/^(hi|hello|你好|嗨|test|测试)$/iu.test(normalized)) return normalized
+  const firstSentence = normalized.split(/[。！？!?\n]/u)[0]?.trim() || normalized
+  return firstSentence.slice(0, 28) + (firstSentence.length > 28 ? '…' : '')
+}
+
+function isTemporarySessionThread(thread: WorkspaceThread): boolean {
+  const path = normalizePathForUi(thread.project.path || '').replaceAll('\\', '/').toLowerCase()
+  return path.includes('/plcpilot/') || path.endsWith('/plcpilot')
+}
+
+function maybeNameTemporarySession(thread: WorkspaceThread, text: string, attachments: UiAttachment[], firstTurn: boolean): void {
+  if (!isTemporarySessionThread(thread) || !firstTurn || thread.session.name && !['新对话', '临时会话'].includes(thread.session.name)) return
+  const title = deriveSessionTitle(text, attachments)
+  thread.session = { ...thread.session, name: title }
+  if (thread === workspace.active.value) snapshot.value = { ...snapshot.value, session: { ...snapshot.value.session, name: title } }
+  if (thread.session.session_file) {
+    void renameSession(title, thread.session.session_file)
+      .then((summary) => { thread.session = { ...thread.session, ...summary } })
+      .catch(() => undefined)
+  }
+}
+
 function isQueuedMessage(message: UiMessage): boolean {
   return message.messageType === 'queued' || message.messageType === 'queued-steering'
 }
@@ -558,13 +593,15 @@ function normalizeReasoningEffort(
   return (['high', 'low', 'minimal', 'none', 'xhigh', 'max'] as const).find((level) => supported.includes(level)) ?? 'none'
 }
 
-async function refresh(): Promise<void> {
+async function refresh(reloadModels = true): Promise<void> {
   if (isRefreshing.value) return
   isRefreshing.value = true
   try {
     // 模型连接配置和工作区快照互不依赖，按 Codex 控制面思路并行读取；
     // 之前串行等待会把两个本地 IPC 请求的耗时叠加到模式切换反馈上。
-    const [, next] = await Promise.all([modelSettings.reload(), getSnapshot()])
+    const next = reloadModels
+      ? (await Promise.all([modelSettings.reload(), getSnapshot()]))[1]
+      : await getSnapshot()
     // MCP 探测期间可能已保存/导入模型。完整快照只合并其他数据，模型以独立
     // 接口为准，避免较晚返回的旧快照把新配置和对话选择器回滚。
     next.models = snapshot.value.models
@@ -827,6 +864,15 @@ function insertFileMention(): void {
   composerRef.value?.appendTextToDraft('@')
 }
 
+function onSuggestedPrompt(prompt: string): void {
+  const current = composerRef.value?.readDraft()
+  if (!current) return
+  composerRef.value?.hydrateDraft({
+    ...current,
+    text: current.text.trim() ? `${current.text.trimEnd()}\n${prompt}` : prompt,
+  })
+}
+
 function queuedMessageFromPayload(id: string, payload: SubmitPayload): UiMessage {
   const attachments = messageAttachments((payload.attachments ?? []).filter((attachment) => attachment.status === 'ready'))
   return {
@@ -973,6 +1019,7 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   const queuedMessagesAtStart = messages.value.filter(isQueuedMessage)
   const baseMessages = messages.value.filter((item) => !isQueuedMessage(item))
   const pendingTurnIndex = baseMessages.filter((item) => item.role === 'user').length
+  const firstTurn = pendingTurnIndex === 0 && !thread.session.name
   const requestModel = payload.model?.trim() || selectedModel.value
   const requestModelProfileId = payload.modelProfileId?.trim() || selectedModelProfileId.value
   const requestReasoningEffort = payload.reasoningEffort ?? reasoningEffort.value
@@ -1266,9 +1313,10 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     messages.value = [...currentMessages, ...queuedMessages]
     const finishedAt = globalThis.performance?.now?.() ?? Date.now()
     appendAgentResult(result, text, payload.skills, visibleAttachments, payload.references, responseAnnotations, finishedAt - startedAt, requestModelProfileId, requestModel, requestReasoningEffort, requestCollaborationMode, thread, nativeTurnIndex)
+    maybeNameTemporarySession(thread, text, visibleAttachments, firstTurn)
     pendingResponseAnnotations.value = []
     // 正文和工具轨迹已经落地，连接检查/MCP 状态刷新不应继续占住发送按钮。
-    void refresh().catch(() => undefined)
+    void refresh(false).catch(() => undefined)
   } catch (error) {
     const errorText = error instanceof Error ? error.message : String(error)
     const interrupted = /已中止|已停止/u.test(errorText)
@@ -1952,9 +2000,9 @@ let stopWindowDrop: (() => void) | undefined
 let syncTimer: number | undefined
 
 onMounted(async () => {
-  // refresh 已并行读取模型配置和界面快照；启动阶段不再重复请求一次模型设置。
-  await refresh()
   try {
+    // 开屏动画与初始化并行；异常同样交还工作台，保留设置和重试入口。
+    await refresh()
     const restored = await workspace.restore()
     if (!restored) workspace.active.value.project = snapshot.value.project
     // 空白会话或未发送草稿在重启后继续保持无路径，首次发送再创建目录。
@@ -1964,10 +2012,17 @@ onMounted(async () => {
     // 当前线程上下文为准，不能因为启动刷新把它误替换成旧工程。
     snapshot.value = { ...snapshot.value, project: workspace.active.value.project }
     projectPathDraft.value = workspace.active.value.project.path || ''
-  } catch (error) { showNotice(`恢复会话工作区未完成：${String(error)}`) }
+  } catch (error) {
+    showNotice(`恢复会话工作区未完成：${String(error)}`)
+  } finally {
+    appReady.value = true
+  }
   window.addEventListener('keydown', onKeyDown)
   await setupNativeWindowDrop()
   syncTimer = window.setInterval(() => {
+    // 没有工程或本轮正在输出时，CODESYS Bridge 同步不会改变可见上下文，
+    // 继续发起请求只会抢占桌面 IPC 和扫描线程；下一次空闲 tick 再恢复同步。
+    if (workspace.active.value.isBusy || workbenchMode.value !== 'codesys' || !currentProject.value.path) return
     void syncCurrentProject().then((project) => {
       if (!workspace.active.value.isBusy && isSamePath(project.path, currentProject.value.path)) {
         workspace.active.value.project = project
@@ -1985,9 +2040,11 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <AppSplashScreen v-if="showAppSplash" :ready="appReady" @finished="showAppSplash = false" />
   <AppUpdateNotice v-if="!showSettings && updater.state.available && updater.state.phase === 'available' && updater.state.dismissedVersion !== updater.state.available.version"
     :version="updater.state.available.version" @open="settingsCategory = 'updates'; showSettings = true" @dismiss="updater.state.dismissedVersion = updater.state.available!.version" />
   <DesktopLayout
+    :is-initializing="showAppSplash"
     :is-sidebar-collapsed="isSidebarCollapsed"
     :is-settings-mode="showSettings"
     @close-sidebar="isSidebarCollapsed = true"
@@ -2058,6 +2115,9 @@ onUnmounted(() => {
             :is-turn-in-progress="isBusy"
             :active-thread-id="activeThreadId"
             :cwd="currentCwd"
+            :workbench-mode="workbenchMode"
+            :project-name="currentProject.name || ''"
+            :has-project="currentProject.exists"
             @edit-message="onEditMessage"
             @resend-message="onResendMessage"
             @retry-message="onRetryMessage"
@@ -2066,6 +2126,7 @@ onUnmounted(() => {
             @add-response-annotation="addResponseAnnotation"
             @update-response-annotation="updateResponseAnnotation"
             @remove-response-annotation="removeResponseAnnotation"
+            @suggest-prompt="onSuggestedPrompt"
           />
 
           <section v-if="pendingChanges.length > 0" class="plc-approval-strip" aria-live="polite">

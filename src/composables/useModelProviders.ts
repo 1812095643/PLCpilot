@@ -48,9 +48,9 @@ export function useModelProviders(refresh: () => void) {
     const result = await discoverProviderModels(saved.id)
     if (form.value.id === saved.id) { discovery.value = result; discoveryProviderId.value = saved.id }
   })
-  const add = (ids: string[]) => perform(async () => {
+  const add = (models: ModelDiscoveryResult['models']) => perform(async () => {
     if (!discoveryProviderId.value || discoveryProviderId.value !== form.value.id) throw new Error('请重新获取当前服务商的模型。')
-    const imported = await importProviderModels(discoveryProviderId.value, ids)
+    const imported = await importProviderModels(discoveryProviderId.value, models)
     notice.value = `已添加 ${imported.length} 个模型，可在对话中切换。`
     refresh()
   })

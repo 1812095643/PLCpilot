@@ -56,6 +56,7 @@ mod office_tools;
 mod diagnostics;
 mod model_providers;
 mod workbench;
+mod session_preview_cache;
 use attachments::{prepare_attachments, read_local_file, AttachmentInput, CodexImageInput};
 
 const CODESYS_SKILL: &str = include_str!("../../skills/codesys-agent/SKILL.md");
@@ -376,6 +377,12 @@ pub struct DiscoveredModel {
     pub id: String,
     pub name: String,
     pub owned_by: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub reasoning_levels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2526,6 +2533,12 @@ async fn get_model_settings(state: State<'_, AppState>) -> Result<Value, AppErro
 
 /// 按接口范围合并所选模型；同名的其他供应商配置不能被覆盖，密钥不返回前端。
 fn merge_discovered_models(state: &mut RuntimeState, config: ModelConfig, model_ids: Vec<String>) -> Result<Vec<ModelSummary>, AppError> {
+    let discovered = model_ids.into_iter().map(|id| DiscoveredModel { id: id.clone(), name: id, owned_by: None, context_window: None, max_tokens: None, reasoning_levels: Vec::new() }).collect();
+    merge_discovered_models_with_metadata(state, config, discovered)
+}
+
+fn merge_discovered_models_with_metadata(state: &mut RuntimeState, config: ModelConfig, discovered: Vec<DiscoveredModel>) -> Result<Vec<ModelSummary>, AppError> {
+    let model_ids = discovered.iter().map(|model| model.id.clone()).collect::<Vec<_>>();
     if model_ids.is_empty() || model_ids.len() > 500 {
         return Err(AppError::Configuration("请选择 1 到 500 个模型。".into()));
     }
@@ -2541,7 +2554,16 @@ fn merge_discovered_models(state: &mut RuntimeState, config: ModelConfig, model_
         let id = id.trim().to_string();
         if id.is_empty() || id.len() > 512 { return Err(AppError::Configuration("模型 ID 不能为空或超过 512 字节。".into())); }
         if !seen.insert(id.clone()) { continue; }
-        let mut model = normalize_model_for_save(ModelConfig { id: String::new(), name: id.clone(), model: id.clone(), enabled: true, is_default: false, ..source.clone() })?;
+        let metadata = discovered.iter().find(|item| item.id == id);
+        let mut model = normalize_model_for_save(ModelConfig {
+            id: String::new(),
+            name: metadata.map(|item| item.name.clone()).filter(|name| !name.trim().is_empty()).unwrap_or_else(|| id.clone()),
+            model: id.clone(),
+            context_window: metadata.and_then(|item| item.context_window).unwrap_or(source.context_window),
+            max_tokens: metadata.and_then(|item| item.max_tokens).unwrap_or(source.max_tokens).min(metadata.and_then(|item| item.context_window).unwrap_or(source.context_window) as u32),
+            reasoning_levels: metadata.map(|item| item.reasoning_levels.clone()).filter(|levels| !levels.is_empty()).unwrap_or_else(|| source.reasoning_levels.clone()),
+            enabled: true, is_default: false, ..source.clone()
+        })?;
         if let Some(existing) = state.models.iter_mut().find(|existing| existing.model == id && same_model_scope(existing, &model)) {
             // 再次添加只启用原配置、更新明确提供的连接凭据，保留其专属上下文设置。
             existing.enabled = true;
@@ -2954,21 +2976,23 @@ fn project_identity(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn is_temporary_project_path(path: &Path) -> bool {
+    let Some(document_root) = dirs::document_dir() else { return false; };
+    let path_key = project_identity(path);
+    let root_key = project_identity(&document_root.join("PLCpilot"));
+    path_key == root_key || path_key.starts_with(&(root_key + "/"))
+}
+
 fn project_record_from_context(project: &ProjectContext) -> Option<WorkspaceProject> {
     let path = project.path.as_deref()?.trim();
     if path.is_empty() {
         return None;
     }
-    let temporary_root = dirs::document_dir().map(|directory| directory.join("PLCpilot"));
-    let path_key = project_identity(Path::new(path));
-    let is_temporary = temporary_root.as_ref().is_some_and(|root| {
-        let root_key = project_identity(root);
-        path_key == root_key || path_key.starts_with(&(root_key + "/"))
-    });
+    let is_temporary = is_temporary_project_path(Path::new(path));
     Some(WorkspaceProject {
         id: project_identity(Path::new(path)),
         name: if is_temporary {
-            Path::new(path).file_name().and_then(|value| value.to_str()).map(|name| format!("临时会话 · {name}")).unwrap_or_else(|| "临时会话".into())
+            project.name.clone().filter(|name| !name.trim().is_empty() && !name.starts_with("临时会话 ·")).unwrap_or_else(|| "新对话".into())
         } else { project.name.clone().unwrap_or_else(|| {
             Path::new(path)
                 .file_name()
@@ -3059,7 +3083,7 @@ fn resolve_project_path(path: &str) -> Result<ProjectContext, AppError> {
     let project = ProjectContext {
         path: Some(path_buf.to_string_lossy().into_owned()),
         project_directory,
-        name: Some(name),
+        name: Some(if is_temporary_project_path(&path_buf) { "新对话".to_string() } else { name }),
         version: Some(detect_codesys_installation().supported_version),
         exists: metadata.is_file() || metadata.is_dir(),
         extension,
@@ -8255,7 +8279,32 @@ fn discovered_model_from_value(value: &Value) -> Option<DiscoveredModel> {
             .filter(|text| !text.is_empty())
             .map(str::to_string)
     });
-    Some(DiscoveredModel { id, name, owned_by })
+    let context_window = object.and_then(|object| {
+        ["context_window", "contextWindow", "context_length", "contextLength", "max_context_tokens"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_u64))
+            .filter(|value| (1_024..=10_000_000).contains(value))
+    });
+    let max_tokens = object.and_then(|object| {
+        ["max_tokens", "maxTokens", "max_output_tokens", "maxOutputTokens"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()))
+            .filter(|value| *value > 0)
+    });
+    let reasoning_value = object.and_then(|object| {
+        object
+            .get("reasoning_levels")
+            .or_else(|| object.get("reasoningLevels"))
+            .or_else(|| object.get("reasoning_efforts"))
+            .or_else(|| object.get("reasoningEffort"))
+    });
+    let reasoning_levels = match reasoning_value {
+        Some(Value::Array(values)) => values.iter().filter_map(Value::as_str).map(|value| value.trim().to_ascii_lowercase()).collect(),
+        Some(Value::String(value)) => vec![value.trim().to_ascii_lowercase()],
+        _ => Vec::new(),
+    };
+    let reasoning_levels = reasoning_levels.into_iter().filter(|value| matches!(value.as_str(), "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")).collect();
+    Some(DiscoveredModel { id, name, owned_by, context_window, max_tokens, reasoning_levels })
 }
 
 async fn send_json(
@@ -8973,30 +9022,7 @@ fn discover_skills(project: &ProjectContext) -> Vec<SkillSummary> {
 }
 
 fn list_session_records() -> Vec<SessionRecord> {
-    let root = agent_session_dir();
-    let mut records = Vec::new();
-    if !root.is_dir() {
-        return records;
-    }
-    // Pi 默认把文件放在根目录；保留两层递归是为了兼容用户手动整理过的会话目录。
-    for entry in WalkDir::new(root)
-        .max_depth(3)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let path = entry.path();
-        if !entry.file_type().is_file()
-            || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-        {
-            continue;
-        }
-        if let Some(record) = parse_session_record(path) {
-            records.push(record);
-        }
-    }
-    records.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
-    records
+    session_preview_cache::list(&agent_session_dir())
 }
 
 fn parse_session_record(path: &Path) -> Option<SessionRecord> {
@@ -10955,7 +10981,7 @@ mod tests {
     fn model_parser_accepts_common_payloads_and_deduplicates() {
         let payload = json!({
             "data": [
-                {"id": "gpt-5", "display_name": "GPT-5", "owned_by": "openai"},
+                {"id": "gpt-5", "display_name": "GPT-5", "owned_by": "openai", "context_window": 256000, "max_output_tokens": 8192, "reasoning_levels": ["none", "high", "max"]},
                 {"id": "gpt-5", "display_name": "重复项"}
             ],
             "models": [
@@ -10968,12 +10994,18 @@ mod tests {
                 DiscoveredModel {
                     id: "gpt-5".to_string(),
                     name: "GPT-5".to_string(),
-                    owned_by: Some("openai".to_string())
+                    owned_by: Some("openai".to_string()),
+                    context_window: Some(256000),
+                    max_tokens: Some(8192),
+                    reasoning_levels: vec!["none".into(), "high".into(), "max".into()],
                 },
                 DiscoveredModel {
                     id: "llama3:8b".to_string(),
                     name: "llama3:8b".to_string(),
-                    owned_by: None
+                    owned_by: None,
+                    context_window: None,
+                    max_tokens: None,
+                    reasoning_levels: Vec::new(),
                 }
             ]
         );
@@ -11423,6 +11455,25 @@ mod tests {
         merge_discovered_models(&mut state, ModelConfig { base_url: "https://other.example.test/v1".into(), ..source }, vec!["model-a".into()]).expect("另一个接口的同名模型");
         assert_eq!(state.models.len(), 2);
         assert_ne!(state.models[0].id, state.models[1].id);
+    }
+
+    #[test]
+    fn imported_model_applies_discovered_metadata() {
+        let mut state = RuntimeState { models: vec![], ..RuntimeState::default() };
+        let source = ModelConfig { context_window: 128000, max_tokens: 4096, ..ModelConfig::default() };
+        let discovered = vec![DiscoveredModel {
+            id: "meta-model".into(),
+            name: "带元数据模型".into(),
+            owned_by: Some("provider".into()),
+            context_window: Some(256000),
+            max_tokens: Some(8192),
+            reasoning_levels: vec!["none".into(), "high".into(), "max".into()],
+        }];
+        merge_discovered_models_with_metadata(&mut state, source, discovered).expect("导入带元数据模型");
+        assert_eq!(state.models[0].name, "带元数据模型");
+        assert_eq!(state.models[0].context_window, 256000);
+        assert_eq!(state.models[0].max_tokens, 8192);
+        assert_eq!(state.models[0].reasoning_levels, vec!["none", "high", "max"]);
     }
 
     #[test]

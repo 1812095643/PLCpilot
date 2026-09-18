@@ -78,6 +78,9 @@ export type DiscoveredModel = {
   id: string
   name: string
   owned_by: string | null
+  context_window?: number | null
+  max_tokens?: number | null
+  reasoning_levels?: string[]
 }
 
 export type ModelDiscoveryResult = {
@@ -553,7 +556,7 @@ export const saveModelProvider = (provider: { id: string; name: string; provider
 export const deleteModelProvider = (id: string) => invoke<void>('delete_model_provider', { id })
 export const setModelProviderEnabled = (id: string, enabled: boolean) => invoke<ModelProviderSummary[]>('set_model_provider_enabled', { id, enabled })
 export const discoverProviderModels = (id: string) => invoke<ModelDiscoveryResult>('discover_provider_models', { id })
-export const importProviderModels = (id: string, modelIds: string[]) => invoke<ModelSummary[]>('import_provider_models', { id, model_ids: modelIds })
+export const importProviderModels = (id: string, models: DiscoveredModel[]) => invoke<ModelSummary[]>('import_provider_models', { id, models })
 
 export const saveMcp = (form: McpForm) => invoke<McpSummary[]>('configure_mcp', {
   request: {

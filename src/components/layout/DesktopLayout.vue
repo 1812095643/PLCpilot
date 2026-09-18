@@ -4,7 +4,7 @@
       <slot name="topbar" />
     </div>
 
-    <div class="desktop-workspace" :style="layoutStyle">
+    <div class="desktop-workspace" :style="layoutStyle" :inert="isInitializing || undefined">
     <Teleport v-if="isMobile && !isSettingsMode" to="body">
       <Transition name="drawer">
         <div v-if="!isSidebarCollapsed" class="mobile-drawer-backdrop" @click="$emit('close-sidebar')">
@@ -55,10 +55,12 @@ const props = withDefaults(
   defineProps<{
     isSidebarCollapsed?: boolean
     isSettingsMode?: boolean
+    isInitializing?: boolean
   }>(),
   {
     isSidebarCollapsed: false,
     isSettingsMode: false,
+    isInitializing: false,
   },
 )
 

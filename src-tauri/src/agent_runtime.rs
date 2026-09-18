@@ -102,7 +102,9 @@ pub async fn start_temporary_workspace(state: State<'_, AppState>) -> Result<Pro
     let path = root.join(stamp.format("%Y-%m-%d").to_string()).join(format!("{}-{}", stamp.format("%H-%M-%S"), &Uuid::new_v4().to_string()[..8]));
     fs::create_dir_all(&path).map_err(|error| AppError::Project(format!("创建临时会话目录未完成：{error}")))?;
     let mut project = resolve_project_path(&path.to_string_lossy())?;
-    project.name = Some(path.file_name().and_then(|value| value.to_str()).map(|name| format!("临时会话 · {name}")).unwrap_or_else(|| "临时会话".into()));
+    // 目录仍然使用日期和时间保证磁盘层唯一，但界面名称不暴露这段内部标识。
+    // 首条消息完成后由前端把摘要写入 session_info，未发送时统一显示“新对话”。
+    project.name = Some("新对话".into());
     let mut guard = state.inner.lock().await;
     guard.project = project.clone();
     guard.session = AgentSessionSummary::default();

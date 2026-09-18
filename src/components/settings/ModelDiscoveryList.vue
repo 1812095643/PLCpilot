@@ -3,12 +3,13 @@ import { computed, shallowRef, watch } from 'vue'
 import type { ModelDiscoveryResult } from '../../api/plcBridge'
 
 const props = defineProps<{ discovery: ModelDiscoveryResult; addedModelIds: string[]; saving: boolean }>()
-const emit = defineEmits<{ add: [ids: string[]] }>()
+const emit = defineEmits<{ add: [models: ModelDiscoveryResult['models']] }>()
 const query = shallowRef('')
 const selected = shallowRef<string[]>([])
 const visible = computed(() => props.discovery.models.filter((model) => `${model.id} ${model.name}`.toLowerCase().includes(query.value.trim().toLowerCase())))
 const available = computed(() => visible.value.filter((model) => !props.addedModelIds.includes(model.id)))
 const selectedIds = computed(() => selected.value.filter((id) => !props.addedModelIds.includes(id)))
+const selectedModels = computed(() => props.discovery.models.filter((model) => selectedIds.value.includes(model.id)))
 const allSelected = computed(() => available.value.length > 0 && available.value.every((model) => selected.value.includes(model.id)))
 
 function toggle(id: string): void {
@@ -17,6 +18,14 @@ function toggle(id: string): void {
 function toggleAll(): void {
   const ids = new Set(available.value.map((model) => model.id))
   selected.value = allSelected.value ? selected.value.filter((id) => !ids.has(id)) : [...new Set([...selected.value, ...ids])]
+}
+function metadataLabel(model: ModelDiscoveryResult['models'][number]): string {
+  const parts: string[] = []
+  if (model.context_window) parts.push(`${Math.round(model.context_window / 1000)}K 上下文`)
+  if (model.max_tokens) parts.push(`最多 ${model.max_tokens.toLocaleString()} 输出`)
+  if (model.reasoning_levels?.length) parts.push(`思考 ${model.reasoning_levels.join('/')}`)
+  if (model.owned_by) parts.push(model.owned_by)
+  return parts.join(' · ')
 }
 watch(() => props.discovery, () => { selected.value = []; query.value = '' })
 </script>
@@ -29,12 +38,12 @@ watch(() => props.discovery, () => { selected.value = []; query.value = '' })
     <div class="discovered-list">
       <label v-for="model in visible" :key="model.id" class="discovered-row" :class="{ added: addedModelIds.includes(model.id) }">
         <input type="checkbox" :checked="addedModelIds.includes(model.id) || selected.includes(model.id)" :disabled="addedModelIds.includes(model.id) || saving" @change="toggle(model.id)" />
-        <span class="discovered-name"><strong>{{ model.name || model.id }}</strong><small v-if="model.name !== model.id">{{ model.id }}</small></span>
+        <span class="discovered-name"><strong>{{ model.name || model.id }}</strong><small v-if="model.name !== model.id">{{ model.id }}</small><small v-if="metadataLabel(model)">{{ metadataLabel(model) }}</small></span>
         <small v-if="addedModelIds.includes(model.id)">已添加</small>
       </label>
       <p v-if="!visible.length" class="discovered-empty">{{ discovery.models.length ? '没有匹配的模型' : '接口没有返回可用模型' }}</p>
     </div>
-    <footer class="discovered-footer"><span>沿用当前接口和已保存的 Key</span><button type="button" :disabled="!selectedIds.length || saving" @click="emit('add', selectedIds)">{{ saving ? '正在添加…' : `添加所选模型${selectedIds.length ? `（${selectedIds.length}）` : ''}` }}</button></footer>
+    <footer class="discovered-footer"><span>会同步保存接口返回的元数据（上下文、输出上限和推理能力）</span><button type="button" :disabled="!selectedModels.length || saving" @click="emit('add', selectedModels)">{{ saving ? '正在添加…' : `添加所选模型${selectedModels.length ? `（${selectedModels.length}）` : ''}` }}</button></footer>
   </section>
 </template>
 

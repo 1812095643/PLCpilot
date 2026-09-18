@@ -2,12 +2,13 @@
   <section ref="conversationRootRef" class="conversation-root" @contextmenu.capture="onConversationContextMenu" @mouseup="onConversationSelection">
     <p v-if="isLoading" class="conversation-loading">Loading messages...</p>
 
-    <p
+    <EmptyConversationWelcome
       v-else-if="messages.length === 0 && !liveOverlay"
-      class="conversation-empty"
-    >
-      暂无消息
-    </p>
+      :mode="props.workbenchMode || 'codesys'"
+      :project-name="props.projectName"
+      :has-project="props.hasProject"
+      @select="emit('suggest-prompt', $event)"
+    />
 
     <SessionTimeline v-if="timelineTurns.length > 0" :turns="timelineTurns" @jump="jumpToTimelineMessage" />
 
@@ -836,6 +837,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiMentionReference, UiPlanStep, UiResponseTextAnnotation } from '../../types/codex'
+import type { WorkbenchMode } from '../../api/plcBridge'
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { openLocalPath, openWebUrl } from '../../api/plcBridge'
 import { classifyLinkTarget } from '../../utils/linkTarget'
@@ -859,6 +861,7 @@ import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 import SessionTimeline, { type SessionTimelineTurn } from './SessionTimeline.vue'
 import ConversationActivityGroup from './ConversationActivityGroup.vue'
+import EmptyConversationWelcome from './EmptyConversationWelcome.vue'
 import { IconWifi, IconBrain } from '@tabler/icons-vue'
 
 type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
@@ -1326,6 +1329,9 @@ const props = defineProps<{
   isTurnInProgress?: boolean
   activeThreadId: string
   cwd: string
+  workbenchMode?: WorkbenchMode
+  projectName?: string
+  hasProject?: boolean
   hasMorePersistedAbove?: boolean
   isLoadingPersistedAbove?: boolean
   loadEarlierMessages?: (threadId: string) => Promise<void>
@@ -1381,6 +1387,7 @@ const emit = defineEmits<{
   'add-response-annotation': [annotation: UiResponseTextAnnotation]
   'update-response-annotation': [annotation: UiResponseTextAnnotation]
   'remove-response-annotation': [id: string]
+  'suggest-prompt': [prompt: string]
 }>()
 
 export type ThreadConversationExposed = {
