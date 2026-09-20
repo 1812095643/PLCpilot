@@ -8,7 +8,7 @@ import type {
   UiResponseTextAnnotation,
   UiThreadTokenUsage,
 } from '../../types/codex'
-import type { ComposerAttachment, ComposerAttachmentDraft } from '../../composables/useComposerAttachments'
+import type { ComposerAttachment, ComposerAttachmentDraft, PreparedComposerAttachment } from '../../composables/useComposerAttachments'
 import { useComposerAttachments } from '../../composables/useComposerAttachments'
 import { useComposerDraftStorage } from '../../composables/useComposerDraftStorage'
 import { readLocalAttachmentFile, searchComposerMentions, type CommandSummary, type ComposerMentionSuggestion } from '../../api/plcBridge'
@@ -73,6 +73,8 @@ export type ComposerModelOption = {
 export type ThreadComposerExposed = {
   hydrateDraft: (payload: ComposerDraftPayload) => void
   appendTextToDraft: (text: string) => void
+  addPreparedAttachment: (input: PreparedComposerAttachment) => void
+  addDroppedFiles: (files: File[]) => void
   hasUnsavedDraft: () => boolean
   readDraft: () => ComposerDraftPayload
 }
@@ -96,7 +98,6 @@ const props = withDefaults(defineProps<{
   disabled?: boolean
   responseAnnotations?: UiResponseTextAnnotation[]
   sendWithEnter?: boolean
-  inProgressSubmitMode?: 'steer' | 'queue'
 }>(), {
   cwd: '',
   collaborationModes: () => [
@@ -111,7 +112,6 @@ const props = withDefaults(defineProps<{
   accessModeDisabled: false,
   disabled: false,
   sendWithEnter: true,
-  inProgressSubmitMode: 'steer',
   commands: () => [],
   reasoningEfforts: () => ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
 })
@@ -132,7 +132,6 @@ const DRAFT_STORAGE_PREFIX = 'plc-pilot.thread-draft.v2.'
 const draft = shallowRef('')
 const selectedSkills = shallowRef<SkillItem[]>([])
 const draftResponseAnnotations = shallowRef<UiResponseTextAnnotation[]>([])
-const activeInProgressMode = shallowRef<'steer' | 'queue'>(props.inProgressSubmitMode)
 const isFileMentionOpen = shallowRef(false)
 const mentionQuery = shallowRef('')
 const mentionStartIndex = shallowRef<number | null>(null)
@@ -154,7 +153,6 @@ let mentionSearchToken = 0
 const inputRef = shallowRef<HTMLTextAreaElement | null>(null)
 const composerRootRef = shallowRef<HTMLElement | null>(null)
 const fileInputRef = shallowRef<HTMLInputElement | null>(null)
-const isDragActive = shallowRef(false)
 const {
   attachments,
   isReading: isAttachmentReading,
@@ -335,7 +333,7 @@ function appendTextToDraft(text: string): void {
   })
 }
 
-function submitCurrent(mode: 'steer' | 'queue' = props.isTurnInProgress ? activeInProgressMode.value : 'steer'): void {
+function submitCurrent(mode: 'steer' | 'queue' = props.isTurnInProgress ? 'queue' : 'steer'): void {
   if (!canSubmit.value) return
   pruneMentionReferences()
   emit('submit', {
@@ -477,83 +475,6 @@ async function onPaste(event: ClipboardEvent): Promise<void> {
   prepared.filter((item): item is NonNullable<typeof item> => item !== null).forEach((item) => addPreparedAttachment(item, 'clipboard'))
 }
 
-function hasDraggedFiles(event: DragEvent): boolean {
-  const types = Array.from(event.dataTransfer?.types ?? [])
-  return types.includes('Files') || types.includes('text/uri-list')
-}
-
-function onDragOver(event: DragEvent): void {
-  if (!hasDraggedFiles(event)) return
-  event.preventDefault()
-  isDragActive.value = true
-}
-
-function onDragLeave(event: DragEvent): void {
-  if (!hasDraggedFiles(event)) return
-  const root = composerRootRef.value
-  if (root && event.relatedTarget instanceof Node && root.contains(event.relatedTarget)) return
-  isDragActive.value = false
-}
-
-type FileSystemEntryLike = {
-  isFile: boolean
-  isDirectory: boolean
-  file?: (callback: (file: File) => void) => void
-  createReader?: () => { readEntries: (callback: (entries: FileSystemEntryLike[]) => void) => void }
-}
-
-function readDirectoryEntries(reader: { readEntries: (callback: (entries: FileSystemEntryLike[]) => void) => void }): Promise<FileSystemEntryLike[]> {
-  return new Promise((resolve) => reader.readEntries(resolve))
-}
-
-async function filesFromDrop(event: DragEvent): Promise<File[]> {
-  const directFiles = Array.from(event.dataTransfer?.files ?? [])
-  const items = Array.from(event.dataTransfer?.items ?? [])
-  const entries = items
-    .map((item): FileSystemEntryLike | null => item.webkitGetAsEntry?.() ?? null)
-    .filter((entry): entry is FileSystemEntryLike => entry !== null)
-  if (entries.length === 0) return directFiles
-  const result: File[] = [...directFiles]
-  async function visit(entry: FileSystemEntryLike): Promise<void> {
-    if (entry.isFile && entry.file) {
-      await new Promise<void>((resolve) => entry.file?.((file) => { result.push(file); resolve() }))
-      return
-    }
-    if (!entry.isDirectory || !entry.createReader) return
-    const reader = entry.createReader()
-    while (true) {
-      const batch = await readDirectoryEntries(reader)
-      if (batch.length === 0) break
-      for (const child of batch) await visit(child)
-    }
-  }
-  for (const entry of entries) await visit(entry)
-  return result
-}
-
-async function onDrop(event: DragEvent): Promise<void> {
-  if (!hasDraggedFiles(event)) return
-  event.preventDefault()
-  isDragActive.value = false
-  const files = await filesFromDrop(event)
-  if (files.length > 0) {
-    addFiles(files, 'drop')
-    return
-  }
-  const paths = Array.from(event.dataTransfer?.getData('text/uri-list')?.split(/\r?\n/u) ?? [])
-    .map((value) => value.trim())
-    .filter((value) => /^file:\/\//iu.test(value))
-  const prepared = await Promise.all(paths.map(async (path) => {
-    try {
-      const url = new URL(path)
-      const normalizedPath = decodeURIComponent(url.pathname.replace(/^\/(?=[A-Z]:[\\/])/iu, ''))
-      return await readLocalAttachmentFile(normalizedPath)
-    } catch {
-      return null
-    }
-  }))
-  prepared.filter((item): item is NonNullable<typeof item> => item !== null).forEach((item) => addPreparedAttachment(item, 'drop'))
-}
 
 function onCursorChange(): void {
   // textarea 的光标位置会在键盘或鼠标默认行为后更新，延后同步才能按真实位置判断 token。
@@ -840,10 +761,6 @@ function onDocumentPointerDown(event: PointerEvent): void {
   closeSlashCommandPopup()
 }
 
-watch(() => props.inProgressSubmitMode, (value) => {
-  activeInProgressMode.value = value
-})
-
 watch(() => props.responseAnnotations, (value) => {
   const next = validResponseAnnotations(value)
   if (JSON.stringify(next) !== JSON.stringify(draftResponseAnnotations.value)) {
@@ -878,19 +795,20 @@ onMounted(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', onDocumentPointerDown)
   if (mentionSearchTimer) clearTimeout(mentionSearchTimer)
-  isDragActive.value = false
 })
 
 defineExpose<ThreadComposerExposed>({
   hydrateDraft,
   appendTextToDraft,
+  addPreparedAttachment: (input) => addPreparedAttachment(input, 'drop'),
+  addDroppedFiles: (files) => addFiles(files, 'drop'),
   hasUnsavedDraft: () => hasUnsavedDraft.value,
   readDraft: () => ({ text: draft.value, skills: selectedSkills.value.map(({ name, path }) => ({ name, path })), attachments: serializeAttachments(), references: [...mentionReferences.value], responseAnnotations: [...draftResponseAnnotations.value] }),
 })
 </script>
 
 <template>
-  <form ref="composerRootRef" class="plc-thread-composer" :class="{ 'is-drag-active': isDragActive }" @submit.prevent="submitCurrent()" @dragover="onDragOver" @dragleave="onDragLeave" @drop="onDrop">
+  <form ref="composerRootRef" class="plc-thread-composer" @submit.prevent="submitCurrent()">
     <div class="plc-composer-shell" :class="{ 'is-busy': isTurnInProgress }">
       <div v-if="selectedSkills.length > 0" class="plc-composer-chips" aria-label="已启用 Skills">
         <span v-for="skill in selectedSkills" :key="skill.path" class="plc-composer-chip">
@@ -983,17 +901,6 @@ defineExpose<ThreadComposerExposed>({
             <span class="plc-context-ring" :style="contextRingStyle"><span /></span>
             <span class="plc-context-tooltip" role="tooltip">{{ contextTooltip }}</span>
           </span>
-          <button
-            v-if="isTurnInProgress"
-            type="button"
-            class="plc-composer-queue"
-            :disabled="!canSubmit"
-            aria-label="排队发送任务"
-            title="排队发送任务"
-            @click="submitCurrent('queue')"
-          >
-            <IconTablerArrowUp aria-hidden="true" />
-          </button>
           <button
             v-if="isTurnInProgress"
             type="button"
@@ -1093,7 +1000,6 @@ defineExpose<ThreadComposerExposed>({
   padding: 0;
 }
 
-.plc-thread-composer.is-drag-active .plc-composer-shell { border-color: var(--plc-dark-accent, #007acc); box-shadow: 0 0 0 3px rgba(0, 122, 204, 0.14); }
 .plc-composer-file-input { display: none; }
 .plc-composer-attach { display: inline-flex; width: 27px; height: 27px; align-items: center; justify-content: center; border: 0; border-radius: 7px; background: transparent; color: var(--composer-muted); cursor: pointer; }
 .plc-composer-attach:hover:not(:disabled) { background: var(--composer-soft); color: var(--composer-text); }
@@ -1155,7 +1061,7 @@ defineExpose<ThreadComposerExposed>({
 .plc-context-indicator:hover .plc-context-tooltip,
 .plc-context-indicator:focus-visible .plc-context-tooltip { display: block; }
 
-.plc-composer-submit, .plc-composer-stop, .plc-composer-queue {
+.plc-composer-submit, .plc-composer-stop {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1171,10 +1077,6 @@ defineExpose<ThreadComposerExposed>({
 .plc-composer-submit:hover:not(:disabled), .plc-composer-stop:hover { transform: translateY(-1px); background: #525252; color: #fff; }
 .plc-composer-submit:disabled { cursor: not-allowed; opacity: 0.35; }
 .plc-composer-stop { background: #e5e5e5; color: #525252; }
-.plc-composer-queue { width: 27px; height: 27px; border: 1px solid var(--composer-soft); border-radius: 50%; background: transparent; color: var(--composer-muted); }
-.plc-composer-queue:hover:not(:disabled) { border-color: rgba(0, 122, 204, 0.55); background: rgba(0, 122, 204, 0.1); color: #007acc; transform: translateY(-1px); }
-.plc-composer-queue:disabled { cursor: not-allowed; opacity: 0.35; }
-.plc-composer-queue svg { width: 13px; height: 13px; }
 .plc-composer-submit svg, .plc-composer-stop svg { width: 15px; height: 15px; }
 
 .plc-plan-note { margin: 0 2px; color: #8a6a3c; font-size: 10px; }
@@ -1198,7 +1100,5 @@ defineExpose<ThreadComposerExposed>({
 :global(:root.dark) .plc-composer-submit { background: #0e639c; color: #ffffff; }
 :global(:root.dark) .plc-composer-submit:hover:not(:disabled), :global(:root.dark) .plc-composer-stop:hover { background: var(--plc-dark-accent-hover); color: #ffffff; }
 :global(:root.dark) .plc-composer-stop { background: var(--plc-dark-control); color: var(--plc-dark-text); }
-:global(:root.dark) .plc-composer-queue { border-color: var(--plc-dark-border); color: var(--plc-dark-muted); }
-:global(:root.dark) .plc-composer-queue:hover:not(:disabled) { border-color: rgba(0, 122, 204, 0.65); background: rgba(0, 122, 204, 0.18); color: #4fc1ff; }
 :global(:root.dark) .plc-plan-note { color: var(--plc-dark-link); }
 </style>

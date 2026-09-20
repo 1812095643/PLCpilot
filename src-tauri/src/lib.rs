@@ -2504,6 +2504,7 @@ pub fn run() {
             search_project_files,
             search_composer_mentions,
             read_local_attachment_file,
+            inspect_dropped_paths,
             update_thread_file_changes
         ])
         .run(tauri::generate_context!())
@@ -2520,6 +2521,33 @@ fn read_local_attachment_file(path: String) -> Result<AttachmentInput, AppError>
         ));
     }
     read_local_file(&candidate).map_err(AppError::Project)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DroppedPathInfo {
+    path: String,
+    kind: String,
+}
+
+/// 分类窗口拖入的路径，让前端能区分“打开工程目录”和“添加单文件附件”。
+/// 只读取文件属性，不读取文件内容，也不会执行拖入路径。
+#[tauri::command]
+fn inspect_dropped_paths(paths: Vec<String>) -> Result<Vec<DroppedPathInfo>, AppError> {
+    let mut result = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let path = raw.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let candidate = PathBuf::from(path);
+        let kind = match fs::metadata(&candidate) {
+            Ok(metadata) if metadata.is_dir() => "directory",
+            Ok(metadata) if metadata.is_file() => "file",
+            _ => "unknown",
+        };
+        result.push(DroppedPathInfo { path: path.to_string(), kind: kind.to_string() });
+    }
+    Ok(result)
 }
 
 #[tauri::command]

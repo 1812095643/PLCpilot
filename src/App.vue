@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, shallowRef, watch, type ComponentPublicInstance } from 'vue'
-import { getCurrentWebview } from '@tauri-apps/api/webview'
 import DesktopLayout from './components/layout/DesktopLayout.vue'
 import AppSplashScreen from './components/layout/AppSplashScreen.vue'
 import WindowTitleBar from './components/layout/WindowTitleBar.vue'
@@ -20,6 +19,7 @@ import { useAppUpdates } from './composables/useAppUpdates'
 import { useComposerDraftStorage } from './composables/useComposerDraftStorage'
 import type { ComposerDraftPayload, ThreadComposerExposed, SubmitPayload } from './components/content/ThreadComposer.vue'
 import { useWorkspaceThreads, type WorkspaceThread } from './composables/useWorkspaceThreads'
+import { useWorkspaceDrop } from './composables/useWorkspaceDrop'
 import { useAppTheme } from './composables/useAppTheme'
 import { useAccessMode } from './composables/useAccessMode'
 import { hasTurnResponseText, insertTimelineActivity } from './utils/conversationTurns'
@@ -50,6 +50,8 @@ import {
   removeProject,
   renameSession,
   rejectChange,
+  openWebUrl,
+  readLocalAttachmentFile,
   resumeSession,
   runAgent,
   saveMcp,
@@ -108,7 +110,17 @@ const activeView = shallowRef<View>('chat')
 const activeThreadId = workspace.activeId
 const isSidebarCollapsed = shallowRef(false)
 const isBusy = workspace.field('isBusy')
-const isWindowDropActive = shallowRef(false)
+const { active: isWindowDropActive, onDragOver: onWindowDragOver, onDragLeave: onWindowDragLeave, onDrop: onWindowDrop, setupNativeDrop } = useWorkspaceDrop({
+  openProject: async (path) => { await activateProject(path); showSettings.value = false },
+  attachPaths: attachDroppedFiles,
+  attachFiles: async (files) => {
+    showSettings.value = false
+    activeView.value = 'chat'
+    await nextTick()
+    composerRef.value?.addDroppedFiles(files)
+  },
+  notice: showNotice,
+})
 const isRefreshing = shallowRef(false)
 const notice = shallowRef('')
 const providerDiscoveryRequest = shallowRef(0)
@@ -187,8 +199,16 @@ function closeAppDialog(result: boolean | string | null): void {
   dialog?.resolve(result)
 }
 
+async function openExternalUrl(url: string): Promise<void> {
+  try {
+    await openWebUrl(url)
+  } catch (error) {
+    showNotice(`浏览器链接暂时没有打开：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 function openGithubRepository(): void {
-  window.open(GITHUB_REPOSITORY_URL, '_blank', 'noopener,noreferrer')
+  void openExternalUrl(GITHUB_REPOSITORY_URL)
 }
 
 const fallbackCommands: CommandSummary[] = [
@@ -1446,10 +1466,6 @@ async function onPickProjectFolder(): Promise<void> {
   }
 }
 
-async function onOpenProject(project: WorkspaceProject): Promise<void> {
-  await activateProject(project.path)
-}
-
 async function onRemoveProject(project: WorkspaceProject): Promise<void> {
   if (!await requestConfirm('移除工程', `从工作区移除“${project.name}”吗？不会删除磁盘上的文件。`)) return
   try {
@@ -1846,91 +1862,21 @@ async function startNewThread(project?: WorkspaceProject): Promise<void> {
   }
 }
 
-function droppedProjectPath(paths: string[]): string | null {
-  const normalized = paths.map((path) => path.trim()).filter(Boolean)
-  return normalized.find((path) => /\.(project|projectarchive)$/iu.test(path))
-    || normalized.find((path) => !/[.][^\\/]+$/u.test(path))
-    || (normalized.length === 1 ? normalized[0] : null)
-}
-
-function dropIsOverComposer(position?: { x: number; y: number }): boolean {
-  if (!position || typeof document === 'undefined') return false
-  const scale = window.devicePixelRatio || 1
-  const points = [
-    [position.x, position.y],
-    [position.x / scale, position.y / scale],
-  ]
-  return points.some(([x, y]) => document.elementFromPoint(x, y)?.closest('.plc-thread-composer') !== null)
-}
-
-async function openDroppedProject(paths: string[], position?: { x: number; y: number }): Promise<void> {
-  isWindowDropActive.value = false
-  if (dropIsOverComposer(position)) return
-  const path = droppedProjectPath(paths)
-  if (!path) {
-    showNotice('请拖入 CODESYS 工程目录或 .project 文件。')
+async function attachDroppedFiles(paths: string[]): Promise<void> {
+  if (paths.length === 0) return
+  const threadId = activeThreadId.value
+  showSettings.value = false
+  activeView.value = 'chat'
+  await nextTick()
+  const results = await Promise.allSettled(paths.map(readLocalAttachmentFile))
+  // 文件读取期间切换了会话时，不能把附件送进另一个输入框。
+  if (activeThreadId.value !== threadId || !composerRef.value) {
+    showNotice('会话已切换，请把文件重新拖入目标会话。')
     return
   }
-  await activateProject(path)
-}
-
-function onWindowDragOver(event: DragEvent): void {
-  if (event.target instanceof Element && event.target.closest('.plc-thread-composer')) {
-    isWindowDropActive.value = false
-    return
-  }
-  const types = Array.from(event.dataTransfer?.types ?? [])
-  if (!types.includes('Files') && !types.includes('text/uri-list')) return
-  event.preventDefault()
-  isWindowDropActive.value = true
-}
-
-function onWindowDragLeave(event: DragEvent): void {
-  if (event.relatedTarget instanceof Node && event.currentTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return
-  isWindowDropActive.value = false
-}
-
-function uriToLocalPath(value: string): string | null {
-  try {
-    const url = new URL(value)
-    if (url.protocol !== 'file:') return null
-    const pathname = decodeURIComponent(url.pathname)
-    if (url.hostname && url.hostname !== 'localhost') return `\\\\${url.hostname}${pathname.replaceAll('/', '\\')}`
-    return pathname.replace(/^\/(?=[A-Z]:[\\/])/iu, '')
-  } catch {
-    return null
-  }
-}
-
-async function onWindowDrop(event: DragEvent): Promise<void> {
-  if (event.target instanceof Element && event.target.closest('.plc-thread-composer')) {
-    isWindowDropActive.value = false
-    return
-  }
-  const uriPaths = (event.dataTransfer?.getData('text/uri-list') ?? '')
-    .split(/\r?\n/u)
-    .map((value) => uriToLocalPath(value.trim()))
-    .filter((value): value is string => value !== null)
-  if (uriPaths.length === 0) return
-  event.preventDefault()
-  await openDroppedProject(uriPaths)
-}
-
-async function setupNativeWindowDrop(): Promise<void> {
-  try {
-    stopWindowDrop = await getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type === 'enter' || event.payload.type === 'over') {
-        isWindowDropActive.value = !dropIsOverComposer(event.payload.position)
-        return
-      }
-      if (event.payload.type === 'leave') {
-        isWindowDropActive.value = false
-        return
-      }
-      void openDroppedProject(event.payload.paths, event.payload.position)
-    })
-  } catch {
-    // 浏览器预览没有 Tauri 原生拖拽事件，保留 DOM URI 回退。
+  for (const result of results) {
+    if (result.status === 'fulfilled') composerRef.value.addPreparedAttachment(result.value)
+    else showNotice(String(result.reason))
   }
 }
 
@@ -1946,7 +1892,6 @@ function onKeyDown(event: KeyboardEvent): void {
   }
 }
 
-let stopWindowDrop: (() => void) | undefined
 let syncTimer: number | undefined
 
 onMounted(async () => {
@@ -1968,7 +1913,7 @@ onMounted(async () => {
     appReady.value = true
   }
   window.addEventListener('keydown', onKeyDown)
-  await setupNativeWindowDrop()
+  await setupNativeDrop()
   syncTimer = window.setInterval(() => {
     // 没有工程或本轮正在输出时，CODESYS Bridge 同步不会改变可见上下文，
     // 继续发起请求只会抢占桌面 IPC 和扫描线程；下一次空闲 tick 再恢复同步。
@@ -1984,7 +1929,6 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeyDown)
-  stopWindowDrop?.()
   if (syncTimer) window.clearInterval(syncTimer)
 })
 </script>
@@ -2004,7 +1948,7 @@ onUnmounted(() => {
   >
     <template #sidebar>
       <WorkspaceSidebar :projects="sidebarProjects" :threads="sidebarThreads" :active-id="activeThreadId" :theme="theme" :workbench-mode="workbenchMode" @update:theme="theme = $event" @update:workbench-mode="onWorkbenchModeChange"
-        @new-thread="startNewThread" @select-thread="selectSidebarThread" @open-project="onOpenProject"
+        @new-thread="startNewThread" @select-thread="selectSidebarThread"
         @add-project="onPickProjectFolder" @remove-project="onRemoveProject" @rename-thread="renameSidebarThread" @delete-thread="deleteSidebarThread"
         @open-settings="showSettings = true" @open-skills="activeView = 'skills'; showSettings = false" @open-overview="activeView = 'overview'; showSettings = false" />
     </template>
@@ -2042,7 +1986,7 @@ onUnmounted(() => {
 
     <template #content>
       <SettingsPage v-if="showSettings" v-model:category="settingsCategory" :snapshot="snapshot" :theme="theme" :access-mode="accessMode" :access-mode-disabled="!accessModeReady || accessModeSaving || tasksRunning" @update:access-mode="onAccessModeChange" @close="showSettings = false" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
-        <template #updates><UpdatesSettingsPanel :state="updater.state" :busy="updater.active.value" :tasks-running="tasksRunning" @check="updater.check" @install="updater.install" @auto-check="updater.setAutoCheck" /></template>
+        <template #updates><UpdatesSettingsPanel :state="updater.state" :busy="updater.active.value" :tasks-running="tasksRunning" @check="updater.check" @install="updater.install" @auto-check="updater.setAutoCheck" @notice="showNotice" /></template>
         <template #models>
           <p v-if="!modelSettings.loaded.value || modelSettings.error.value" class="plc-model-loading" role="status">
             {{ modelSettings.error.value || '正在读取本机模型配置…' }}
@@ -2132,7 +2076,6 @@ onUnmounted(() => {
         :access-mode-disabled="!accessModeReady || accessModeSaving || tasksRunning"
         :disabled="false"
         :send-with-enter="true"
-        :in-progress-submit-mode="'queue'"
         :response-annotations="pendingResponseAnnotations"
         @submit="onSubmit"
         @interrupt="onInterrupt"
@@ -2148,8 +2091,8 @@ onUnmounted(() => {
     <template #overlays>
       <div v-if="isWindowDropActive" class="plc-window-drop-overlay" role="status" aria-live="polite">
         <IconTablerFolder />
-        <strong>松开以打开工程</strong>
-        <span>支持工程目录或 .project 文件</span>
+        <strong>松开以添加到工作区</strong>
+        <span>文件夹作为项目打开，文件添加到输入框</span>
       </div>
 
       <Transition name="plc-fade"><div v-if="notice" class="plc-toast" role="status">{{ notice }}</div></Transition>
@@ -2164,7 +2107,7 @@ onUnmounted(() => {
         <section class="plc-info-dialog" role="dialog" aria-modal="true" :aria-label="showAbout ? '关于作者' : '打赏作者'">
           <div class="plc-modal-heading"><div><p class="plc-eyebrow">PLC Pilot</p><h2>{{ showAbout ? '关于作者' : '打赏作者' }}</h2></div><button class="plc-close-button" type="button" aria-label="关闭" @click="showAbout = showReward = false"><IconTablerX /></button></div>
           <p v-if="showAbout" class="plc-info-dialog-copy">作者：蔡徐坤</p>
-          <template v-else><p class="plc-info-dialog-copy">感谢支持 PLC Pilot。打赏入口待配置。</p><div class="plc-reward-placeholder" aria-label="打赏二维码占位">打赏二维码待配置</div></template>
+          <template v-else><p class="plc-info-dialog-copy">感谢支持 PLC Pilot。扫码支持作者持续改进。</p><img class="plc-reward-image" src="/assets/reward-alipay.jpg" alt="支付宝打赏二维码" /></template>
         </section>
       </div>
       <div v-if="appDialog" class="plc-overlay plc-dialog-overlay" @click.self="closeAppDialog(appDialog.kind === 'confirm' ? false : null)">
@@ -2345,7 +2288,7 @@ onUnmounted(() => {
 .plc-toast { @apply fixed bottom-5 left-1/2 z-[600] -translate-x-1/2 rounded-full bg-zinc-900 px-4 py-2 text-xs text-white shadow-xl; }
 .plc-info-dialog { width: min(420px, calc(100vw - 32px)); border: 1px solid rgba(128,128,128,.25); border-radius: 12px; background: var(--plc-dialog-bg, #fff); color: var(--plc-dialog-text, #333); padding: 18px; box-shadow: 0 18px 48px rgba(0,0,0,.24); }
 .plc-info-dialog-copy { margin: 16px 0; color: #666; font-size: 13px; line-height: 1.7; }
-.plc-reward-placeholder { display: grid; min-height: 180px; place-items: center; border: 1px dashed #bbb; border-radius: 8px; color: #999; font-size: 12px; }
+.plc-reward-image { display: block; width: min(100%, 360px); max-height: 62vh; margin: 0 auto; border-radius: 8px; object-fit: contain; }
 .plc-app-dialog-input { width: 100%; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; padding: 8px 10px; background: transparent; color: inherit; }
 .plc-app-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 .plc-dialog-overlay { z-index: 800; }

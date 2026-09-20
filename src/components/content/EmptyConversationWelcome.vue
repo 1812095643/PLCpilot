@@ -76,20 +76,18 @@ const prompts = computed<WelcomePrompt[]>(() => {
 
 <template>
   <section class="empty-welcome" aria-labelledby="empty-welcome-title">
-    <div class="empty-welcome-mark" aria-hidden="true">
-      <span class="empty-welcome-mark-orbit" />
-      <IconSparkles :size="24" stroke="1.35" />
-    </div>
+    <strong class="empty-welcome-brand" aria-label="PLC Pilot"><span>PLC</span><span class="empty-welcome-brand-pilot">Pilot</span></strong>
     <p class="empty-welcome-eyebrow">{{ modeCopy.eyebrow }}</p>
     <h1 id="empty-welcome-title" class="empty-welcome-title">{{ modeCopy.title }}</h1>
     <p class="empty-welcome-description">{{ modeCopy.description }}</p>
 
     <div class="empty-welcome-prompts" aria-label="推荐问题">
       <button
-        v-for="item in prompts"
+        v-for="(item, index) in prompts"
         :key="item.title"
         type="button"
         class="empty-welcome-prompt"
+        :data-tone="index"
         @click="emit('select', item.prompt)"
       >
         <span class="empty-welcome-prompt-icon"><component :is="item.icon" :size="16" stroke="1.5" /></span>
@@ -105,38 +103,36 @@ const prompts = computed<WelcomePrompt[]>(() => {
 
 <style scoped>
 .empty-welcome {
+  --conversation-text: #303030;
+  --conversation-muted: #737373;
   display: flex;
   flex: 1;
   min-height: 0;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 36px 24px 156px;
+  padding: 36px 24px 84px;
   color: var(--conversation-text, #303030);
   text-align: center;
   animation: empty-welcome-enter 420ms cubic-bezier(.22, 1, .36, 1) both;
 }
 
-.empty-welcome-mark {
-  position: relative;
-  display: grid;
-  width: 52px;
-  height: 52px;
-  place-items: center;
-  margin-bottom: 18px;
-  border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
-  border-radius: 17px;
-  color: var(--conversation-muted, #6f6f6f);
-  background: color-mix(in srgb, currentColor 5%, transparent);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, .045);
+.empty-welcome-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 24px;
+  color: #111;
+  font-size: 32px;
+  font-weight: 650;
+  letter-spacing: -.035em;
+  line-height: 1;
 }
 
-.empty-welcome-mark-orbit {
-  position: absolute;
-  inset: -5px;
-  border: 1px solid color-mix(in srgb, currentColor 8%, transparent);
-  border-radius: 20px;
-  transform: rotate(12deg);
+.empty-welcome-brand-pilot {
+  padding: 5px 7px 6px;
+  border-radius: 6px;
+  background: #f59e0b;
 }
 
 .empty-welcome-eyebrow {
@@ -168,10 +164,10 @@ const prompts = computed<WelcomePrompt[]>(() => {
 
 .empty-welcome-prompts {
   display: grid;
-  width: min(100%, 690px);
+  width: min(100%, 600px);
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 9px;
-  margin-top: 28px;
+  gap: 12px;
+  margin-top: 44px;
   text-align: left;
 }
 
@@ -179,9 +175,9 @@ const prompts = computed<WelcomePrompt[]>(() => {
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 10px;
-  min-height: 62px;
-  padding: 11px 12px;
+  gap: 12px;
+  min-height: 82px;
+  padding: 16px;
   border: 1px solid color-mix(in srgb, var(--conversation-text, #303030) 11%, transparent);
   border-radius: 10px;
   color: inherit;
@@ -191,15 +187,20 @@ const prompts = computed<WelcomePrompt[]>(() => {
   transition: transform 180ms ease, border-color 180ms ease, background-color 180ms ease, box-shadow 180ms ease;
 }
 
+.empty-welcome-prompt[data-tone='0'] { --prompt-color: #2563ad; }
+.empty-welcome-prompt[data-tone='1'] { --prompt-color: #258064; }
+.empty-welcome-prompt[data-tone='2'] { --prompt-color: #a26315; }
+.empty-welcome-prompt[data-tone='3'] { --prompt-color: #8254a8; }
+
 .empty-welcome-prompt:hover {
-  border-color: color-mix(in srgb, var(--conversation-accent, #e68a15) 48%, transparent);
-  background: color-mix(in srgb, var(--conversation-accent, #e68a15) 7%, transparent);
+  border-color: color-mix(in srgb, var(--prompt-color) 40%, transparent);
+  background: color-mix(in srgb, var(--prompt-color) 5%, transparent);
   box-shadow: 0 8px 18px rgba(0, 0, 0, .05);
   transform: translateY(-2px);
 }
 
 .empty-welcome-prompt:focus-visible {
-  outline: 2px solid var(--conversation-accent, #e68a15);
+  outline: 2px solid var(--prompt-color);
   outline-offset: 2px;
 }
 
@@ -211,7 +212,7 @@ const prompts = computed<WelcomePrompt[]>(() => {
   place-items: center;
   border: 1px solid color-mix(in srgb, currentColor 10%, transparent);
   border-radius: 8px;
-  color: var(--conversation-muted, #727272);
+  color: var(--prompt-color);
   background: color-mix(in srgb, currentColor 5%, transparent);
 }
 
@@ -225,7 +226,7 @@ const prompts = computed<WelcomePrompt[]>(() => {
 
 .empty-welcome-prompt-copy strong {
   overflow: hidden;
-  color: var(--conversation-text, #2d2d2d);
+  color: var(--prompt-color);
   font-size: 12px;
   font-weight: 600;
   text-overflow: ellipsis;
@@ -251,7 +252,7 @@ const prompts = computed<WelcomePrompt[]>(() => {
 }
 
 .empty-welcome-prompt:hover .empty-welcome-prompt-arrow {
-  color: var(--conversation-accent, #e68a15);
+  color: var(--prompt-color);
   transform: translate(2px, -2px);
 }
 
@@ -261,15 +262,27 @@ const prompts = computed<WelcomePrompt[]>(() => {
 }
 
 @media (max-width: 680px) {
-  .empty-welcome { padding-inline: 16px; }
+  .empty-welcome { justify-content: flex-start; overflow-y: auto; padding: 24px 16px; }
   .empty-welcome-prompts { grid-template-columns: 1fr; max-width: 420px; }
+}
+
+@media (max-height: 720px) and (min-width: 681px) {
+  .empty-welcome { padding-block: 18px; overflow-y: auto; }
+  .empty-welcome-prompts { margin-top: 28px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .empty-welcome, .empty-welcome-prompt { animation: none; transition: none; }
 }
 
-:global(:root.dark) .empty-welcome-prompt:hover {
+:global(.dark .empty-welcome) { --conversation-text: #e5e5e5; --conversation-muted: #a3a3a3; }
+:global(.dark .empty-welcome-brand) { color: #fff; }
+:global(.dark .empty-welcome-prompt[data-tone='0']) { --prompt-color: #8bbafa; }
+:global(.dark .empty-welcome-prompt[data-tone='1']) { --prompt-color: #7ec7ae; }
+:global(.dark .empty-welcome-prompt[data-tone='2']) { --prompt-color: #e2b877; }
+:global(.dark .empty-welcome-prompt[data-tone='3']) { --prompt-color: #c1a1e4; }
+
+:global(.dark .empty-welcome-prompt:hover) {
   box-shadow: 0 10px 22px rgba(0, 0, 0, .24);
 }
 </style>

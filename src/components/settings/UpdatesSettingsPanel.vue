@@ -2,12 +2,20 @@
 import { computed } from 'vue'
 import { IconRefresh, IconDownload, IconExternalLink } from '@tabler/icons-vue'
 import type { AppUpdateState } from '../../composables/useAppUpdates'
+import { openWebUrl } from '../../api/plcBridge'
 
 const props = defineProps<{ state: AppUpdateState; busy: boolean; tasksRunning: boolean }>()
-const emit = defineEmits<{ check: []; install: []; 'auto-check': [value: boolean] }>()
+const emit = defineEmits<{ check: []; install: []; 'auto-check': [value: boolean]; notice: [message: string] }>()
 const percent = computed(() => props.state.total ? Math.min(100, Math.round(props.state.downloaded / props.state.total * 100)) : null)
 const status = computed(() => ({ idle: '随时获取最新改进', checking: '正在检查更新…', current: '已是最新版本', available: '新版本已就绪', saving: '正在保存会话与草稿…', downloading: '正在下载更新…', verifying: '正在校验更新文件…', installing: '正在安装，完成后会重新打开…', error: '稍后再试或重新检查' })[props.state.phase])
 const size = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`
+async function openReleases(): Promise<void> {
+  try {
+    await openWebUrl('https://github.com/1812095643/PLCpilot/releases')
+  } catch (error) {
+    emit('notice', String(error))
+  }
+}
 </script>
 
 <template>
@@ -25,7 +33,7 @@ const size = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`
       <p class="settings-feedback">{{ tasksRunning ? '还有任务或排队消息，处理完毕后即可更新。' : '会先保存草稿与会话，再重启软件。项目、模型设置和聊天记录会保留。' }}</p>
     </section>
     <p v-if="state.error" class="settings-feedback error" role="alert">{{ state.error }}</p>
-    <a class="updates-link" href="https://github.com/1812095643/PLCpilot/releases" target="_blank" rel="noopener noreferrer">查看全部版本与安装包<IconExternalLink /></a>
+    <a class="updates-link" href="https://github.com/1812095643/PLCpilot/releases" target="_blank" rel="noopener noreferrer" @click.prevent="openReleases">查看全部版本与安装包<IconExternalLink /></a>
   </section>
 </template>
 
@@ -54,7 +62,7 @@ const size = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`
 .updates-download { display: grid; gap: 7px; margin: 18px 0; }
 .updates-download progress { width: 100%; height: 6px; accent-color: var(--settings-text); }
 .updates-download small { font-variant-numeric: tabular-nums; color: var(--settings-muted); }
-.updates-link { display: inline-flex; align-items: center; gap: 5px; margin-top: 26px; color: var(--settings-muted); text-decoration: none; font-size: 12px; }
+.updates-link { display: inline-flex; align-items: center; gap: 5px; margin-top: 26px; border: 0; padding: 0; color: var(--settings-muted); background: transparent; text-decoration: none; font-size: 12px; cursor: pointer; }
 .updates-link:hover { color: var(--settings-text); }
 .spinning { animation: update-spin 1.4s linear infinite; }
 @keyframes update-spin { to { transform: rotate(360deg); } }

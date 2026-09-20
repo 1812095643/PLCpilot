@@ -17,7 +17,7 @@ import type { ThemePreference } from '../../types/theme'
 export type SidebarThread = { id: string; name: string; cwd: string; busy: boolean; status: string; persisted: boolean }
 const props = defineProps<{ projects: WorkspaceProject[]; threads: SidebarThread[]; activeId: string; theme: ThemePreference; workbenchMode: WorkbenchMode }>()
 const emit = defineEmits<{
-  'new-thread': [project?: WorkspaceProject]; 'select-thread': [id: string]; 'open-project': [project: WorkspaceProject];
+  'new-thread': [project?: WorkspaceProject]; 'select-thread': [id: string];
   'add-project': []; 'remove-project': [project: WorkspaceProject]; 'rename-thread': [id: string]; 'delete-thread': [id: string];
   'open-settings': []; 'open-skills': []; 'open-overview': [];
   'update:theme': [theme: ThemePreference];
@@ -51,7 +51,7 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
     <div class="sidebar-scroll">
       <div class="group-heading"><span>项目</span><button title="添加项目" aria-label="添加项目" @click="emit('add-project')"><IconTablerFolder /></button></div>
       <section v-for="group in groups" :key="group.project.id" class="project-group">
-        <div class="project-heading"><button class="fold-button" :aria-label="`${collapsed.has(group.project.id) ? '展开' : '收起'} ${group.project.name}`" @click="toggle(group.project.id)"><IconTablerChevronDown :class="{ collapsed: collapsed.has(group.project.id) }" /></button><button class="project-name" :title="normalizePathForUi(group.project.path)" @click="emit('open-project', group.project)">{{ group.project.name }}</button><button class="row-action" :aria-label="`在 ${group.project.name} 新建会话`" title="新建项目会话" @click="emit('new-thread', group.project)"><IconTablerFilePencil /></button><button class="row-action" :aria-label="`移除项目 ${group.project.name}`" title="移除项目入口" @click="emit('remove-project', group.project)"><IconTablerTrash /></button></div>
+        <div class="project-heading"><button class="fold-button" :aria-label="`${collapsed.has(group.project.id) ? '展开' : '收起'} ${group.project.name}`" @click="toggle(group.project.id)"><IconTablerChevronDown :class="{ collapsed: collapsed.has(group.project.id) }" /></button><button class="project-name" :title="`${collapsed.has(group.project.id) ? '展开' : '收起'} ${normalizePathForUi(group.project.path)}`" @click="toggle(group.project.id)">{{ group.project.name }}</button><button class="row-action" :aria-label="`在 ${group.project.name} 新建会话`" title="新建项目会话" @click="emit('new-thread', group.project)"><IconTablerFilePencil /></button><button class="row-action" :aria-label="`移除项目 ${group.project.name}`" title="移除项目入口" @click="emit('remove-project', group.project)"><IconTablerTrash /></button></div>
         <div v-if="!collapsed.has(group.project.id)" class="project-threads">
           <div v-for="thread in group.threads.slice(0, visibleLimit)" :key="thread.id" class="thread-row" :class="{ active: activeId === thread.id, 'search-match': normalizedSearch }">
             <button class="thread-main" :title="thread.status || thread.name" @click="emit('select-thread', thread.id)"><span class="thread-state" :class="{ running: thread.busy }" /><span>{{ thread.name }}</span></button>

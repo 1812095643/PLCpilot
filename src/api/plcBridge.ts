@@ -1,9 +1,19 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { ReasoningEffort, UiAttachment, UiMentionReference, UiMentionKind, UiResponseTextAnnotation } from '../types/codex'
 
 export const openLocalPath = (path: string, mode: 'reveal' | 'default') => invoke<void>('open_local_path', { path, mode })
-export const openWebUrl = (url: string) => invoke<void>('open_web_url', { url })
+/** 桌面 WebView 的新窗口不会自动交给浏览器，外部网址统一经系统关联打开。 */
+export async function openWebUrl(url: string): Promise<void> {
+  const target = new URL(url.trim())
+  if (!['http:', 'https:'].includes(target.protocol) || !target.hostname) {
+    throw new Error('请使用完整的 HTTP 或 HTTPS 网址。')
+  }
+  if (isTauri()) await invoke<void>('open_web_url', { url: target.href })
+  else window.open(target.href, '_blank', 'noopener,noreferrer')
+}
+export type DroppedPathInfo = { path: string; kind: 'file' | 'directory' | 'unknown' }
+export const inspectDroppedPaths = (paths: string[]) => invoke<DroppedPathInfo[]>('inspect_dropped_paths', { paths })
 
 export type ProviderKind = 'responses' | 'messages' | 'chatcompletions' | 'ollama'
 export type WorkbenchMode = 'codesys' | 'chat' | 'stone'

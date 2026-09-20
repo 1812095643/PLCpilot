@@ -1,5 +1,5 @@
 <template>
-  <section ref="conversationRootRef" class="conversation-root" @contextmenu.capture="onConversationContextMenu" @mouseup="onConversationSelection">
+  <section ref="conversationRootRef" class="conversation-root" @click.capture="onConversationLinkClick" @contextmenu.capture="onConversationContextMenu" @mouseup="onConversationSelection">
     <p v-if="isLoading" class="conversation-loading">Loading messages...</p>
 
     <EmptyConversationWelcome
@@ -3108,6 +3108,29 @@ const fileLinkContextMenuStyle = computed(() => ({
 }))
 const fileLinkContextTarget = computed(() => classifyLinkTarget(fileLinkContextBrowseUrl.value, window.location.href))
 
+async function onConversationLinkClick(event: MouseEvent): Promise<void> {
+  if (event.button !== 0 || (!isTauri() && (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey))) return
+  const target = event.target
+  if (!(target instanceof Element)) return
+  const anchor = target.closest('a.message-file-link, a.message-skill-chip')
+  if (!(anchor instanceof HTMLAnchorElement)) return
+  const href = (anchor.getAttribute('href') ?? '').trim()
+  if (!href || href === '#') return
+  const link = classifyLinkTarget(href, window.location.href)
+  if (link.kind === 'other') return
+  event.preventDefault()
+  event.stopPropagation()
+  try {
+    if (link.kind === 'web') {
+      await openWebUrl(link.href)
+      return
+    }
+    await openLocalPath(link.path, 'default')
+  } catch (error) {
+    emit('notice', String(error))
+  }
+}
+
 async function onConversationContextMenu(event: MouseEvent): Promise<void> {
   const target = event.target
   if (!(target instanceof Element)) return
@@ -3143,8 +3166,7 @@ async function openFileLinkContextBrowse(): Promise<void> {
   closeFileLinkContextMenu()
   if (target.kind !== 'web') return
   try {
-    if (isTauri()) await openWebUrl(target.href)
-    else window.open(target.href, '_blank', 'noopener,noreferrer')
+    await openWebUrl(target.href)
   } catch (error) { emit('notice', String(error)) }
 }
 
