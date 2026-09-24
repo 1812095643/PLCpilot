@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  连接 CODESYS、CAREL STone 与日常开发任务的本地优先 AI Agent 工作台
+  连接 CODESYS、CAREL STone、自由聊天与通用生产力任务的本地优先 AI Agent 工作台
 </p>
 
 <p align="center">
