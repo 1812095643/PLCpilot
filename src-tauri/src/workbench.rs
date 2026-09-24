@@ -12,7 +12,9 @@ pub fn tool_allowed(mode: WorkbenchMode, server: &str, name: &str) -> bool {
 }
 
 pub fn skill_allowed(mode: WorkbenchMode, skill: &SkillSummary) -> bool {
-    mode == WorkbenchMode::Codesys || builtin_skill_content(&skill.id).is_none()
+    mode == WorkbenchMode::Codesys
+        || builtin_skill_content(&skill.id).is_none()
+        || matches!(skill.id.as_str(), PATENT_DISCLOSURE_SKILL_ID | "documents" | "spreadsheets" | "presentations" | "pdf")
 }
 
 /// 非 CODESYS 模式只扫描用户工作目录，不带入 Bridge 的编辑器、快照和版本信息。
@@ -75,7 +77,8 @@ pub fn system_prompt(project: &ProjectContext, mode: WorkbenchMode) -> String {
         "你是 PLC Pilot，当前为 CAREL Stone 模式。使用内置 STone MCP 的官方 API 参考与工程自动化工具。先 stone_environment，按需 stone_api_search / stone_api_get。真实工程操作通过 SToneCLI/IronPython；先打开解决方案、读取项目，再修改、保存和编译。必须检查官方 Result.IsSuccessful 或 CLI 退出码。控制器 ST 库参考不是远程接口；未安装 STone 或缺少许可时不得声称已编译。下载、变量写入、重启等操作依照本次用户授权和客户端审批。"
     };
     let custom_skills = discover_skills(project).into_iter().filter(|skill| skill.enabled && skill_allowed(mode, skill))
-        .filter_map(|skill| skill.path.and_then(|path| fs::read_to_string(path).ok())).map(|text| truncate(&text, 12000)).collect::<Vec<_>>().join("\n\n");
+        .filter_map(|skill| builtin_skill_prompt_content(&skill.id, false).or_else(|| skill.path.and_then(|path| fs::read_to_string(path).ok())))
+        .map(|text| truncate(&text, 12000)).collect::<Vec<_>>().join("\n\n");
     format!("{introduction}\n当前工作目录：{}\n扫描到的文件：{}\n先读取再修改，操作结果以真实工具返回为依据。写入与命令遵循客户端批准/拒绝或完全访问模式。\n{custom_skills}",
         project.working_directory.as_deref().or(project.project_directory.as_deref()).unwrap_or("会话工作目录"), project.source_files.join("、"))
 }

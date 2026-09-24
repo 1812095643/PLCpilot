@@ -176,6 +176,10 @@ pub async fn list_skill_catalog(state: State<'_, AppState>) -> Result<Vec<SkillC
 
 #[tauri::command]
 pub async fn install_skill_catalog(id: String) -> Result<(), AppError> {
+    if id == "patent-disclosure-skill" {
+        builtin_skill_resource_root(&id).ok_or_else(|| AppError::Configuration("专利 Skill 资源缺失，请重新安装完整 PLC Pilot。".into()))?;
+        return Ok(());
+    }
     let content = builtin_skill_content(&id).ok_or_else(|| AppError::Configuration("这个 Skill 没有可安装的已核验内容。".into()))?;
     if id.is_empty() || id.chars().any(|value| !(value.is_ascii_alphanumeric() || value == '-' || value == '_')) { return Err(AppError::Configuration("Skill 标识不符合目录命名规则。".into())); }
     let directory = app_data_root().join("skills").join(&id);

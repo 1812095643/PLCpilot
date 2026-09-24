@@ -1,10 +1,12 @@
 {
   "name": "plc-pilot",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "private": true,
   "description": "支持 CODESYS、CAREL STone 与自由聊天的本地 AI Agent 工作台",
   "type": "module",
-  "workspaces": ["stone-mcp"],
+  "workspaces": [
+    "stone-mcp"
+  ],
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build:agent-host": "node scripts/build-agent-host.mjs",

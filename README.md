@@ -20,13 +20,13 @@ PLC Pilot 作为独立桌面应用运行。交互结构参考 Codex 等本地 Ag
 
 ## 下载
 
-当前稳定版本：[v0.1.14](https://github.com/1812095643/PLCpilot/releases/tag/v0.1.14)
+当前稳定版本：[v0.1.15](https://github.com/1812095643/PLCpilot/releases/tag/v0.1.15)
 
-- [Windows 安装版（EXE）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.14/PLC-Pilot-0.1.14-x64-setup.exe)：适合大多数用户。
-- [Windows 安装版（MSI）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.14/PLC-Pilot-0.1.14-x64.msi)：适合组织化部署。
-- [Windows 便携版（ZIP）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.14/PLC-Pilot-Portable-0.1.14-win-x64.zip)：完整解压后运行，不写入系统 PATH。
-- [CAREL STone MCP 独立包](https://github.com/1812095643/PLCpilot/releases/download/v0.1.14/PLC-Pilot-STone-MCP-0.1.1.zip)：需要单独运行 STone MCP 时使用。
-- [更新清单](https://github.com/1812095643/PLCpilot/releases/download/v0.1.14/latest.json) · [SHA-256 校验](https://github.com/1812095643/PLCpilot/releases/download/v0.1.14/SHA256SUMS.txt)
+- [Windows 安装版（EXE）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/PLC-Pilot-0.1.15-x64-setup.exe)：适合大多数用户。
+- [Windows 安装版（MSI）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/PLC-Pilot-0.1.15-x64.msi)：适合组织化部署。
+- [Windows 便携版（ZIP）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/PLC-Pilot-Portable-0.1.15-win-x64.zip)：完整解压后运行，不写入系统 PATH。
+- [CAREL STone MCP 独立包](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/PLC-Pilot-STone-MCP-0.1.1.zip)：需要单独运行 STone MCP 时使用。
+- [更新清单](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/latest.json) · [SHA-256 校验](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/SHA256SUMS.txt)
 
 安装版和便携版都包含精简的 Node.js、npm/npx、Python 和 pip 运行时。首次安装第三方 MCP 或 Python 依赖时仍需要网络。CODESYS、CAREL STone 和 WebView2 属于外部软件；便携版需要系统已有 WebView2，安装版可联网补装。
 
@@ -103,6 +103,9 @@ PLC Pilot 作为独立桌面应用运行。交互结构参考 Codex 等本地 Ag
 - CODESYS 诊断与编译
 - PLC 投运与交付
 - Documents、Spreadsheets、Presentations、PDF
+- `patent-disclosure-skill` 中国专利技能：从研发材料挖掘专利点，编写交底书和申请文件，并支持专利检索、通俗解读、专利地图、政策简报与审查答复。完整上游资源随安装包内置，按需在本轮选择使用。
+
+专利 Skill 的 Word/PPTX、YAML、公式和 Playwright Python 依赖已随安装包提供；PDF、CAD、matplotlib、浏览器内核和向量模型等可选组件按需安装。
 
 也可以把项目目录中的用户自定义 Skills 纳入本轮任务。高风险工具仍由 PLC Pilot 的审批模式和完全访问模式统一管理。
 

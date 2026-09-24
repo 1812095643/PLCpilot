@@ -1,3 +1,21 @@
+0.1.15 新增中国专利 Skill：内置 `handsomestWei/patent-disclosure-skill` 完整资源。
+
+- Skills 设置页新增“中国专利交底与申请”，默认随 PLC Pilot 提供，可在自由聊天、CODESYS 和 Stone 模式中按需选择。
+- 完整保留上游 9 个子技能、提示词、参考资料、文档生成/检索工具和 MIT License；入口支持交底书、申请文件、案卷会稿、专利检索、通俗解读、专利地图、政策简报和审查答复。
+- 针对随包嵌入式 Python 补齐上游工具缺少的共享 UTF-8 模块，并让浏览器/公式脚本显式定位自身工具目录，确保空电脑直接运行。
+- 安装包把完整 Skill 目录放入程序旁的 `skills\patent-disclosure-skill` 资源目录，生成 Word、线稿和检索脚本直接使用包内路径，不依赖源码目录或临时文件夹。
+- 专利 Skill 使用随包 Python 运行时，核心 Word/PPTX、YAML、公式和浏览器自动化依赖随包提供；PDF 专用、CAD、matplotlib、浏览器内核和向量模型仍按需安装。
+- 上游来源：`https://github.com/handsomestWei/patent-disclosure-skill`，本次同步提交：`39d96b8be4afd19f936f66a995c6b4ae28378915`。
+
+在“设置 → 软件更新”或“帮助 → 检查更新”中可检查并安装本版本。更新保留模型、密钥、项目、MCP/Skills 配置和聊天记录。
+
+- 安装版：`PLC-Pilot-0.1.15-x64-setup.exe`，同时提供 MSI 安装包。
+- 便携版：`PLC-Pilot-Portable-0.1.15-win-x64.zip`，请完整解压，保留运行时目录。
+- 安装完成页继续提供立即启动、桌面快捷方式与开机自启选项；设置内可管理开机自启。
+- 安装版和便携版均包含 Node.js、npm/npx、Python 和 pip，继续提供独立的 STone MCP 压缩包。
+
+便携版需要 Windows 已安装 WebView2；安装版可联网补装。发布文件提供更新签名和 SHA-256 校验清单。
+
 0.1.14 会话交互与界面更新：修复文件拖拽和外链打开，完善欢迎页与工具目录。
 
 - 点击侧边栏项目名称仅展开或折叠，点击具体会话才打开对话。

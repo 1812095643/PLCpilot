@@ -69,6 +69,8 @@ const DOCUMENTS_SKILL: &str = include_str!("../../skills/documents/SKILL.md");
 const SPREADSHEETS_SKILL: &str = include_str!("../../skills/spreadsheets/SKILL.md");
 const PRESENTATIONS_SKILL: &str = include_str!("../../skills/presentations/SKILL.md");
 const PDF_SKILL: &str = include_str!("../../skills/pdf/SKILL.md");
+const PATENT_DISCLOSURE_SKILL: &str = include_str!("../../skills/patent-disclosure-skill/SKILL.md");
+const PATENT_DISCLOSURE_SKILL_ID: &str = "patent-disclosure-skill";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1050,6 +1052,21 @@ fn ensure_runtime_layout() -> Result<(), AppError> {
         })?;
     }
     Ok(())
+}
+
+fn builtin_skill_resource_root(id: &str) -> Option<PathBuf> {
+    if id != PATENT_DISCLOSURE_SKILL_ID { return None; }
+    // 直接读取包内完整资源，不在每次启动时删除、重拷用户目录。
+    // 发布版只认包内路径，避免构建机源码掩盖便携版或安装版漏包。
+    if let Some(path) = bundled_runtime_file(&format!("skills/{id}/SKILL.md")) {
+        return path.parent().map(Path::to_path_buf);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../skills").join(id);
+        if source.join("SKILL.md").is_file() { return Some(source); }
+    }
+    None
 }
 
 fn normalize_model_profile(mut model: ModelConfig, index: usize) -> ModelConfig {
@@ -8579,8 +8596,23 @@ fn builtin_skill_content(id: &str) -> Option<&'static str> {
         "spreadsheets" => Some(SPREADSHEETS_SKILL),
         "presentations" => Some(PRESENTATIONS_SKILL),
         "pdf" => Some(PDF_SKILL),
+        PATENT_DISCLOSURE_SKILL_ID => Some(PATENT_DISCLOSURE_SKILL),
         _ => None,
     }
+}
+
+fn builtin_skill_prompt_content(id: &str, selected: bool) -> Option<String> {
+    let content = builtin_skill_content(id)?;
+    if id == PATENT_DISCLOSURE_SKILL_ID {
+        let Some(root) = builtin_skill_resource_root(id) else {
+            return Some("中国专利 Skill 的包内资源缺失，请重新安装完整 PLC Pilot；不要声称已读取或执行该 Skill。".into());
+        };
+        let location = format!("中国专利 Skill（patent-disclosure-skill）：交底、申请、案卷、检索、解读、专利地图、政策简报与审查答复。入口：{}\n资源根目录：{}。仅在用户提出专利相关任务或选用该 Skill 时先 read 入口及对应子 SKILL.md；所有相对路径以资源根目录解析。执行脚本使用包内 Python：{}，通过 powershell 或 exec_command，继续遵守客户端审批。产出写当前工作目录的 outputs，不修改安装目录。核心依赖已内置；可选 PDF/CAD/向量库等按上游要求按需准备，不虚构 WebSearch 或图像生成工具。专利文档排版使用上游 Python 脚本；通用 Office 工具仅做基础读写。",
+            root.join("SKILL.md").display(), root.display(), resolve_runtime_command("python"));
+        // 未选用时只注入发现信息，避免专利交付规则干扰普通 PLC/聊天任务。
+        return Some(if selected { format!("{location}\n\n{content}") } else { location });
+    }
+    Some(content.to_string())
 }
 
 async fn snapshot_from_app_state(state: &State<'_, AppState>) -> Result<AppSnapshot, AppError> {
@@ -9448,6 +9480,7 @@ fn builtin_skills() -> Vec<SkillSummary> {
         SkillSummary { id: "spreadsheets".into(), name: "Spreadsheets · Excel".into(), description: "读取和生成 Excel 工作簿，支持多工作表行列数据。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
         SkillSummary { id: "presentations".into(), name: "Presentations · PowerPoint".into(), description: "读取和生成 PowerPoint 幻灯片标题与正文。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
         SkillSummary { id: "pdf".into(), name: "PDF".into(), description: "读取 PDF 文本层并生成基础文本 PDF。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
+        SkillSummary { id: PATENT_DISCLOSURE_SKILL_ID.into(), name: "中国专利交底与申请".into(), description: "从研发材料挖掘专利点，编写中国专利交底书和申请文件，并支持检索、解读、政策简报与审查答复。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
     ]
 }
 
@@ -9651,6 +9684,7 @@ fn skill_catalog_entries(project: &ProjectContext) -> Vec<SkillCatalogEntry> {
         SkillCatalogEntry { id: "spreadsheets".into(), name: "Spreadsheets · Excel".into(), description: "读取和生成 Excel 工作簿，支持多工作表行列数据。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("spreadsheets"), free: true },
         SkillCatalogEntry { id: "presentations".into(), name: "Presentations · PowerPoint".into(), description: "读取和生成 PowerPoint 幻灯片标题与正文。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("presentations"), free: true },
         SkillCatalogEntry { id: "pdf".into(), name: "PDF".into(), description: "读取 PDF 文本层并生成基础文本 PDF。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("pdf"), free: true },
+        SkillCatalogEntry { id: PATENT_DISCLOSURE_SKILL_ID.into(), name: "中国专利交底与申请".into(), description: "从研发材料挖掘专利点，编写中国专利交底书和申请文件，并支持检索、解读、政策简报与审查答复。".into(), source: "github.com/handsomestWei/patent-disclosure-skill".into(), license: "MIT".into(), installed: installed.contains(PATENT_DISCLOSURE_SKILL_ID), free: true },
     ]
 }
 
@@ -9711,7 +9745,7 @@ fn build_system_prompt(project: &ProjectContext) -> String {
         .into_iter()
         .filter(|skill| skill.enabled)
     {
-        if let Some(content) = builtin_skill_content(&skill.id) { skill_sections.push(content.to_string()); continue; }
+        if let Some(content) = builtin_skill_prompt_content(&skill.id, false) { skill_sections.push(content); continue; }
         if let Some(path) = skill.path {
             if let Ok(content) = std::fs::read_to_string(path) {
                 skill_sections.push(truncate(&content, 12000));
@@ -9851,8 +9885,7 @@ fn build_agent_system_prompt(project: &ProjectContext, request: &AgentRequest) -
                 .strip_prefix("builtin://")
                 .unwrap_or_else(|| selected_value.trim());
             if !known_skills.iter().any(|skill| skill.enabled && (skill.id == selected_id || skill.path.as_deref() == Some(selected_value.trim()))) { continue; }
-            let content = builtin_skill_content(selected_id)
-                .map(str::to_string)
+            let content = builtin_skill_prompt_content(selected_id, true)
                 .or_else(|| {
                     known_skills
                         .iter()
