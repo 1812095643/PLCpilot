@@ -1,6 +1,6 @@
 {
   "name": "plc-pilot",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "private": true,
   "description": "支持 CODESYS、CAREL STone 与自由聊天的本地 AI Agent 工作台",
   "type": "module",

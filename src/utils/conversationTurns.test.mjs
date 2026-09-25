@@ -68,11 +68,19 @@ test('ongoing turn stays visible while previous turns remain collapsible and que
 });
 
 test('restored text and activities share a turn despite legacy prefixes and get a disclosure', () => {
-  const records = [message('user', 'user', 'work', { turnId: 'restored-0' }), message('intro', 'assistant', 'intro', { turnId: 'restored-0' }),
+  const records = [message('user', 'user', 'work', { turnId: 'restored-0', activityDurationMs: 23456 }), message('intro', 'assistant', 'intro', { turnId: 'restored-0' }),
     activity('retry', 'retry', 'completed'), message('final', 'assistant', 'answer', { turnId: 'restored-0' })];
   assert.equal(new Set(responseTurnKeys(records).values()).size, 1);
   const completed = completedResponses(records, false);
   assert.deepEqual(responseTimeline(records, completed).map(m => m.id), ['user', 'process-turn-0', 'intro', 'retry', 'final']);
+  assert.equal(completed.get('turn-0').header.activityDurationMs, 23456);
+});
+
+test('persisted duration keeps a disclosure for a reply without tools', () => {
+  const records = [message('user', 'user', 'work', { activityDurationMs: 8000 }), message('final', 'assistant', 'answer')];
+  const completed = completedResponses(records, false);
+  assert.equal(completed.get('turn-0').header.activityDurationMs, 8000);
+  assert.deepEqual(responseTimeline(records, completed).map(m => m.id), ['user', 'process-turn-0', 'final']);
 });
 
 test('long completed turns keep the disclosure above the render window and never hide the final answer', () => {

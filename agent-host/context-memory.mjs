@@ -128,13 +128,14 @@ export async function createProjectMemory(root, cwd, secrets = []) {
     catch (error) { if (error.code === "ENOENT") return []; throw error; }
     const records = [];
     for (const file of files) {
-      if (!file.isFile() || !/^(fact-[a-f0-9-]{36}|summary-[a-f0-9]{24})\.json$/.test(file.name)) continue;
+      if (!file.isFile() || !/^(fact-[a-f0-9-]{36}|knowledge-[a-f0-9-]{36}|summary-[a-f0-9]{24})\.json$/.test(file.name)) continue;
       const path = join(directory, file.name);
       try {
         if ((await stat(path)).size > 80000) continue;
         const data = JSON.parse(await readFile(path, "utf8"));
         if (`${data.id}.json` !== file.name || data.project !== project || typeof data.content !== "string") continue;
-        if (!Number.isFinite(Date.parse(data.updated_at)) || Date.now() - Date.parse(data.updated_at) > MEMORY_MAX_AGE_MS) continue;
+        if (!Number.isFinite(Date.parse(data.updated_at))) continue;
+        if (data.kind !== "knowledge" && Date.now() - Date.parse(data.updated_at) > MEMORY_MAX_AGE_MS) continue;
         records.push({ ...data, content: clean(data.content), title: clean(data.title) });
       } catch (error) {
         // 单个记录损坏/删除不应让整个会话无法启动；权限和 I/O 故障仍要上报。
@@ -144,7 +145,8 @@ export async function createProjectMemory(root, cwd, secrets = []) {
     return records.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || a.id.localeCompare(b.id));
   }
   async function save({ id = `fact-${randomUUID()}`, kind = "fact", title, content, source }) {
-    if (!String(content ?? "").trim() || content.length > MAX_MEMORY_CHARS) throw new Error("记忆正文应为 1 至 12000 个字符，请只保留可复用的事实。");
+    const maxChars = kind === "knowledge" ? 50000 : MAX_MEMORY_CHARS;
+    if (!String(content ?? "").trim() || content.length > maxChars) throw new Error(`${kind === "knowledge" ? "知识库" : "记忆"}正文应为 1 至 ${maxChars} 个字符。`);
     const records = await list();
     if (!records.some((item) => item.id === id) && records.length >= MAX_MEMORY_RECORDS) throw new Error("当前项目已有 128 条近期记忆，请先删除不再需要的记录。");
     const record = { id, kind, project, title: clean(title || "项目记忆").slice(0, 100), content: clean(content), source, updated_at: new Date().toISOString(), verification: "历史参考，使用前核对当前状态" };
@@ -152,7 +154,7 @@ export async function createProjectMemory(root, cwd, secrets = []) {
     return record;
   }
   async function remove(id) {
-    if (!/^(fact-[a-f0-9-]{36}|summary-[a-f0-9]{24})$/.test(String(id))) throw new Error("请使用 memory 返回的完整记录 ID。");
+    if (!/^(fact-[a-f0-9-]{36}|knowledge-[a-f0-9-]{36}|summary-[a-f0-9]{24})$/.test(String(id))) throw new Error("请使用 memory 返回的完整记录 ID。");
     await rm(join(directory, `${id}.json`), { force: true });
   }
   return { directory, list, save, remove };
@@ -250,7 +252,7 @@ export function createContextExtension({ store, preferences = {}, secrets = [], 
       },
     });
     if (preferences.project_memory !== false) pi.registerTool({
-      name: "memory", label: "项目记忆", description: "检索或维护当前工作目录的跨会话记忆。save 必须引用当前 history 的 source_id，只保存稳定事实/经验；delete 用于忘记指定记录。摘要不是已验证事实，历史批准不是当前权限。",
+      name: "memory", label: "项目记忆与知识库", description: "检索或维护当前工作目录的跨会话记忆与项目知识库。save 必须引用当前 history 的 source_id，只保存稳定事实/经验；delete 用于忘记指定记录。知识库条目可由桌面上下文中心维护。摘要不是已验证事实，历史批准不是当前权限。",
       parameters: Type.Object({ action: actions("list", "search", "read", "save", "delete"), id: Type.Optional(Type.String()), query: Type.Optional(Type.String()), title: Type.Optional(Type.String()), content: Type.Optional(Type.String()), source_id: Type.Optional(Type.String()), offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_RESULT_CHARS })) }),
       async execute(_id, args, signal, _update, ctx) {
         signal?.throwIfAborted();

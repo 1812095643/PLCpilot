@@ -76,10 +76,19 @@ export function completedResponses(messages: UiMessage[], running: boolean): Map
       && message.commandExecution?.status !== 'waiting'
       && (message.text.trim() || message.commandExecution || message.fileChanges?.length || message.plan?.steps.length))
       .map((message) => message.id))
-    if (!worked && !processIds.size) continue
+    const persistedDurationMs = turn.items.find((message) => message.role === 'user')?.activityDurationMs ?? 0
+    if (!worked && !processIds.size && persistedDurationMs <= 0) continue
     result.set(key, {
       key, startIndex: turn.startIndex, final, processIds,
-      header: worked ?? { id: `process-${key}`, role: 'system', text: '操作过程', messageType: 'worked', turnIndex: final.turnIndex, turnId: final.turnId },
+      header: worked ?? {
+        id: `process-${key}`,
+        role: 'system',
+        text: '操作过程',
+        messageType: 'worked',
+        activityDurationMs: turn.items.find((message) => message.role === 'user')?.activityDurationMs,
+        turnIndex: final.turnIndex,
+        turnId: final.turnId,
+      },
     })
   }
   return result

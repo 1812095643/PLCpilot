@@ -178,6 +178,7 @@ export type ToolSummary = {
 
 export type SessionRecord = {
   ui_turns?: Array<{ turn_index: number; text: string; attachments?: LocalAttachmentInput[]; references?: UiMentionReference[]; response_annotations?: SessionRecord['messages'][number]['response_annotations']; skills?: string[]; collaboration_mode?: 'default' | 'plan' }>
+  turn_durations?: Array<{ turn_index: number; duration_ms: number }>
   activities?: Array<{ turn_index: number; event: AgentEvent; timeline_order?: number }>
   session_id: string
   name: string | null
@@ -204,6 +205,17 @@ export type SessionRecord = {
       created_at?: string | null
     }>
   }>
+}
+
+export type ProjectContextRecord = {
+  id: string
+  kind: 'fact' | 'summary' | 'knowledge' | string
+  project: string
+  title: string
+  content: string
+  source?: unknown
+  updated_at: string
+  verification?: string | null
 }
 
 export type ForkSessionMode = 'before_turn' | 'through_turn'
@@ -489,6 +501,16 @@ export const removeProject = (id: string) => invoke<WorkspaceProject[]>('remove_
 export const scanProject = () => invoke<ProjectContext>('scan_project')
 export const syncCurrentProject = () => invoke<ProjectContext>('sync_current_project')
 export const listSessions = () => invoke<SessionRecord[]>('list_sessions')
+export const searchSessions = (query: string) => invoke<SessionRecord[]>('search_sessions', { query })
+export const listProjectContext = (projectPath: string) => invoke<ProjectContextRecord[]>('list_project_context', { project_path: projectPath })
+export const saveProjectContext = (payload: { projectPath: string; id?: string; kind: 'fact' | 'knowledge'; title: string; content: string }) => invoke<ProjectContextRecord>('save_project_context', {
+  project_path: payload.projectPath,
+  id: payload.id,
+  kind: payload.kind,
+  title: payload.title,
+  content: payload.content,
+})
+export const deleteProjectContext = (projectPath: string, id: string) => invoke<void>('delete_project_context', { project_path: projectPath, id })
 export const resumeSession = (path: string) => invoke<SessionRecord>('resume_session', { path })
 export const forkSession = (request: ForkSessionRequest) => invoke<SessionRecord>('fork_session', {
   request: {

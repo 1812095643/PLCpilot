@@ -11,8 +11,10 @@ use std::{
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use base64::Engine;
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
@@ -464,7 +466,23 @@ pub struct SessionRecord {
     #[serde(default)]
     pub ui_turns: Vec<Value>,
     #[serde(default)]
+    pub turn_durations: Vec<Value>,
+    #[serde(default)]
     pub activities: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectContextRecord {
+    pub id: String,
+    pub kind: String,
+    pub project: String,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub source: Option<Value>,
+    pub updated_at: String,
+    #[serde(default)]
+    pub verification: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1802,6 +1820,7 @@ async fn dispatch_local_rpc(
                 reasoning_effort: None,
                 messages: Vec::new(),
                 ui_turns: Vec::new(),
+                turn_durations: Vec::new(),
                 activities: Vec::new(),
             }))
             .map_err(|error| AppError::Internal(format!("编码线程读取结果未完成：{error}")))?
@@ -2536,6 +2555,10 @@ pub fn run() {
             compile_project,
             get_skill_content,
             list_sessions,
+            search_sessions,
+            list_project_context,
+            save_project_context,
+            delete_project_context,
             resume_session,
             fork_session,
             list_projects,
@@ -3278,6 +3301,7 @@ async fn rename_session_inner(
             reasoning_effort: None,
             messages: Vec::new(),
             ui_turns: Vec::new(),
+            turn_durations: Vec::new(),
             activities: Vec::new(),
         }
     };
@@ -3435,6 +3459,139 @@ async fn open_local_path(path: String, mode: String) -> Result<(), AppError> {
 #[tauri::command]
 async fn list_sessions() -> Result<Vec<SessionRecord>, AppError> {
     Ok(list_session_records())
+}
+
+fn project_context_memory_root(project_path: &str) -> Result<(String, PathBuf), AppError> {
+    let requested = project_path.trim();
+    if requested.is_empty() {
+        return Err(AppError::Configuration("请先选择项目目录，再管理项目记忆。".into()));
+    }
+    let candidate = dunce::canonicalize(requested)
+        .map_err(|error| AppError::Configuration(format!("项目目录不可访问：{error}")))?;
+    let directory = if candidate.is_file() {
+        candidate.parent().map(Path::to_path_buf).ok_or_else(|| AppError::Configuration("项目文件没有父目录。".into()))?
+    } else if candidate.is_dir() {
+        candidate
+    } else {
+        return Err(AppError::Configuration("项目目录不存在。".into()));
+    };
+    let project = if cfg!(windows) { directory.to_string_lossy().to_lowercase() } else { directory.to_string_lossy().into_owned() };
+    let project_id = format!("{:x}", Sha256::digest(project.as_bytes()));
+    Ok((project, app_data_root().join("memories").join("projects").join(&project_id[..24])))
+}
+
+fn project_context_records(project_path: &str) -> Result<Vec<ProjectContextRecord>, AppError> {
+    let (project, directory) = project_context_memory_root(project_path)?;
+    let mut records = Vec::new();
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
+        Err(error) => return Err(AppError::Configuration(format!("读取项目上下文未完成：{error}"))),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") { continue; }
+        let Ok(bytes) = fs::read(&path) else { continue; };
+        let Ok(record) = serde_json::from_slice::<ProjectContextRecord>(&bytes) else { continue; };
+        if record.project != project || record.content.trim().is_empty() { continue; }
+        records.push(record);
+    }
+    records.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    Ok(records)
+}
+
+fn valid_project_context_id(value: &str) -> bool {
+    (value.starts_with("fact-") || value.starts_with("summary-") || value.starts_with("knowledge-"))
+        && value.len() <= 96
+        && value.chars().all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+#[tauri::command]
+async fn list_project_context(project_path: String) -> Result<Vec<ProjectContextRecord>, AppError> {
+    tauri::async_runtime::spawn_blocking(move || project_context_records(&project_path))
+        .await
+        .map_err(|error| AppError::Internal(format!("读取项目上下文任务未完成：{error}")))?
+}
+
+#[tauri::command]
+async fn save_project_context(
+    project_path: String,
+    id: Option<String>,
+    kind: String,
+    title: String,
+    content: String,
+) -> Result<ProjectContextRecord, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (project, directory) = project_context_memory_root(&project_path)?;
+        let kind = if kind.trim().eq_ignore_ascii_case("knowledge") { "knowledge" } else { "fact" }.to_string();
+        let content = content.trim().to_string();
+        let max_chars = if kind == "knowledge" { 50_000 } else { 12_000 };
+        if content.is_empty() || content.chars().count() > max_chars {
+            return Err(AppError::Configuration(format!("{}内容长度应为 1 至 {} 个字符。", if kind == "knowledge" { "知识库" } else { "记忆" }, max_chars)));
+        }
+        let existing = project_context_records(&project_path)?;
+        let record_id = id.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| format!("{}-{}", if kind == "knowledge" { "knowledge" } else { "fact" }, Uuid::new_v4()));
+        if !valid_project_context_id(&record_id) {
+            return Err(AppError::Configuration("项目上下文记录 ID 不可用。".into()));
+        }
+        if !existing.iter().any(|item| item.id == record_id) && existing.len() >= 128 {
+            return Err(AppError::Configuration("当前项目已有 128 条上下文记录，请先删除不再需要的内容。".into()));
+        }
+        let record = ProjectContextRecord {
+            id: record_id,
+            kind,
+            project,
+            title: title.trim().chars().take(100).collect::<String>().if_empty_then("项目上下文"),
+            content,
+            source: Some(json!({"type": "desktop", "updated_by": "PLC Pilot"})),
+            updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            verification: Some("历史参考，使用前核对当前项目状态".into()),
+        };
+        fs::create_dir_all(&directory).map_err(|error| AppError::Configuration(format!("创建项目上下文目录未完成：{error}")))?;
+        write_json_atomic(&directory.join(format!("{}.json", record.id)), &record, "项目上下文")?;
+        Ok(record)
+    }).await.map_err(|error| AppError::Internal(format!("保存项目上下文任务未完成：{error}")))?
+}
+
+#[tauri::command]
+async fn delete_project_context(project_path: String, id: String) -> Result<(), AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !valid_project_context_id(&id) {
+            return Err(AppError::Configuration("项目上下文记录 ID 不可用。".into()));
+        }
+        let (_, directory) = project_context_memory_root(&project_path)?;
+        fs::remove_file(directory.join(format!("{id}.json"))).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound { AppError::Configuration("这条项目上下文已经不存在。".into()) }
+            else { AppError::Configuration(format!("删除项目上下文未完成：{error}")) }
+        })
+    }).await.map_err(|error| AppError::Internal(format!("删除项目上下文任务未完成：{error}")))?
+}
+
+trait EmptyIf {
+    fn if_empty_then(self, fallback: &str) -> String;
+}
+
+impl EmptyIf for String {
+    fn if_empty_then(self, fallback: &str) -> String { if self.trim().is_empty() { fallback.to_string() } else { self } }
+}
+
+#[tauri::command]
+async fn search_sessions(query: String) -> Result<Vec<SessionRecord>, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() { return Ok(list_session_records()); }
+        let root = agent_session_dir();
+        let mut records = Vec::new();
+        for entry in WalkDir::new(root).max_depth(3).follow_links(false).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            if !entry.file_type().is_file() || path.extension().and_then(|value| value.to_str()) != Some("jsonl") { continue; }
+            let Some(record) = parse_session_record_with_mode(path, false) else { continue; };
+            let haystack = format!("{}\n{}\n{}", record.name.clone().unwrap_or_default(), record.cwd.clone().unwrap_or_default(), record.messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>().join("\n")).to_lowercase();
+            if haystack.contains(&needle) { records.push(record); }
+        }
+        records.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
+        Ok(records)
+    }).await.map_err(|error| AppError::Internal(format!("搜索会话任务未完成：{error}")))?
 }
 
 #[tauri::command]
@@ -9010,6 +9167,20 @@ fn available_commands() -> Vec<CommandSummary> {
             false,
         ),
         (
+            "/memory",
+            "项目记忆",
+            "管理当前项目的长期记忆",
+            "project",
+            false,
+        ),
+        (
+            "/knowledge",
+            "项目知识库",
+            "管理当前项目的知识条目",
+            "project",
+            false,
+        ),
+        (
             "/rename",
             "重命名会话",
             "给当前会话设置一个易识别的名称",
@@ -9296,6 +9467,7 @@ fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionR
     let mut reasoning_effort = None;
     let mut messages = Vec::new();
     let mut ui_turns: Vec<Value> = Vec::new();
+    let mut turn_durations: Vec<Value> = Vec::new();
     let mut activities: Vec<Value> = Vec::new();
     const RESPONSE_ANNOTATION_ENTRY: &str = "plc-pilot.response-text-annotations";
     for (line_index, line) in content.lines().enumerate() {
@@ -9387,6 +9559,19 @@ fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionR
                     } else { target.push(data); }
                 }
             }
+            Some("custom") if entry.get("customType").and_then(Value::as_str) == Some("plc-pilot.ui-turn-duration") => {
+                if !preview {
+                    let mut data = entry.get("data").cloned().unwrap_or_default();
+                    if let Some(object) = data.as_object_mut() {
+                        object.entry("timeline_order").or_insert_with(|| json!(line_index));
+                    }
+                    if let Some(existing) = turn_durations.iter_mut().find(|current| current["turn_index"] == data["turn_index"]) {
+                        *existing = data;
+                    } else {
+                        turn_durations.push(data);
+                    }
+                }
+            }
             Some("custom")
                 if entry
                     .get("customType")
@@ -9451,6 +9636,7 @@ fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionR
         reasoning_effort,
         messages,
         ui_turns,
+        turn_durations,
         activities,
         modified_at,
     })
@@ -11529,13 +11715,14 @@ mod tests {
                 "{\"type\":\"session\",\"id\":\"session-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/plc\"}\n",
                 "{\"type\":\"session_info\",\"id\":\"info-1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"name\":\"泵站诊断\"}\n",
                 "{\"type\":\"custom\",\"customType\":\"plc-pilot.model-profile\",\"data\":{\"profile_id\":\"model-large\",\"reasoning_effort\":\"high\"}}\n",
+                "{\"type\":\"custom\",\"customType\":\"plc-pilot.ui-turn-duration\",\"data\":{\"turn_index\":0,\"duration_ms\":12345}}\n",
                 "{\"type\":\"message\",\"id\":\"user-1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":\"检查 MAIN\"}}\n",
                 "{\"type\":\"message\",\"id\":\"assistant-1\",\"parentId\":\"user-1\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"已读取工程。\"}]}}\n",
                 "{\"type\":\"message\",\"id\":\"tool-1\",\"parentId\":\"assistant-1\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"message\":{\"role\":\"toolResult\",\"content\":\"内部结果\"}}\n"
             ),
         )
         .expect("写入会话文件");
-        let record = parse_session_record(&path).expect("解析会话文件");
+        let record = parse_session_record_with_mode(&path, false).expect("解析会话文件");
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.name.as_deref(), Some("泵站诊断"));
         assert_eq!(record.cwd.as_deref(), Some("C:/plc"));
@@ -11548,6 +11735,7 @@ mod tests {
             Some("model-large")
         );
         assert_eq!(record.messages[1].content, "已读取工程。");
+        assert_eq!(record.turn_durations[0]["duration_ms"], 12345);
     }
 
     #[test]

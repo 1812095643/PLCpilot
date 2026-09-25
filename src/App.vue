@@ -10,6 +10,8 @@ import ThreadConversation from './components/content/ThreadConversation.vue'
 import CodesysStatusPanel from './components/content/CodesysStatusPanel.vue'
 import type { ThreadConversationExposed } from './components/content/ThreadConversation.vue'
 import ThreadComposer from './components/content/ThreadComposer.vue'
+import GlobalSessionCenter from './components/content/GlobalSessionCenter.vue'
+import ProjectContextCenter from './components/content/ProjectContextCenter.vue'
 import DocumentWorkspace from './components/documents/DocumentWorkspace.vue'
 import { useDocumentWorkspace } from './composables/useDocumentWorkspace'
 import type { DocumentSelection } from './api/documents'
@@ -93,7 +95,7 @@ import type {
 } from './types/codex'
 import type { Diagnostic } from './api/plcBridge'
 
-type View = 'chat' | 'overview' | 'skills'
+type View = 'chat' | 'overview' | 'skills' | 'sessions' | 'knowledge'
 
 const snapshot = shallowRef<Snapshot>(EMPTY_SNAPSHOT)
 const appReady = shallowRef(false)
@@ -108,6 +110,7 @@ const updater = useAppUpdates(async () => {
   await workspace.persist()
 }, () => tasksRunning.value)
 const messages = workspace.field('messages')
+const activeSessionId = computed(() => workspace.active.value.session.session_id || '')
 /** 当前 Composer 中等待随下一条用户消息发送的回复批注。 */
 const pendingResponseAnnotations = workspace.field('pendingResponseAnnotations')
 const activeView = shallowRef<View>('chat')
@@ -223,6 +226,8 @@ const fallbackCommands: CommandSummary[] = [
   { command: '/help', label: '帮助', detail: '查看命令和安全边界', category: 'session', supports_args: false },
   { command: '/status', label: '运行状态', detail: '工程、模型和会话状态', category: 'session', supports_args: false },
   { command: '/sessions', label: '会话历史', detail: '列出本机保存的工作会话', category: 'session', supports_args: false },
+  { command: '/memory', label: '项目记忆', detail: '管理当前项目的长期记忆', category: 'project', supports_args: false },
+  { command: '/knowledge', label: '项目知识库', detail: '管理当前项目的知识条目', category: 'project', supports_args: false },
   { command: '/projects', label: '项目列表', detail: '查看最近打开的工程目录', category: 'project', supports_args: false },
   { command: '/rename', label: '重命名会话', detail: '给当前会话设置一个易识别的名称', category: 'session', supports_args: true },
   { command: '/clear', label: '清空会话', detail: '移除当前对话记录，不改工程文件', category: 'session', supports_args: false },
@@ -426,6 +431,9 @@ function restoreSessionMessages(record: SessionRecord): UiMessage[] {
     if (item.role === 'user') turnIndex += 1
     const normalizedTurnIndex = Math.max(0, turnIndex)
     const metadata = item.role === 'user' ? record.ui_turns?.find((entry) => entry.turn_index === normalizedTurnIndex) : undefined
+    const persistedDurationMs = item.role === 'user'
+      ? record.turn_durations?.find((entry) => entry.turn_index === normalizedTurnIndex)?.duration_ms
+      : undefined
     const restoredProfileId = item.model_profile_id || record.model_profile_id || undefined
     const restoredProfile = snapshot.value.models.find((model) => model.id === restoredProfileId)
     const responseAnnotations = (metadata?.response_annotations ?? item.response_annotations ?? [])
@@ -460,6 +468,9 @@ function restoreSessionMessages(record: SessionRecord): UiMessage[] {
       sessionMessageIndex: index,
       sessionTurnIndex: normalizedTurnIndex,
       timelineOrder: item.timeline_order,
+      activityDurationMs: typeof persistedDurationMs === 'number' && Number.isFinite(persistedDurationMs)
+        ? Math.max(0, Math.round(persistedDurationMs))
+        : undefined,
     }
   })
   // 旧会话通常把批注写在发送它的 user 记录上；恢复时把标记重新挂到对应的
@@ -973,6 +984,8 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   if (text === '/model') { settingsCategory.value = 'models'; providerDiscoveryRequest.value += 1; showSettings.value = true; return }
   if (text === '/skills' || text === '/mcp') { settingsCategory.value = text.slice(1); showSettings.value = true; return }
   if (text === '/tools') { activeView.value = 'skills'; showSettings.value = false; return }
+  if (text === '/sessions') { activeView.value = 'sessions'; showSettings.value = false; return }
+  if (text === '/memory' || text === '/knowledge') { activeView.value = 'knowledge'; showSettings.value = false; return }
   if (/^\/(approve|reject)\s+/u.test(text)) {
     const [action, id] = text.split(/\s+/u)
     const change = thread.pendingChanges.find((change) => change.id === id)
@@ -1041,8 +1054,33 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   messages.value = [...baseMessages, pendingUserMessage, streamingAssistantMessage, ...queuedMessagesAtStart]
   let lastStreamSequence = 0
   let nativeTurnIndex: number | undefined
+  const turnStartedAt = Date.now()
+  let turnElapsedTimer: number | undefined
   let thinkingStartedAt = 0
   let thinkingTimer: number | undefined
+
+  function formatTurnElapsed(): string {
+    const elapsedSeconds = Math.max(0, Math.floor((Date.now() - turnStartedAt) / 1000))
+    return `已持续 ${elapsedSeconds} 秒`
+  }
+
+  function updateTurnElapsed(): void {
+    if (streamingRequestId.value !== requestId || !liveOverlay.value) return
+    const details = liveOverlay.value.activityDetails.filter((item) => !/^已持续 \d+ 秒$/u.test(item))
+    liveOverlay.value = { ...liveOverlay.value, activityDetails: [...details, formatTurnElapsed()] }
+  }
+
+  function startTurnElapsedTimer(): void {
+    updateTurnElapsed()
+    if (turnElapsedTimer === undefined) turnElapsedTimer = window.setInterval(updateTurnElapsed, 1000)
+  }
+
+  function stopTurnElapsedTimer(): void {
+    if (turnElapsedTimer !== undefined) window.clearInterval(turnElapsedTimer)
+    turnElapsedTimer = undefined
+  }
+
+  startTurnElapsedTimer()
 
   function stopThinkingTimer(): void {
     if (thinkingTimer !== undefined) window.clearInterval(thinkingTimer)
@@ -1052,10 +1090,9 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
 
   function showThinkingActivity(): void {
     if (!thinkingStartedAt || streamingRequestId.value !== requestId) return
-    const elapsedSeconds = Math.max(0, Math.floor((Date.now() - thinkingStartedAt) / 1000))
     liveOverlay.value = {
       activityLabel: '正在思考…',
-      activityDetails: elapsedSeconds > 0 ? [`已持续 ${elapsedSeconds} 秒`] : ['正在分析上下文'],
+      activityDetails: [formatTurnElapsed()],
       reasoningText: '',
       errorText: '',
       status: 'working',
@@ -1358,6 +1395,7 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     liveOverlay.value = null
   } finally {
     stopThinkingTimer()
+    stopTurnElapsedTimer()
     stopWatchingText()
     isBusy.value = false
     streamingRequestId.value = ''
@@ -1984,7 +2022,8 @@ onUnmounted(() => {
       <WorkspaceSidebar :projects="sidebarProjects" :threads="sidebarThreads" :active-id="activeThreadId" :theme="theme" :workbench-mode="workbenchMode" @update:theme="theme = $event" @update:workbench-mode="onWorkbenchModeChange"
         @new-thread="startNewThread" @select-thread="selectSidebarThread"
         @add-project="onPickProjectFolder" @remove-project="onRemoveProject" @rename-thread="renameSidebarThread" @delete-thread="deleteSidebarThread"
-        @open-settings="showSettings = true" @open-skills="activeView = 'skills'; showSettings = false" @open-overview="activeView = 'overview'; showSettings = false" />
+        @open-settings="showSettings = true" @open-skills="activeView = 'skills'; showSettings = false" @open-overview="activeView = 'overview'; showSettings = false"
+        @open-sessions="activeView = 'sessions'; showSettings = false" @open-knowledge="activeView = 'knowledge'; showSettings = false" />
     </template>
 
     <template #topbar>
@@ -2008,7 +2047,7 @@ onUnmounted(() => {
     </template>
 
     <template #header>
-      <ContentHeader :title="showSettings ? '设置' : currentTitle" :accent="activeView !== 'chat'">
+      <ContentHeader :title="showSettings ? '设置' : activeView === 'sessions' ? '会话中心' : activeView === 'knowledge' ? '项目上下文' : currentTitle" :accent="activeView !== 'chat'">
         <template #leading>
           <span class="plc-header-status" :data-state="isBusy ? 'busy' : currentProject.exists ? 'ok' : 'idle'" />
         </template>
@@ -2069,6 +2108,10 @@ onUnmounted(() => {
           </section>
 
         </div>
+
+        <GlobalSessionCenter v-else-if="activeView === 'sessions'" :sessions="snapshot.sessions" :projects="snapshot.projects" :active-id="activeSessionId" @open="onResumeSession" @rename="onRenameSession" @delete="onDeleteSession" @notice="showNotice" />
+
+        <ProjectContextCenter v-else-if="activeView === 'knowledge'" :project-path="currentProject.path || currentCwd" :project-name="currentProject.name || '当前项目'" @notice="showNotice" />
 
         <div v-else-if="activeView === 'overview'" class="plc-detail-layout">
           <section class="plc-detail-section plc-project-overview">

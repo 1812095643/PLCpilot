@@ -20,6 +20,7 @@ const emit = defineEmits<{
   'new-thread': [project?: WorkspaceProject]; 'select-thread': [id: string];
   'add-project': []; 'remove-project': [project: WorkspaceProject]; 'rename-thread': [id: string]; 'delete-thread': [id: string];
   'open-settings': []; 'open-skills': []; 'open-overview': [];
+  'open-sessions': []; 'open-knowledge': [];
   'update:theme': [theme: ThemePreference];
   'update:workbench-mode': [mode: WorkbenchMode];
 }>()
@@ -47,6 +48,8 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
     <div v-if="searchOpen" class="sidebar-search-wrap"><input v-model="search" class="sidebar-search" aria-label="搜索项目和会话" placeholder="搜索项目、会话或工作目录" autofocus /><span class="sidebar-search-summary" aria-live="polite">{{ searchSummary }}</span></div>
     <button class="sidebar-nav" @click="emit('new-thread')"><IconTablerFilePencil /><span>新对话</span></button>
     <button class="sidebar-nav" @click="emit('open-overview')"><IconTablerFolder /><span>工程概览</span></button>
+    <button class="sidebar-nav" @click="emit('open-sessions')"><IconTablerSearch /><span>会话中心</span></button>
+    <button class="sidebar-nav" @click="emit('open-knowledge')"><IconTablerBolt /><span>项目上下文</span></button>
     <button class="sidebar-nav" @click="emit('open-skills')"><IconTablerBolt /><span>Skills 与工具</span></button>
     <div class="sidebar-scroll">
       <div class="group-heading"><span>项目</span><button title="添加项目" aria-label="添加项目" @click="emit('add-project')"><IconTablerFolder /></button></div>

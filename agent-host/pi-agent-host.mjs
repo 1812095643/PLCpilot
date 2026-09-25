@@ -45,6 +45,7 @@ let flushingSteering = false;
 const activeToolArguments = new Map();
 let compactionCount = 0;
 let lastCompactedAt = null;
+let activeRunTurnIndex = null;
 let retryAfterHintMs = null;
 let retryStatusCode = null;
 let lastThinkingSignalAt = 0;
@@ -919,9 +920,18 @@ async function ensureSession(config) {
   return activeSession;
 }
 
+function persistTurnDuration(durationMs) {
+  if (!activeSession || !Number.isFinite(durationMs) || durationMs < 0 || !Number.isInteger(activeRunTurnIndex)) return;
+  activeSession.sessionManager.appendCustomEntry("plc-pilot.ui-turn-duration", {
+    turn_index: activeRunTurnIndex,
+    duration_ms: Math.max(0, Math.round(durationMs)),
+  });
+}
+
 async function runPrompt(config) {
   const session = await ensureSession(config);
   activeTurnIndex = session.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message?.role === "user").length;
+  activeRunTurnIndex = activeTurnIndex;
   session.sessionManager.appendCustomEntry("plc-pilot.ui-turn", {
     turn_index: activeTurnIndex, text: config.display_message ?? config.message,
     attachments: config.attachments ?? [], references: config.references ?? [],
@@ -982,6 +992,7 @@ async function runCompact(config) {
 }
 
 async function handleCommand(command) {
+  const runStartedAt = Date.now();
   registerDiagnosticSecrets(command);
   if (command.type === "run") {
     diagnosticRequest = command.request_id ?? null;
@@ -1034,10 +1045,18 @@ async function handleCommand(command) {
     return;
   }
   if (command.type === "run") {
+    let durationPersisted = false;
+    const persistDurationIfNeeded = () => {
+      if (command.action === "compact" || durationPersisted) return;
+      durationPersisted = true;
+      persistTurnDuration(Date.now() - runStartedAt);
+    };
     try {
       const result = command.action === "compact" ? await runCompact(command) : await runPrompt(command);
+      persistDurationIfNeeded();
       writeMessage(result);
     } catch (error) {
+      persistDurationIfNeeded();
       writeMessage({
         type: "error",
         request_id: command.request_id ?? null,
