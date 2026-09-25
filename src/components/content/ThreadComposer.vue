@@ -119,6 +119,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   submit: [payload: SubmitPayload]
   interrupt: []
+  'preview-attachment': [attachment: ComposerAttachment]
   'update:access-mode': [mode: 'approval' | 'full']
   'update:selected-collaboration-mode': [mode: CollaborationModeKind]
   'update:selected-model': [modelId: string]
@@ -841,7 +842,7 @@ defineExpose<ThreadComposerExposed>({
             @edit="editResponseAnnotation"
             @remove="removeResponseAnnotation"
           />
-          <ComposerAttachmentStrip :attachments="attachments" @remove="removeAttachment" />
+          <ComposerAttachmentStrip :attachments="attachments" @remove="removeAttachment" @preview="emit('preview-attachment', $event)" />
         </div>
         <textarea
           ref="inputRef"

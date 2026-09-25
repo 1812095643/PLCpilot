@@ -420,13 +420,20 @@ function waitForTool(request, signal) {
     const requestedTimeout = Number(request.arguments?.timeoutMs);
     const timeoutMs = String(request.tool_name).startsWith("stone_") && Number.isFinite(requestedTimeout)
       ? Math.max(TOOL_TIMEOUT_MS, Math.min(3600000, Math.max(1000, requestedTimeout)) + 60000)
-      : TOOL_TIMEOUT_MS;
-    const timer = setTimeout(() => {
+      : request.tool_name === "image_gen" ? 660000 : TOOL_TIMEOUT_MS;
+    const pending = {
+      timer: null,
+      paused: false,
+      resolve,
+      reject,
+    };
+    const expire = () => {
       pendingToolRequests.delete(request.request_id);
       reject(new Error(`PLC 工具响应超过 ${Math.round(timeoutMs / 1000)} 秒仍未返回`));
-    }, timeoutMs);
+    };
+    pending.timer = setTimeout(expire, timeoutMs);
     const abort = () => {
-      clearTimeout(timer);
+      if (pending.timer) clearTimeout(pending.timer);
       pendingToolRequests.delete(request.request_id);
       reject(new Error("工具调用已中止"));
     };
@@ -436,13 +443,18 @@ function waitForTool(request, signal) {
     }
     signal?.addEventListener("abort", abort, { once: true });
     pendingToolRequests.set(request.request_id, {
+      pause: () => {
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.timer = null;
+        pending.paused = true;
+      },
       resolve: (value) => {
-        clearTimeout(timer);
+        if (pending.timer) clearTimeout(pending.timer);
         signal?.removeEventListener("abort", abort);
         resolve(value);
       },
       reject: (error) => {
-        clearTimeout(timer);
+        if (pending.timer) clearTimeout(pending.timer);
         signal?.removeEventListener("abort", abort);
         reject(error);
       },
@@ -451,8 +463,11 @@ function waitForTool(request, signal) {
 }
 
 async function sendToolRequest(request, signal) {
+  // 先登记等待项，再写 stdin，避免 Rust 在极快审批时先返回
+  // approval_wait，而 Node 还没有建立对应的 request 记录。
+  const waiting = waitForTool(request, signal);
   writeMessage({ type: "tool_request", ...request });
-  return waitForTool(request, signal);
+  return waiting;
 }
 
 function sessionState() {
@@ -976,7 +991,7 @@ async function handleCommand(command) {
       messageCharacters: String(command.message ?? "").length, attachments: command.attachments?.length ?? 0, mcpTools: command.mcp_tools?.length ?? 0 });
   } else if (command.type === "tool_result") {
     diagnosticLog.info("agent.tool.result", { requestId: diagnosticRequest, toolRequestId: command.request_id, isError: command.is_error, decision: command.decision, content: command.content });
-  } else if (["abort", "shutdown", "steer", "record_approval", "execute_approved"].includes(command.type)) {
+  } else if (["abort", "shutdown", "steer", "record_approval", "execute_approved", "approval_wait"].includes(command.type)) {
     diagnosticLog.info(`agent.${command.type}`, { requestId: diagnosticRequest, arguments: command.arguments });
   }
   if (command.type === "steer") {
@@ -994,6 +1009,10 @@ async function handleCommand(command) {
         writeMessage({ type: "result", content: result.content, is_error: false });
       }
     } catch (error) { writeMessage({ type: "error", message: String(error) }); }
+    return;
+  }
+  if (command.type === "approval_wait") {
+    pendingToolRequests.get(command.request_id)?.pause();
     return;
   }
   if (command.type === "tool_result") {

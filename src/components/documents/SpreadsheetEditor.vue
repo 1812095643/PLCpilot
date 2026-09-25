@@ -1,0 +1,40 @@
+<script setup lang="ts">
+import { computed, onMounted, onBeforeUnmount, shallowRef, useTemplateRef, watch } from 'vue'
+import type { DocumentSnapshot, DocumentNode, DocumentOperation, DocumentSelection } from '../../api/documents'
+const props = defineProps<{ document: DocumentSnapshot; busy: boolean }>()
+const emit = defineEmits<{ apply: [operations: DocumentOperation[]]; quote: [selection: DocumentSelection] }>()
+const sheetIndex = shallowRef(0), rowOffset = shallowRef(0), columnOffset = shallowRef(0), viewportHeight = shallowRef(500), viewportWidth = shallowRef(700)
+const selectedAddress = shallowRef('A1'), addressDraft = shallowRef('A1'), draft = shallowRef('')
+const viewport = useTemplateRef<HTMLElement>('viewport')
+const ROW_HEIGHT = 26, COLUMN_WIDTH = 110, ROW_HEADER_WIDTH = 44
+const sheet = computed(() => props.document.nodes[sheetIndex.value])
+function columnName(value: number) { let text = ''; while (value > 0) { value--; text = String.fromCharCode(65 + value % 26) + text; value = Math.floor(value / 26) } return text }
+function coordinates(address: string) { const match = /^([A-Z]+)(\d+)$/.exec(address); return match ? { row: Number(match[2]), column: [...match[1]].reduce((total, char) => total * 26 + char.charCodeAt(0) - 64, 0) } : null }
+const cells = computed(() => new Map(sheet.value?.children.map(cell => [String(cell.properties.address), cell]) ?? []))
+const dimensions = computed(() => { let rows = 100, columns = 15; for (const address of cells.value.keys()) { const c = coordinates(address); if (c) { rows = Math.max(rows, c.row + 20); columns = Math.max(columns, c.column + 3) } } return { rows: Math.min(1048576, rows), columns: Math.min(16384, columns) } })
+const rows = computed(() => Array.from({ length: Math.max(0, Math.min(dimensions.value.rows - rowOffset.value, Math.ceil(viewportHeight.value / ROW_HEIGHT) + 4)) }, (_, i) => rowOffset.value + i + 1))
+const columns = computed(() => Array.from({ length: Math.max(0, Math.min(dimensions.value.columns - columnOffset.value, Math.ceil(viewportWidth.value / COLUMN_WIDTH) + 2)) }, (_, i) => columnOffset.value + i + 1))
+function select(address: string) { const cell = cells.value.get(address); selectedAddress.value = address; addressDraft.value = address; draft.value = cell?.properties.formula ? `=${cell.properties.formula}` : cell?.text ?? '' }
+watch([() => props.document.version, sheetIndex], () => select(selectedAddress.value))
+function scroll() { if (!viewport.value) return; rowOffset.value = Math.max(0, Math.floor((viewport.value.scrollTop - ROW_HEIGHT) / ROW_HEIGHT)); columnOffset.value = Math.max(0, Math.floor(viewport.value.scrollLeft / COLUMN_WIDTH)) }
+function goTo() { const address = addressDraft.value.trim().toUpperCase(); const c = coordinates(address); if (!c || c.row < 1 || c.row > dimensions.value.rows || c.column < 1 || c.column > dimensions.value.columns) return; select(address); viewport.value?.scrollTo({ top: (c.row - 1) * ROW_HEIGHT, left: (c.column - 1) * COLUMN_WIDTH }) }
+function apply() { if (!sheet.value) return; const formula = draft.value.startsWith('=') ? draft.value.slice(1) : undefined; const value = !formula && draft.value.trim() && /^-?(?:\d+\.?\d*|\.\d+)$/.test(draft.value) ? Number(draft.value) : draft.value; emit('apply', [{ op: 'set_cell', sheet: sheet.value.id, address: selectedAddress.value, value, formula }]) }
+function quote() { if (!sheet.value) return; emit('quote', { documentId: props.document.id, version: props.document.version, path: props.document.path, nodeId: `${sheet.value.id}#${selectedAddress.value}`, text: `${sheet.value.text}!${selectedAddress.value}: ${draft.value}` }) }
+let observer: ResizeObserver | undefined
+onMounted(() => { if (!viewport.value) return; observer = new ResizeObserver(([entry]) => { viewportHeight.value = entry.contentRect.height; viewportWidth.value = entry.contentRect.width }); observer.observe(viewport.value) })
+onBeforeUnmount(() => observer?.disconnect())
+</script>
+<template>
+  <div class="sheet-editor">
+    <div class="formula-bar"><input v-model="addressDraft" class="cell-address" aria-label="单元格地址" @keydown.enter.prevent="goTo" /><span class="formula-symbol">ƒx</span><input v-model="draft" class="formula-input" aria-label="单元格值或公式" :disabled="busy" @keydown.enter.prevent="apply" /><button :disabled="busy" @click="apply">应用</button><button @click="quote">引用</button></div>
+    <div ref="viewport" class="sheet-viewport" @scroll="scroll"><div class="sheet-grid" :style="{ height: `${(dimensions.rows + 1) * ROW_HEIGHT}px`, width: `${dimensions.columns * COLUMN_WIDTH + ROW_HEADER_WIDTH}px` }">
+      <div class="row-head column-head corner" :style="{ width: `${ROW_HEADER_WIDTH}px`, height: `${ROW_HEIGHT}px` }" />
+      <div v-for="column in columns" :key="`h${column}`" class="column-head" :style="{ left: `${ROW_HEADER_WIDTH + (column - 1) * COLUMN_WIDTH}px`, width: `${COLUMN_WIDTH}px`, height: `${ROW_HEIGHT}px` }">{{ columnName(column) }}</div>
+      <template v-for="row in rows" :key="row"><div class="row-head" :style="{ top: `${row * ROW_HEIGHT}px`, height: `${ROW_HEIGHT}px`, width: `${ROW_HEADER_WIDTH}px` }">{{ row }}</div><button v-for="column in columns" :key="`${row}:${column}`" class="sheet-cell" :class="{ selected: selectedAddress === `${columnName(column)}${row}` }" :style="{ left: `${ROW_HEADER_WIDTH + (column - 1) * COLUMN_WIDTH}px`, top: `${row * ROW_HEIGHT}px`, width: `${COLUMN_WIDTH}px`, height: `${ROW_HEIGHT}px` }" :title="String(cells.get(`${columnName(column)}${row}`)?.properties.formula ?? '')" @click="select(`${columnName(column)}${row}`)">{{ cells.get(`${columnName(column)}${row}`)?.text || (cells.get(`${columnName(column)}${row}`)?.properties.formula ? `=${cells.get(`${columnName(column)}${row}`)?.properties.formula}` : '') }}</button></template>
+    </div></div>
+    <nav class="sheet-tabs" aria-label="工作表"><button v-for="(item, index) in document.nodes" :key="item.id" :class="{ active: sheetIndex === index }" @click="sheetIndex = index; selectedAddress = 'A1'; viewport?.scrollTo(0, 0)">{{ item.text }}</button></nav>
+  </div>
+</template>
+<style scoped>
+.sheet-editor { display: flex; height: 100%; min-height: 0; flex-direction: column; }.formula-bar { display: flex; align-items: center; gap: 5px; padding: 7px; border-bottom: 1px solid var(--document-line); }.formula-bar input { color: var(--document-text); background: var(--document-field); border: 0; padding: 6px; border-radius: 4px; font-size: 12px; }.cell-address { width: 61px; }.formula-input { flex: 1; min-width: 50px; }.formula-symbol { color: var(--document-muted); padding: 0 5px; font-style: italic; }.formula-bar button { border: 0; background: none; color: var(--document-muted); font-size: 11px; cursor: pointer; padding: 4px; }.sheet-viewport { flex: 1; min-height: 0; overflow: auto; }.sheet-grid { position: relative; background: var(--document-bg); }.sheet-cell,.row-head,.column-head { position: absolute; box-sizing: border-box; border: 0; border-bottom: 1px solid var(--document-line); border-right: 1px solid var(--document-line); font: 11px/26px 'Cascadia Code', 'Microsoft YaHei', monospace; }.sheet-cell { background: var(--document-bg); color: var(--document-text); text-align: left; padding: 0 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: cell; }.sheet-cell.selected { box-shadow: inset 0 0 0 2px #dc9f51; z-index: 1; }.row-head,.column-head { background: var(--document-field); color: var(--document-muted); text-align: center; z-index: 2; user-select: none; }.row-head { left: 0; }.column-head { top: 0; }.corner { z-index: 3; }.sheet-tabs { display: flex; overflow-x: auto; border-top: 1px solid var(--document-line); padding: 5px 8px 0; flex-shrink: 0; gap: 5px; }.sheet-tabs button { border: 0; border-bottom: 2px solid transparent; background: none; color: var(--document-muted); padding: 7px 12px; font-size: 11px; cursor: pointer; white-space: nowrap; }.sheet-tabs .active { border-bottom-color: #dc9f51; color: var(--document-text); }
+</style>

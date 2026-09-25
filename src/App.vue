@@ -10,6 +10,11 @@ import ThreadConversation from './components/content/ThreadConversation.vue'
 import CodesysStatusPanel from './components/content/CodesysStatusPanel.vue'
 import type { ThreadConversationExposed } from './components/content/ThreadConversation.vue'
 import ThreadComposer from './components/content/ThreadComposer.vue'
+import DocumentWorkspace from './components/documents/DocumentWorkspace.vue'
+import { useDocumentWorkspace } from './composables/useDocumentWorkspace'
+import type { DocumentSelection } from './api/documents'
+import { listen } from '@tauri-apps/api/event'
+import type { ImageGenerationProgress } from './api/imageGeneration'
 import ComposerQueue from './components/content/ComposerQueue.vue'
 import ModelSettingsPanel from './components/settings/ModelSettingsPanel.vue'
 import SettingsPage from './components/settings/SettingsPage.vue'
@@ -29,7 +34,6 @@ import IconTablerSettings from './components/icons/IconTablerSettings.vue'
 import IconTablerSearch from './components/icons/IconTablerSearch.vue'
 import IconTablerTerminal from './components/icons/IconTablerTerminal.vue'
 import IconTablerFolder from './components/icons/IconTablerFolder.vue'
-import IconTablerFilePencil from './components/icons/IconTablerFilePencil.vue'
 import IconTablerTrash from './components/icons/IconTablerTrash.vue'
 import IconTablerX from './components/icons/IconTablerX.vue'
 import { normalizePathForUi } from './pathUtils'
@@ -108,6 +112,10 @@ const messages = workspace.field('messages')
 const pendingResponseAnnotations = workspace.field('pendingResponseAnnotations')
 const activeView = shallowRef<View>('chat')
 const activeThreadId = workspace.activeId
+const documentWorkspace = useDocumentWorkspace(activeThreadId, showNotice)
+function quoteDocument(selection: DocumentSelection) {
+  composerRef.value?.appendTextToDraft(`\n[文件选区：${selection.path}\n文档 ID：${selection.documentId}\n版本：${selection.version}${selection.nodeId ? `\n对象：${selection.nodeId}` : ''}]\n${selection.text}\n`)
+}
 const isSidebarCollapsed = shallowRef(false)
 const isBusy = workspace.field('isBusy')
 const { active: isWindowDropActive, onDragOver: onWindowDragOver, onDragLeave: onWindowDragLeave, onDrop: onWindowDrop, setupNativeDrop } = useWorkspaceDrop({
@@ -439,7 +447,7 @@ function restoreSessionMessages(record: SessionRecord): UiMessage[] {
       id: newId(item.role),
       role: item.role === 'assistant' ? 'assistant' : 'user',
       text: metadata?.text ?? item.content,
-      attachments: metadata?.attachments?.map<UiAttachment>((attachment) => ({ id: attachment.id || newId('attachment'), name: attachment.name, size: attachment.size, mimeType: attachment.mime_type, kind: attachment.kind === 'image' ? 'image' : attachment.kind === 'text' ? 'text' : 'file', status: attachment.error ? 'error' : 'ready', error: attachment.error, dataBase64: attachment.data_base64, textContent: attachment.text_content })) ?? (item.images ?? []).map((image, imageIndex) => restoredImageAttachment(image.image_url, index, imageIndex)),
+      attachments: metadata?.attachments?.map<UiAttachment>((attachment) => ({ id: attachment.id || newId('attachment'), name: attachment.name, size: attachment.size, mimeType: attachment.mime_type, kind: attachment.kind === 'image' ? 'image' : attachment.kind === 'text' ? 'text' : 'file', status: attachment.error ? 'error' : 'ready', error: attachment.error, dataBase64: attachment.data_base64, textContent: attachment.text_content, sourcePath: attachment.source_path })) ?? (item.images ?? []).map((image, imageIndex) => restoredImageAttachment(image.image_url, index, imageIndex)),
       references: metadata?.references,
       skills: metadata?.skills?.map((path) => ({ path, name: snapshot.value.skills.find((skill) => skill.path === path || `builtin://${skill.id}` === path)?.name || path })),
       collaborationMode: metadata?.collaboration_mode,
@@ -1136,9 +1144,10 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     if (isVisibleActivityEvent(item)) {
       stopThinkingTimer()
       const failed = ['warning', 'error', 'blocked'].includes(item.status)
+      const waiting = item.status === 'waiting'
       liveOverlay.value = {
-        activityLabel: item.status === 'running' ? item.title : failed ? '工具返回了诊断' : '工具已完成，正在继续…',
-        activityDetails: [],
+        activityLabel: item.status === 'running' ? item.title : waiting ? '等待批准后继续…' : failed ? '工具返回了诊断' : '工具已完成，正在继续…',
+        activityDetails: waiting && item.detail ? [item.detail] : [],
         reasoningText: '',
         errorText: failed ? item.detail || '' : '',
         status: failed ? 'error' : 'working',
@@ -1699,7 +1708,11 @@ async function onApprove(change: PendingChange): Promise<void> {
     const result = await approveChange(change.id, (event) => upsertLiveAgentEvent(event, turnIndex, thread))
     thread.pendingChanges = thread.pendingChanges.filter((pending) => pending.id !== change.id)
     if (thread === workspace.active.value) snapshot.value = { ...snapshot.value, pending_changes: thread.pendingChanges }
-    if (change.tool_name !== 'exec_command') thread.messages = [...thread.messages, eventToMessage({ id: change.id, kind: 'tool', title: result.is_error ? '动作返回诊断' : '已完成审批动作', detail: JSON.stringify(result.content, null, 2), status: result.is_error ? 'error' : 'done', tool: change.tool_name }, turnIndex, thread.project.project_directory || thread.project.path || '')]
+    // 正在运行的原轮次会在审批结果回传后自己产生工具完成事件；
+    // 只有遗留的、已经结束的审批动作才需要由界面补一条本地记录，避免重复显示。
+    if (!thread.isBusy && !thread.liveOverlay && change.tool_name !== 'exec_command') {
+      thread.messages = [...thread.messages, eventToMessage({ id: change.id, kind: 'tool', title: result.is_error ? '动作返回诊断' : '已完成审批动作', detail: JSON.stringify(result.content, null, 2), status: result.is_error ? 'error' : 'done', tool: change.tool_name }, turnIndex, thread.project.project_directory || thread.project.path || '')]
+    }
     showNotice(result.is_error ? '动作返回诊断，请查看工具详情。' : '审批动作已执行。')
     await refresh()
   } catch (error) {
@@ -1893,8 +1906,21 @@ function onKeyDown(event: KeyboardEvent): void {
 }
 
 let syncTimer: number | undefined
+let stopImageEvents: (() => void) | undefined
+function onImageProgress(progress: ImageGenerationProgress) {
+  const thread = workspace.threads.value.find(item => item.id === progress.scope)
+  if (!thread) return
+  const id = `image-${progress.id}`
+  const existing = thread.messages.find(item => item.id === id)
+  const source = thread.messages.find(item => item.id === thread.streamingAssistantId)
+  const message: UiMessage = { id, role: 'assistant', text: progress.status === 'completed' ? '图片已生成' : '正在生成图片', messageType: 'image-generation', imageGeneration: progress, turnIndex: existing?.turnIndex ?? source?.turnIndex, turnId: existing?.turnId ?? source?.turnId }
+  const next = insertTimelineActivity(thread.messages, message, thread.streamingAssistantId, thread.textStream.currentText(thread.streamingRequestId), () => newId('assistant-live'))
+  thread.messages = next.messages; thread.streamingAssistantId = next.assistantId
+  if (next.split) thread.textStream.reset(thread.streamingRequestId)
+}
 
 onMounted(async () => {
+  try { stopImageEvents = await listen<ImageGenerationProgress>('image-generation', ({ payload }) => onImageProgress(payload)) } catch { /* 浏览器预览没有桌面事件通道。 */ }
   try {
     // 开屏动画与初始化并行；异常同样交还工作台，保留设置和重试入口。
     await refresh()
@@ -1928,6 +1954,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  stopImageEvents?.()
   window.removeEventListener('keydown', onKeyDown)
   if (syncTimer) window.clearInterval(syncTimer)
 })
@@ -1941,11 +1968,18 @@ onUnmounted(() => {
     :is-initializing="showAppSplash"
     :is-sidebar-collapsed="isSidebarCollapsed"
     :is-settings-mode="showSettings"
+    :preview-visible="documentWorkspace.visible.value && activeView === 'chat'"
     @close-sidebar="isSidebarCollapsed = true"
     @dragover="onWindowDragOver"
     @dragleave="onWindowDragLeave"
     @drop="onWindowDrop"
   >
+    <template #preview>
+      <DocumentWorkspace :tabs="documentWorkspace.tabs.value" :active="documentWorkspace.active.value" :loading="documentWorkspace.loading.value"
+        :busy="documentWorkspace.busy.value" @apply="documentWorkspace.apply" @save="documentWorkspace.save" @history="documentWorkspace.history"
+        @select="documentWorkspace.select" @close="documentWorkspace.close" @hide="documentWorkspace.hide"
+        @refresh="documentWorkspace.open({ path: $event })" @quote="quoteDocument" @notice="showNotice" />
+    </template>
     <template #sidebar>
       <WorkspaceSidebar :projects="sidebarProjects" :threads="sidebarThreads" :active-id="activeThreadId" :theme="theme" :workbench-mode="workbenchMode" @update:theme="theme = $event" @update:workbench-mode="onWorkbenchModeChange"
         @new-thread="startNewThread" @select-thread="selectSidebarThread"
@@ -2017,6 +2051,8 @@ onUnmounted(() => {
             @retry-message="onRetryMessage"
             @fork-message="onForkMessage"
             @notice="showNotice"
+            @preview-file="documentWorkspace.open({ path: $event })"
+            @preview-attachment="documentWorkspace.open({ attachment: $event })"
             @add-response-annotation="addResponseAnnotation"
             @update-response-annotation="updateResponseAnnotation"
             @remove-response-annotation="removeResponseAnnotation"
@@ -2057,6 +2093,7 @@ onUnmounted(() => {
     <template #composer>
       <ComposerQueue v-if="!showSettings && activeView === 'chat' && queuedSubmits.length" :items="queuedSubmits" :paused="queuePaused" :busy="isBusy" @cancel="cancelQueuedSubmit" @resume="resumeSubmitQueue" @edit="withdrawQueuedSubmit" @steer="steerQueuedSubmit" @reorder="reorderQueuedSubmit" />
       <ThreadComposer
+        @preview-attachment="documentWorkspace.open({ attachment: $event })"
         v-if="!showSettings && activeView === 'chat'"
         ref="composerRef"
         class="plc-composer"

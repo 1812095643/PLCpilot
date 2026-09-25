@@ -161,7 +161,7 @@
               </div>
 
               <div v-if="message.attachments && message.attachments.length > 0" class="message-file-attachments" aria-label="消息附件">
-                <article v-for="attachment in message.attachments" :key="`${message.id}:${attachment.id}`" class="message-file-attachment" :data-status="attachment.status">
+                <article v-for="attachment in message.attachments" :key="`${message.id}:${attachment.id}`" class="message-file-attachment" :data-status="attachment.status" role="button" tabindex="0" :aria-label="`预览 ${attachment.name}`" @click="emit('preview-attachment', attachment)" @keydown.enter.prevent="emit('preview-attachment', attachment)" @keydown.space.prevent="emit('preview-attachment', attachment)">
                   <img
                     v-if="attachment.kind === 'image' && attachmentPreviewUrl(attachment)"
                     class="message-file-attachment-preview"
@@ -178,7 +178,8 @@
 
               <article v-if="message.text.length > 0" class="message-card" :data-role="message.role">
                 <span v-if="message.messageType === 'queued' || message.messageType === 'queued-steering'" class="message-queued-badge">{{ message.messageType === 'queued-steering' ? '调整中' : '排队中' }}</span>
-                <div v-if="message.messageType === 'worked'" class="turn-activity-summary">
+                <ImageGenerationCard v-if="message.imageGeneration" :progress="message.imageGeneration" @open="emit('preview-file', $event)" />
+                <div v-else-if="message.messageType === 'worked'" class="turn-activity-summary">
                   <ConversationTurnSummary
                     :label="message.activityDurationMs ? formatWorkedDuration(message.activityDurationMs) : '操作过程'"
                     :expanded="history.expanded.value.has(message.id)"
@@ -842,6 +843,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiMentionReference, UiPlanStep, UiResponseTextAnnotation } from '../../types/codex'
+import ImageGenerationCard from './ImageGenerationCard.vue'
 import type { WorkbenchMode } from '../../api/plcBridge'
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { openLocalPath, openWebUrl } from '../../api/plcBridge'
@@ -1368,6 +1370,8 @@ const emit = defineEmits<{
   'update-response-annotation': [annotation: UiResponseTextAnnotation]
   'remove-response-annotation': [id: string]
   'suggest-prompt': [prompt: string]
+  'preview-file': [path: string]
+  'preview-attachment': [attachment: UiAttachment]
 }>()
 
 export type ThreadConversationExposed = {
@@ -3125,7 +3129,7 @@ async function onConversationLinkClick(event: MouseEvent): Promise<void> {
       await openWebUrl(link.href)
       return
     }
-    await openLocalPath(link.path, 'default')
+    emit('preview-file', link.path)
   } catch (error) {
     emit('notice', String(error))
   }

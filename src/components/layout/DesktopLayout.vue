@@ -16,11 +16,11 @@
     </Teleport>
 
     <template v-if="!isMobile && !isSettingsMode">
-      <aside v-if="!isSidebarCollapsed" class="desktop-sidebar">
+      <aside v-if="!effectiveSidebarCollapsed" class="desktop-sidebar">
         <slot name="sidebar" />
       </aside>
       <button
-        v-if="!isSidebarCollapsed"
+        v-if="!effectiveSidebarCollapsed"
         class="desktop-resize-handle"
         type="button"
         aria-label="调整侧边栏宽度"
@@ -28,6 +28,7 @@
       />
     </template>
 
+    <div ref="panels" class="desktop-panels" :class="{ 'has-preview': previewVisible && !isSettingsMode }" :style="{ '--preview-fraction': `${previewFraction * 100}%` }">
     <section class="desktop-main">
       <header v-if="$slots.header && !isSettingsMode" class="desktop-header">
         <slot name="header" />
@@ -41,6 +42,11 @@
         <slot name="composer" />
       </footer>
     </section>
+    <template v-if="previewVisible && !isSettingsMode">
+      <div class="document-resizer" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" :aria-valuenow="Math.round(previewFraction * 100)" :aria-valuemin="30" :aria-valuemax="72" tabindex="0" @pointerdown="startPreviewResize" @keydown.left.prevent="adjustPreview(.03)" @keydown.right.prevent="adjustPreview(-.03)" />
+      <aside class="desktop-preview"><slot name="preview" /></aside>
+    </template>
+    </div>
     </div>
 
     <slot name="overlays" />
@@ -48,7 +54,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, onMounted, onBeforeUnmount, shallowRef, useTemplateRef } from 'vue'
 import { useMobile } from '../../composables/useMobile'
 
 const props = withDefaults(
@@ -56,6 +62,7 @@ const props = withDefaults(
     isSidebarCollapsed?: boolean
     isSettingsMode?: boolean
     isInitializing?: boolean
+    previewVisible?: boolean
   }>(),
   {
     isSidebarCollapsed: false,
@@ -78,6 +85,7 @@ defineSlots<{
   content?: () => unknown
   composer?: () => unknown
   overlays?: () => unknown
+  preview?: () => unknown
 }>()
 
 const { isMobile } = useMobile()
@@ -100,9 +108,40 @@ function loadSidebarWidth(): number {
 }
 
 const sidebarWidth = ref(loadSidebarWidth())
+const viewportWidth = shallowRef(window.innerWidth)
+const effectiveSidebarCollapsed = computed(() => props.isSidebarCollapsed || (props.previewVisible && viewportWidth.value < 1250))
+const panels = useTemplateRef<HTMLElement>('panels')
+const savedFraction = Number(localStorage.getItem('plc-pilot.document-width'))
+const previewFraction = shallowRef(savedFraction >= .3 && savedFraction <= .72 ? savedFraction : .57)
+let stopPreviewResize: (() => void) | undefined
+function adjustPreview(value: number) {
+  const width = panels.value?.clientWidth ?? viewportWidth.value
+  const minimum = Math.max(.3, Math.min(.5, 340 / width))
+  const maximum = Math.max(minimum, Math.min(.72, 1 - 300 / width))
+  previewFraction.value = Math.max(minimum, Math.min(maximum, previewFraction.value + value))
+  localStorage.setItem('plc-pilot.document-width', String(previewFraction.value))
+}
+function startPreviewResize(event: PointerEvent) {
+  if (event.button !== 0) return
+  event.preventDefault()
+  stopPreviewResize?.()
+  const host = event.currentTarget as HTMLElement
+  host.setPointerCapture(event.pointerId)
+  const move = (current: PointerEvent) => {
+    const rect = panels.value?.getBoundingClientRect()
+    if (rect) adjustPreview((rect.right - current.clientX) / rect.width - previewFraction.value)
+  }
+  const stop = () => { host.removeEventListener('pointermove', move); host.removeEventListener('pointerup', stop); host.removeEventListener('pointercancel', stop); host.removeEventListener('lostpointercapture', stop); document.body.style.userSelect = ''; stopPreviewResize = undefined }
+  host.addEventListener('pointermove', move); host.addEventListener('pointerup', stop); host.addEventListener('pointercancel', stop); host.addEventListener('lostpointercapture', stop)
+  document.body.style.userSelect = 'none'
+  stopPreviewResize = stop
+}
+function updateViewport() { viewportWidth.value = window.innerWidth; adjustPreview(0) }
+onMounted(() => window.addEventListener('resize', updateViewport))
+onBeforeUnmount(() => { window.removeEventListener('resize', updateViewport); stopPreviewResize?.() })
 
 const layoutStyle = computed(() => {
-  if (isMobile.value || props.isSidebarCollapsed || props.isSettingsMode) {
+  if (isMobile.value || effectiveSidebarCollapsed.value || props.isSettingsMode) {
     return {
       '--sidebar-width': '0px',
       '--layout-columns': 'minmax(0, 1fr)',
@@ -180,6 +219,14 @@ function onResizeHandleMouseDown(event: MouseEvent): void {
 .desktop-main {
   @apply relative z-[100] flex min-h-0 min-w-0 flex-col bg-white overflow-y-hidden overflow-x-visible;
 }
+
+.desktop-panels { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; min-height: 0; overflow: hidden; }
+.desktop-panels.has-preview { grid-template-columns: minmax(0, 1fr) 1px minmax(0, var(--preview-fraction)); }
+.desktop-preview { min-width: 0; min-height: 0; overflow: hidden; position: relative; z-index: 110; animation: preview-arrive 220ms cubic-bezier(.2,.75,.2,1); }
+.document-resizer { position: relative; z-index: 330; background: #dedede; cursor: col-resize; touch-action: none; }.document-resizer::before { content: ''; position: absolute; inset: 0 -4px; }.document-resizer:hover,.document-resizer:focus-visible { background: #e59b43; outline: none; }
+:global(.dark .document-resizer) { background: #353535; }
+@keyframes preview-arrive { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: translateX(0); } }
+@media(prefers-reduced-motion:reduce) { .desktop-preview { animation: none; } }
 
 .desktop-header {
   @apply min-w-0 shrink-0;

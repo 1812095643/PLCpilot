@@ -19,7 +19,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{watch, Mutex},
     time::{sleep, timeout},
 };
 use uuid::Uuid;
@@ -47,6 +47,9 @@ const RPC_REQUEST_TIMEOUT_SECONDS: u64 = 300;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 mod attachments;
+mod document_core;
+mod image_generation;
+mod officecli;
 mod agent_runtime;
 mod agent_control;
 mod settings;
@@ -69,6 +72,7 @@ const DOCUMENTS_SKILL: &str = include_str!("../../skills/documents/SKILL.md");
 const SPREADSHEETS_SKILL: &str = include_str!("../../skills/spreadsheets/SKILL.md");
 const PRESENTATIONS_SKILL: &str = include_str!("../../skills/presentations/SKILL.md");
 const PDF_SKILL: &str = include_str!("../../skills/pdf/SKILL.md");
+const IMAGEGEN_SKILL: &str = include_str!("../../skills/imagegen/SKILL.md");
 const PATENT_DISCLOSURE_SKILL: &str = include_str!("../../skills/patent-disclosure-skill/SKILL.md");
 const PATENT_DISCLOSURE_SKILL_ID: &str = "patent-disclosure-skill";
 
@@ -907,7 +911,11 @@ pub struct AppState {
     /// 隔离 Agent 状态与桌面控制面共享的审批注册表。审批动作在工具暂停时
     /// 立即登记，用户无需等待当前轮次结束即可批准或拒绝。
     pub approvals: Arc<Mutex<HashMap<String, PendingChange>>>,
+    /// 原 Agent 工具调用的继续通道。审批完成后将真实工具结果送回原调用，
+    /// 让模型继续当前轮次，不再把批准动作变成一次独立的新消息。
+    pub approval_waiters: Arc<Mutex<HashMap<String, watch::Sender<Option<ToolCallResult>>>>>,
     pub isolated: bool,
+    pub document_scope: String,
 }
 
 impl AppState {
@@ -920,7 +928,9 @@ impl AppState {
             running: Arc::new(Mutex::new(HashMap::new())),
             mcp_catalog: Arc::new(Mutex::new(McpCatalogCache::default())),
             approvals: Arc::new(Mutex::new(HashMap::new())),
+            approval_waiters: Arc::new(Mutex::new(HashMap::new())),
             isolated: false,
+            document_scope: "desktop-default".into(),
         }
     }
 }
@@ -2330,6 +2340,9 @@ fn builtin_tools() -> Vec<McpTool> {
     ];
     tools.extend(generic_tools::tools());
     tools.extend(office_tools::tools());
+    tools.extend(document_core::agent::tools());
+    tools.push(image_generation::tool());
+    tools.push(officecli::tool());
     tools
 }
 
@@ -2431,6 +2444,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::Builder::new().app_name("PLC Pilot").build())
         .setup(|app| {
+            document_core::initialize(app.handle().clone());
             diagnostics::info("app.ready", json!({}));
             let state = app.state::<AppState>().inner().clone();
             let handle = app.handle().clone();
@@ -2443,6 +2457,21 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            document_core::document_open,
+            document_core::document_close,
+            document_core::document_pick,
+            document_core::document_get,
+            document_core::document_apply,
+            document_core::document_save,
+            document_core::document_history,
+            document_core::document_render_page,
+            document_core::document_cache_attachment,
+            image_generation::get_image_settings,
+            image_generation::save_image_settings,
+            officecli::get_officecli_status,
+            officecli::set_office_engine_mode,
+            officecli::install_officecli,
+            officecli::uninstall_officecli,
             workbench::set_workbench_mode,
             workbench::inspect_workbench,
             model_providers::get_model_providers,
@@ -4306,7 +4335,7 @@ async fn call_mcp_tool_inner(
         return Err(AppError::Mcp("当前模式不使用该工业工具，请先切换相应工作模式。".into()));
     }
     let full_access = settings::read_preferences()?.access_mode == "full";
-    if !full_access && (is_forbidden_tool(&request.tool_name) || is_mutating_tool(&request.tool_name)) {
+    if !full_access && (is_forbidden_tool(&request.tool_name) || (request.tool_name == "officecli" && officecli::request_requires_approval(&request.arguments)) || (request.tool_name != "officecli" && is_mutating_tool(&request.tool_name))) {
         return Err(AppError::Mcp(
             "这个工具可能改变工程或在线设备，必须先通过审批卡片批准，或由用户启用完全访问模式。".to_string(),
         ));
@@ -4329,25 +4358,42 @@ async fn approve_change(
     let pending = pending_change_for_state(&state, &id)
         .await
         .ok_or_else(|| AppError::Mcp("待审批动作不存在。".into()))?;
-    if pending.summary.tool_name == "exec_command" {
-        if pending.summary.status != "pending" { return Err(AppError::Mcp("这个动作已经处理过了。".into())); }
-        if let Some(item) = state.inner.lock().await.pending.get_mut(&id) { item.summary.status = "applying".into(); }
-        if let Some(item) = state.approvals.lock().await.get_mut(&id) { item.summary.status = "applying".into(); }
+    let live_waiter = has_approval_waiter(&state, &id).await;
+    let result = if pending.summary.tool_name == "exec_command" {
+        let pending = claim_pending_change(&state, &id).await?;
+        let mut execution_pending = pending.clone();
+        if live_waiter {
+            // 原 Agent 仍在写入同一个 JSONL 会话；工具结果会由 Pi 自己
+            // 写入，审批辅助宿主不能再次追加 approval-result。
+            if let Some(arguments) = execution_pending.arguments.as_object_mut() {
+                arguments.insert("record_in_session".into(), Value::Bool(false));
+            }
+        }
         let stream = AgentStreamSender::new(format!("approval-{id}"), app.clone());
         stream.send_event(AgentEvent::new(&id, "command", "正在运行 PowerShell 命令", Some(pending.arguments["command"].as_str().unwrap_or_default().into()), "running", Some("powershell".into())));
-        let result = generic_tools::host_action(&app, &state, &pending, "execute_approved", Some(&stream), None).await;
+        let result = generic_tools::host_action(&app, &state, &execution_pending, "execute_approved", Some(&stream), None).await;
         let (status, detail) = match &result { Ok(result) => (if result.is_error { "error" } else { "done" }, serde_json::to_string_pretty(&result.content).unwrap_or_default()), Err(error) => ("error", error.to_string()) };
         stream.send_event(AgentEvent::new(&id, "command", &format!("已运行命令 {}", pending.arguments["command"].as_str().unwrap_or_default()), Some(detail), status, Some("powershell".into())));
-        let final_status = if status == "done" { "approved" } else { "error" };
-        if let Some(item) = state.inner.lock().await.pending.get_mut(&id) { item.summary.status = final_status.into(); }
-        if let Some(item) = state.approvals.lock().await.get_mut(&id) { item.summary.status = final_status.into(); }
-        return result;
+        set_pending_change_status(&state, &id, if status == "done" { "approved" } else { "error" }).await;
+        result
+    } else {
+        approve_change_inner(id.clone(), &state).await
+    };
+    if live_waiter {
+        let continuation = match &result {
+            Ok(result) => result.clone(),
+            Err(error) => approval_error_result(error),
+        };
+        resolve_approval(&state, &id, continuation).await;
     }
-    let result = approve_change_inner(id, &state).await?;
-    if pending.arguments.get("session_file").and_then(Value::as_str).is_some() {
-        generic_tools::host_action(&app, &state, &pending, "record_approval", None, Some(&result.content)).await?;
+    if !live_waiter {
+        if let Ok(result) = &result {
+            if pending.arguments.get("session_file").and_then(Value::as_str).is_some() {
+                generic_tools::host_action(&app, &state, &pending, "record_approval", None, Some(&result.content)).await?;
+            }
+        }
     }
-    Ok(result)
+    result
 }
 
 /// 审批动作可能由隔离 Agent 状态创建，但按钮始终运行在桌面根状态。
@@ -4360,6 +4406,123 @@ async fn pending_change_for_state(state: &AppState, id: &str) -> Option<PendingC
     state.inner.lock().await.pending.get(id).cloned()
 }
 
+async fn has_approval_waiter(state: &AppState, id: &str) -> bool {
+    state.approval_waiters.lock().await.contains_key(id)
+}
+
+async fn register_approval_channel(state: &AppState, id: &str) {
+    let (sender, _receiver) = watch::channel::<Option<ToolCallResult>>(None);
+    state.approval_waiters.lock().await.insert(id.to_string(), sender);
+}
+
+async fn resolve_approval(state: &AppState, id: &str, result: ToolCallResult) {
+    if let Some(sender) = state.approval_waiters.lock().await.get(id).cloned() {
+        // send_replace 会在 receiver 尚未建立时也保留最新结果，避免用户
+        // 极快点击批准导致原工具调用永远收不到继续信号。
+        sender.send_replace(Some(result));
+    }
+}
+
+fn approval_error_result(error: &AppError) -> ToolCallResult {
+    ToolCallResult {
+        content: vec![json!({"type":"text", "text": error.to_string()})],
+        is_error: true,
+    }
+}
+
+async fn claim_pending_change(state: &AppState, id: &str) -> Result<PendingChange, AppError> {
+    if let Some(pending) = {
+        let mut shared = state.approvals.lock().await;
+        if let Some(item) = shared.get_mut(id) {
+            if item.summary.status != "pending" {
+                return Err(AppError::Mcp("这个动作已经处理过了".into()));
+            }
+            item.summary.status = "applying".into();
+            Some(item.clone())
+        } else {
+            None
+        }
+    } {
+        if let Some(item) = state.inner.lock().await.pending.get_mut(id) {
+            item.summary.status = "applying".into();
+        }
+        return Ok(pending);
+    }
+    let mut local = state.inner.lock().await;
+    let item = local.pending.get_mut(id).ok_or_else(|| AppError::Mcp("待审批动作不存在或已经处理".into()))?;
+    if item.summary.status != "pending" {
+        return Err(AppError::Mcp("这个动作已经处理过了".into()));
+    }
+    item.summary.status = "applying".into();
+    Ok(item.clone())
+}
+
+async fn reject_pending_change(state: &AppState, id: &str) -> Result<(), AppError> {
+    let shared = {
+        let mut approvals = state.approvals.lock().await;
+        if let Some(item) = approvals.get_mut(id) {
+            if item.summary.status != "pending" {
+                return Err(AppError::Mcp("这个动作已经处理过了".into()));
+            }
+            item.summary.status = "rejected".into();
+            true
+        } else {
+            false
+        }
+    };
+    if shared {
+        if let Some(local) = state.inner.lock().await.pending.get_mut(id) {
+            local.summary.status = "rejected".into();
+        }
+        return Ok(());
+    }
+    let mut local = state.inner.lock().await;
+    let item = local.pending.get_mut(id).ok_or_else(|| AppError::Mcp("待审批动作不存在或已经处理".into()))?;
+    if item.summary.status != "pending" {
+        return Err(AppError::Mcp("这个动作已经处理过了".into()));
+    }
+    item.summary.status = "rejected".into();
+    Ok(())
+}
+
+async fn wait_for_approval(state: &AppState, id: &str) -> Result<ToolCallResult, AppError> {
+    let sender = state.approval_waiters.lock().await.get(id).cloned().ok_or_else(|| AppError::Internal("审批通道不存在，当前工具未继续执行。".into()))?;
+    let mut receiver = sender.subscribe();
+    let initial = receiver.borrow().clone();
+    if let Some(result) = initial {
+        state.approval_waiters.lock().await.remove(id);
+        return Ok(result);
+    }
+    tokio::select! {
+        result = receiver.changed() => {
+            state.approval_waiters.lock().await.remove(id);
+            result.map_err(|_| AppError::Internal("审批通道已关闭，当前工具未继续执行。".into()))?;
+            let value = receiver.borrow().clone();
+            value.ok_or_else(|| AppError::Internal("审批通道返回了空结果。".into()))
+        },
+        _ = wait_for_abort(state) => {
+            state.approval_waiters.lock().await.remove(id);
+            set_pending_change_status(state, id, "cancelled").await;
+            Err(AppError::Internal("当前 Agent 任务已中止".into()))
+        }
+    }
+}
+
+async fn cancel_approval_waiters(state: &AppState) {
+    let ids = state.approval_waiters.lock().await.keys().cloned().collect::<Vec<_>>();
+    for id in ids {
+        set_pending_change_status(state, &id, "cancelled").await;
+        resolve_approval(
+            state,
+            &id,
+            ToolCallResult {
+                content: vec![json!({"type":"text", "text":"当前 Agent 任务已结束，这个待审批动作未执行。"})],
+                is_error: true,
+            },
+        ).await;
+    }
+}
+
 async fn set_pending_change_status(state: &AppState, id: &str, status: &str) {
     if let Some(item) = state.inner.lock().await.pending.get_mut(id) {
         item.summary.status = status.to_string();
@@ -4370,14 +4533,7 @@ async fn set_pending_change_status(state: &AppState, id: &str, status: &str) {
 }
 
 async fn approve_change_inner(id: String, state: &AppState) -> Result<ToolCallResult, AppError> {
-    let pending = pending_change_for_state(state, &id)
-        .await
-        .ok_or_else(|| AppError::Mcp("待审批动作不存在或已经处理".to_string()))?;
-    if pending.summary.status != "pending" {
-        return Err(AppError::Mcp("这个动作已经处理过了".to_string()));
-    }
-    // 先占用动作，防止用户快速双击或多个窗口同时批准造成重复写入。
-    set_pending_change_status(state, &id, "applying").await;
+    let pending = claim_pending_change(state, &id).await?;
     let result = if pending.summary.server_id == BUILTIN_SERVER_ID {
         apply_builtin_pending_change(state, &pending).await
     } else {
@@ -4400,18 +4556,23 @@ async fn approve_change_inner(id: String, state: &AppState) -> Result<ToolCallRe
 
 #[tauri::command]
 async fn reject_change(id: String, state: State<'_, AppState>) -> Result<(), AppError> {
-    reject_change_inner(id, &state).await
+    let live_waiter = has_approval_waiter(&state, &id).await;
+    let result = reject_change_inner(id.clone(), &state).await;
+    if live_waiter && result.is_ok() {
+        resolve_approval(
+            &state,
+            &id,
+            ToolCallResult {
+                content: vec![json!({"type":"text", "text":"用户拒绝了这次需要审批的工具调用，未执行任何修改。"})],
+                is_error: true,
+            },
+        ).await;
+    }
+    result
 }
 
 async fn reject_change_inner(id: String, state: &AppState) -> Result<(), AppError> {
-    let pending = pending_change_for_state(state, &id)
-        .await
-        .ok_or_else(|| AppError::Mcp("待审批动作不存在或已经处理".to_string()))?;
-    if pending.summary.status != "pending" {
-        return Err(AppError::Mcp("这个动作已经处理过了".to_string()));
-    }
-    set_pending_change_status(state, &id, "rejected").await;
-    Ok(())
+    reject_pending_change(state, &id).await
 }
 
 #[tauri::command]
@@ -4657,6 +4818,9 @@ async fn run_agent(
         // 首字节返回前就让界面知道本轮已经进入执行态，不会一直停留在“连接中”。
         stream.send_status("thinking", Some("start"));
         let result = run_agent_inner(app, request, &state, Some(stream.clone())).await;
+        if result.is_err() {
+            cancel_approval_waiters(&state).await;
+        }
         // 每个运行实例独立持有会话与 cwd；审批产物按全局唯一 ID 汇回桌面，
         // 不能用整个 RuntimeState 覆盖当前窗口，否则切换项目会串会话和模型。
         let runtime = state.inner.lock().await;
@@ -5675,7 +5839,32 @@ async fn run_pi_host(
                             return Err(AppError::Internal("当前 Agent 任务已中止".to_string()));
                         }
                     };
-                    write_host_json(&mut *stdin.lock().await, response).await?;
+                    if response.get("type").and_then(Value::as_str) == Some("approval_wait") {
+                        let approval_id = response
+                            .get("approval_id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| AppError::Internal("审批等待缺少动作标识。".into()))?
+                            .to_string();
+                        // 先通知 Node 暂停该工具调用的超时计时，再等待用户操作。
+                        // 这条消息不是 tool_result，Pi 不会结束当前 turn。
+                        write_host_json(
+                            &mut *stdin.lock().await,
+                            json!({"type":"approval_wait", "request_id": response.get("request_id")}),
+                        ).await?;
+                        let result = wait_for_approval(state, &approval_id).await?;
+                        write_host_json(
+                            &mut *stdin.lock().await,
+                            json!({
+                                "type": "tool_result",
+                                "request_id": response.get("request_id"),
+                                "content": result.content,
+                                "is_error": result.is_error,
+                                "decision": if result.is_error { "error" } else { "executed" },
+                            }),
+                        ).await?;
+                    } else {
+                        write_host_json(&mut *stdin.lock().await, response).await?;
+                    }
                 }
                 Some("result") => {
                     let final_text = value
@@ -5790,7 +5979,7 @@ async fn process_pi_tool_request(
     }
     let qualified = qualify_tool(&server_id, &tool_name);
     let full_access = settings::read_preferences()?.access_mode == "full";
-    let needs_approval = is_mutating_tool(&tool_name) || is_forbidden_tool(&tool_name);
+    let needs_approval = if tool_name == "officecli" { officecli::request_requires_approval(&arguments) } else { is_mutating_tool(&tool_name) || is_forbidden_tool(&tool_name) }; let needs_approval = needs_approval || (plan_mode && tool_name == "image_gen");
     if plan_mode && needs_approval {
         push_event_with_stream(
             app,
@@ -5817,8 +6006,8 @@ async fn process_pi_tool_request(
         }));
     }
     if server_id == BUILTIN_SERVER_ID {
-        if matches!(tool_name.as_str(), "propose_edit" | "propose_write" | "apply_patch" | "exec_command" | "write_office_document") {
-            let proposal = if tool_name == "propose_edit" { propose_builtin_edit(state, arguments).await } else if tool_name == "write_office_document" { office_tools::propose(state, arguments).await } else { generic_tools::propose(state, &tool_name, arguments).await };
+        if matches!(tool_name.as_str(), "propose_edit" | "propose_write" | "apply_patch" | "exec_command" | "write_office_document" | "document_edit" | "officecli") && needs_approval {
+            let proposal = if tool_name == "document_edit" { document_core::agent::propose(state, arguments).await } else if tool_name == "officecli" { officecli::propose(state, arguments).await } else if tool_name == "propose_edit" { propose_builtin_edit(state, arguments).await } else if tool_name == "write_office_document" { office_tools::propose(state, arguments).await } else { generic_tools::propose(state, &tool_name, arguments).await };
             match proposal {
                 Ok(summary) => {
                     if full_access {
@@ -5835,6 +6024,7 @@ async fn process_pi_tool_request(
                         push_event_with_stream(app, events, AgentEvent::new(&call_id, "safety", if is_error { "完全访问执行未完成" } else { "完全访问已执行" }, Some(summary.title.clone()), if is_error { "error" } else { "done" }, Some(qualified.clone())), stream);
                         return Ok(json!({"type":"tool_result","request_id":request_id,"content":content,"is_error":is_error,"decision":if is_error {"error"} else {"executed"}}));
                     }
+                    register_approval_channel(state, &summary.id).await;
                     let mut approval_event = AgentEvent::new(
                         &call_id,
                         "approval",
@@ -5851,12 +6041,9 @@ async fn process_pi_tool_request(
                         stream,
                     );
                     return Ok(json!({
-                        "type": "tool_result",
+                        "type": "approval_wait",
                         "request_id": request_id,
-                        "content": [{"type":"text","text":"已生成待审批工程 Diff。请等待用户确认后再写入。"}],
-                        "is_error": true,
-                        "decision": "pending",
-                        "details": {"change_id": summary.id, "diff": summary.diff},
+                        "approval_id": summary.id,
                     }));
                 }
                 Err(error) => {
@@ -5896,7 +6083,8 @@ async fn process_pi_tool_request(
             ),
             stream,
         );
-        match call_builtin_tool(state, &tool_name, arguments).await {
+        let result = if tool_name == "image_gen" { image_generation::generate(app, state, arguments).await } else if tool_name == "officecli" { officecli::call(serde_json::from_value(arguments).map_err(|e|AppError::Configuration(format!("OfficeCLI 参数不匹配：{e}")))?).await } else { call_builtin_tool(state, &tool_name, arguments).await };
+        match result {
             Ok(result) => {
                 let result_text = serde_json::to_string(&result.content)
                     .map_err(|error| AppError::Internal(error.to_string()))?;
@@ -5977,6 +6165,7 @@ async fn process_pi_tool_request(
         let pending = PendingChange { summary: summary.clone(), arguments };
         state.inner.lock().await.pending.insert(id.clone(), pending.clone());
         state.approvals.lock().await.insert(id, pending);
+        register_approval_channel(state, &summary.id).await;
         let mut approval_event = AgentEvent::new(
             &call_id,
             "approval",
@@ -5993,12 +6182,9 @@ async fn process_pi_tool_request(
             stream,
         );
         return Ok(json!({
-            "type": "tool_result",
+            "type": "approval_wait",
             "request_id": request_id,
-            "content": [{"type":"text","text":"已生成待审批动作。请等待用户确认后再执行。"}],
-            "is_error": true,
-            "decision": "pending",
-            "details": {"change_id": summary.id},
+            "approval_id": summary.id,
         }));
     }
 
@@ -7304,6 +7490,7 @@ async fn call_builtin_tool(
     tool_name: &str,
     arguments: Value,
 ) -> Result<ToolCallResult, AppError> {
+    if tool_name == "document_inspect" { return document_core::agent::inspect(state, arguments).await; }
     let project = state.inner.lock().await.project.clone();
     if !project.exists {
         return Err(AppError::Project(
@@ -7464,6 +7651,8 @@ async fn apply_builtin_pending_change(
     state: &AppState,
     pending: &PendingChange,
 ) -> Result<ToolCallResult, AppError> {
+    if pending.summary.tool_name == "document_edit" { return document_core::agent::apply_approved(pending).await; }
+    if pending.summary.tool_name == "officecli" { return officecli::apply_pending(pending).await; }
     if pending.summary.tool_name == "write_office_document" { return office_tools::apply(pending); }
     if matches!(pending.summary.tool_name.as_str(), "apply_patch" | "propose_write") { return generic_tools::apply_patch(pending); }
     if pending.summary.tool_name == "exec_command" { return Err(AppError::Configuration("请在桌面审批卡片中确认命令。".into())); }
@@ -8596,6 +8785,7 @@ fn builtin_skill_content(id: &str) -> Option<&'static str> {
         "spreadsheets" => Some(SPREADSHEETS_SKILL),
         "presentations" => Some(PRESENTATIONS_SKILL),
         "pdf" => Some(PDF_SKILL),
+        "imagegen" => Some(IMAGEGEN_SKILL),
         PATENT_DISCLOSURE_SKILL_ID => Some(PATENT_DISCLOSURE_SKILL),
         _ => None,
     }
@@ -9476,6 +9666,7 @@ fn builtin_skills() -> Vec<SkillSummary> {
             path: None,
             content_available: true,
         },
+        SkillSummary { id: "imagegen".into(), name: "ImageGen · 生图与改图".into(), description: "生成照片、插画、文档及 PPT 配图，复用已配置的生图服务商。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
         SkillSummary { id: "documents".into(), name: "Documents · Word".into(), description: "读取和生成 Word 文档，使用原生 Office 工具。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
         SkillSummary { id: "spreadsheets".into(), name: "Spreadsheets · Excel".into(), description: "读取和生成 Excel 工作簿，支持多工作表行列数据。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
         SkillSummary { id: "presentations".into(), name: "Presentations · PowerPoint".into(), description: "读取和生成 PowerPoint 幻灯片标题与正文。".into(), enabled: true, scope: "builtin".into(), path: None, content_available: true },
@@ -9684,6 +9875,7 @@ fn skill_catalog_entries(project: &ProjectContext) -> Vec<SkillCatalogEntry> {
         SkillCatalogEntry { id: "spreadsheets".into(), name: "Spreadsheets · Excel".into(), description: "读取和生成 Excel 工作簿，支持多工作表行列数据。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("spreadsheets"), free: true },
         SkillCatalogEntry { id: "presentations".into(), name: "Presentations · PowerPoint".into(), description: "读取和生成 PowerPoint 幻灯片标题与正文。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("presentations"), free: true },
         SkillCatalogEntry { id: "pdf".into(), name: "PDF".into(), description: "读取 PDF 文本层并生成基础文本 PDF。".into(), source: "PLC Pilot 内置".into(), license: "MIT".into(), installed: installed.contains("pdf"), free: true },
+        SkillCatalogEntry { id: "imagegen".into(), name: "ImageGen · 生图与改图".into(), description: "生成照片、插画、PPT 背景和文档配图，复用已配置的生图服务商。".into(), source: "PLC Pilot 内置".into(), license: "Apache-2.0".into(), installed: installed.contains("imagegen"), free: true },
         SkillCatalogEntry { id: PATENT_DISCLOSURE_SKILL_ID.into(), name: "中国专利交底与申请".into(), description: "从研发材料挖掘专利点，编写中国专利交底书和申请文件，并支持检索、解读、政策简报与审查答复。".into(), source: "github.com/handsomestWei/patent-disclosure-skill".into(), license: "MIT".into(), installed: installed.contains(PATENT_DISCLOSURE_SKILL_ID), free: true },
     ]
 }
@@ -9957,6 +10149,7 @@ fn is_mutating_tool(name: &str) -> bool {
     if name == "exec_command" { return true; }
     let name = name.to_lowercase();
     let local_name = name.rsplit("__").next().unwrap_or(&name);
+    if local_name == "officecli" { return true; }
     if local_name.starts_with("stone_") {
         // 原关键词判断漏掉 AddFile、Build、Connect、ClearBinaries、许可激活等
         // 实际会修改工程/目标的 STone 调用。直接复用 MCP 目录生成的完整策略；

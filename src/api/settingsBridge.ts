@@ -25,6 +25,11 @@ export const listMcpCatalog = () => invoke<McpCatalogEntry[]>('list_mcp_catalog'
 export const installMcpCatalog = (id: string) => invoke<McpSummary[]>('install_mcp_catalog', { id })
 export const listSkillCatalog = () => invoke<SkillCatalogEntry[]>('list_skill_catalog')
 export const installSkillCatalog = (id: string) => invoke<void>('install_skill_catalog', { id })
+export type OfficeCliStatus = { mode: 'native' | 'auto' | 'officecli'; installed: boolean; version?: string; path?: string; size: number; latest_version: string }
+export const getOfficeCliStatus = () => invoke<OfficeCliStatus>('get_officecli_status')
+export const setOfficeEngineMode = (mode: OfficeCliStatus['mode']) => invoke<OfficeCliStatus>('set_office_engine_mode', { mode })
+export const installOfficeCli = () => invoke<OfficeCliStatus>('install_officecli')
+export const uninstallOfficeCli = () => invoke<OfficeCliStatus>('uninstall_officecli')
 
 export type McpCatalogEntry = { id: string; name: string; description: string; source: string; license: string; package: string; command: string; args: string[]; transport: string; requires_workspace: boolean; requires_credentials: boolean; requires_codesys: boolean; notes: string }
 export type SkillCatalogEntry = { id: string; name: string; description: string; source: string; license: string; installed: boolean; free: boolean }

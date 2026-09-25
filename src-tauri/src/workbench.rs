@@ -14,7 +14,7 @@ pub fn tool_allowed(mode: WorkbenchMode, server: &str, name: &str) -> bool {
 pub fn skill_allowed(mode: WorkbenchMode, skill: &SkillSummary) -> bool {
     mode == WorkbenchMode::Codesys
         || builtin_skill_content(&skill.id).is_none()
-        || matches!(skill.id.as_str(), PATENT_DISCLOSURE_SKILL_ID | "documents" | "spreadsheets" | "presentations" | "pdf")
+        || matches!(skill.id.as_str(), PATENT_DISCLOSURE_SKILL_ID | "documents" | "spreadsheets" | "presentations" | "pdf" | "imagegen")
 }
 
 /// 非 CODESYS 模式只扫描用户工作目录，不带入 Bridge 的编辑器、快照和版本信息。

@@ -67,12 +67,12 @@ export function completedResponses(messages: UiMessage[], running: boolean): Map
     if (running && key === activeKey) continue
     const final = [...turn.items].reverse().find((message) => message.role === 'assistant'
       && (message.text.trim() || message.plan?.steps.length)
-      && !['agentMessage.commentary', 'assistant.partial', 'localCommand'].includes(message.messageType || '')
+      && !message.imageGeneration && !['agentMessage.commentary', 'assistant.partial', 'localCommand'].includes(message.messageType || '')
       && !(message.messageType || '').endsWith('.live'))
     if (!final || turn.items.some((message) => message.messageType === 'localCommand')) continue
     const worked = turn.items.find((message) => message.messageType === 'worked')
     const processIds = new Set(turn.items.filter((message) => message.id !== final.id && message.role !== 'user'
-      && message.messageType !== 'worked' && !duplicates.has(message.id)
+      && message.messageType !== 'worked' && !message.imageGeneration && !duplicates.has(message.id)
       && message.commandExecution?.status !== 'waiting'
       && (message.text.trim() || message.commandExecution || message.fileChanges?.length || message.plan?.steps.length))
       .map((message) => message.id))

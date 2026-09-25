@@ -9,6 +9,7 @@ defineProps<{
 
 const emit = defineEmits<{
   remove: [id: string]
+  preview: [attachment: ComposerAttachment]
 }>()
 
 function formatSize(size: number): string {
@@ -33,7 +34,7 @@ function statusLabel(attachment: ComposerAttachment): string {
       <div v-else class="composer-attachment-icon" aria-hidden="true">
         <IconTablerFilePencil />
       </div>
-      <div class="composer-attachment-copy">
+      <div class="composer-attachment-copy" role="button" tabindex="0" :aria-label="`预览 ${attachment.name}`" @click="emit('preview', attachment)" @keydown.enter.prevent="emit('preview', attachment)" @keydown.space.prevent="emit('preview', attachment)">
         <strong :title="attachment.name">{{ attachment.name }}</strong>
         <span>{{ formatSize(attachment.size) }} · {{ statusLabel(attachment) }}</span>
       </div>

@@ -383,6 +383,7 @@ export type LocalAttachmentInput = {
   data_base64?: string
   image_url?: string
   text_content?: string
+  source_path?: string
   error?: string
 }
 
@@ -654,6 +655,7 @@ export const runAgent = async (
           ? `data:${attachment.mimeType};base64,${attachment.dataBase64}`
           : undefined,
         text_content: attachment.textContent,
+        source_path: attachment.sourcePath,
         error: attachment.error,
       })) || [],
       references: options.references?.map((reference) => ({
@@ -702,7 +704,7 @@ export const steerAgent = (requestId: string, threadId: string, inputId: string,
   requestId,
   input: {
     request_id: inputId, client_thread_id: threadId, message: payload.text,
-    attachments: payload.attachments.map((item) => ({ id: item.id, name: item.name, mime_type: item.mimeType, size: item.size, kind: item.kind, data_base64: item.dataBase64, text_content: item.textContent, error: item.error })),
+    attachments: payload.attachments.map((item) => ({ id: item.id, name: item.name, mime_type: item.mimeType, size: item.size, kind: item.kind, data_base64: item.dataBase64, text_content: item.textContent, source_path: item.sourcePath, error: item.error })),
     references: payload.references,
     response_annotations: payload.responseAnnotations.map((item) => ({ id: item.id, source_message_id: item.sourceMessageId, source_message_key: item.sourceMessageKey, source_turn_index: item.sourceTurnIndex, selected_text: item.selectedText, body: item.body, created_at: item.createdAt })),
     skills: payload.skills.map((item) => item.path),

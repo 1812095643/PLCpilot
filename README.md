@@ -20,13 +20,13 @@ PLC Pilot 作为独立桌面应用运行。交互结构参考 Codex 等本地 Ag
 
 ## 下载
 
-当前稳定版本：[v0.1.15](https://github.com/1812095643/PLCpilot/releases/tag/v0.1.15)
+当前稳定版本：[v0.1.16](https://github.com/1812095643/PLCpilot/releases/tag/v0.1.16)
 
-- [Windows 安装版（EXE）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/PLC-Pilot-0.1.15-x64-setup.exe)：适合大多数用户。
-- [Windows 安装版（MSI）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/PLC-Pilot-0.1.15-x64.msi)：适合组织化部署。
-- [Windows 便携版（ZIP）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/PLC-Pilot-Portable-0.1.15-win-x64.zip)：完整解压后运行，不写入系统 PATH。
-- [CAREL STone MCP 独立包](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/PLC-Pilot-STone-MCP-0.1.1.zip)：需要单独运行 STone MCP 时使用。
-- [更新清单](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/latest.json) · [SHA-256 校验](https://github.com/1812095643/PLCpilot/releases/download/v0.1.15/SHA256SUMS.txt)
+- [Windows 安装版（EXE）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.16/PLC-Pilot-0.1.16-x64-setup.exe)：适合大多数用户。
+- [Windows 安装版（MSI）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.16/PLC-Pilot-0.1.16-x64.msi)：适合组织化部署。
+- [Windows 便携版（ZIP）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.16/PLC-Pilot-Portable-0.1.16-win-x64.zip)：完整解压后运行，不写入系统 PATH。
+- [CAREL STone MCP 独立包](https://github.com/1812095643/PLCpilot/releases/download/v0.1.16/PLC-Pilot-STone-MCP-0.1.1.zip)：需要单独运行 STone MCP 时使用。
+- [更新清单](https://github.com/1812095643/PLCpilot/releases/download/v0.1.16/latest.json) · [SHA-256 校验](https://github.com/1812095643/PLCpilot/releases/download/v0.1.16/SHA256SUMS.txt)
 
 安装版和便携版都包含精简的 Node.js、npm/npx、Python 和 pip 运行时。首次安装第三方 MCP 或 Python 依赖时仍需要网络。CODESYS、CAREL STone 和 WebView2 属于外部软件；便携版需要系统已有 WebView2，安装版可联网补装。
 

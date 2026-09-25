@@ -37,6 +37,8 @@ pub struct AttachmentInput {
     pub image_url: Option<String>,
     #[serde(default, alias = "textContent")]
     pub text_content: Option<String>,
+    #[serde(default, alias = "sourcePath")]
+    pub source_path: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -126,6 +128,7 @@ pub fn read_local_file(path: &Path) -> Result<AttachmentInput, String> {
         size,
         kind: kind.to_string(),
         data_base64: Some(BASE64_STANDARD.encode(bytes)),
+        source_path: Some(path.to_string_lossy().into_owned()),
         ..AttachmentInput::default()
     };
     let mut items = vec![attachment.clone()];

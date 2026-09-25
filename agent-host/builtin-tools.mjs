@@ -77,7 +77,9 @@ export async function executeApprovedCommand(argumentsValue, onUpdate) {
   });
   try {
     const result = await commandPromise;
-    recordApproval(argumentsValue, result.content);
+    if (argumentsValue.record_in_session !== false) {
+      recordApproval(argumentsValue, result.content);
+    }
     return result;
   } finally { commandController = null; commandPromise = null; }
 }

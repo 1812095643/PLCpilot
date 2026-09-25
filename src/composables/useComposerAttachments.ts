@@ -1,5 +1,6 @@
 import { computed, onBeforeUnmount, readonly, shallowRef } from 'vue'
 import type { UiAttachment, UiAttachmentKind, UiAttachmentStatus } from '../types/codex'
+import { invoke, isTauri } from '@tauri-apps/api/core'
 
 export type ComposerAttachmentSource = 'file' | 'clipboard' | 'drop' | 'draft'
 
@@ -11,7 +12,7 @@ export type ComposerAttachment = UiAttachment & {
   source?: ComposerAttachmentSource
 }
 
-export type ComposerAttachmentDraft = Pick<ComposerAttachment, 'id' | 'name' | 'mimeType' | 'size' | 'kind' | 'status' | 'error' | 'dataBase64' | 'textContent'>
+export type ComposerAttachmentDraft = Pick<ComposerAttachment, 'id' | 'name' | 'mimeType' | 'size' | 'kind' | 'status' | 'error' | 'dataBase64' | 'textContent' | 'sourcePath'>
 
 export type PreparedComposerAttachment = {
   id?: string
@@ -22,6 +23,7 @@ export type PreparedComposerAttachment = {
   data_base64?: string
   image_url?: string
   text_content?: string
+  source_path?: string
   error?: string
 }
 
@@ -148,14 +150,17 @@ export function useComposerAttachments(options: AttachmentOptions = {}) {
           return
         }
         const textContent = await readTextFile(file)
-        updateAttachment(id, { status: 'ready', textContent, mimeType })
+        const sourcePath = isTauri() ? await invoke<string>('document_cache_attachment', { attachment: { name: file.name, textContent } }) : undefined
+        updateAttachment(id, { status: 'ready', textContent, mimeType, sourcePath })
         return
       }
       const dataBase64 = await readFileAsBase64(file)
+      const sourcePath = isTauri() ? await invoke<string>('document_cache_attachment', { attachment: { name: file.name, dataBase64 } }) : undefined
       updateAttachment(id, {
         status: 'ready',
         mimeType,
         dataBase64,
+        sourcePath,
         previewUrl: kind === 'image' ? URL.createObjectURL(file) : undefined,
       })
     } catch (error) {
@@ -255,6 +260,7 @@ export function useComposerAttachments(options: AttachmentOptions = {}) {
       error: input.error,
       dataBase64,
       textContent: input.text_content,
+      sourcePath: input.source_path,
       previewUrl: kind === 'image' && (input.image_url || dataBase64)
         ? input.image_url || `data:${mimeType};base64,${dataBase64}`
         : undefined,

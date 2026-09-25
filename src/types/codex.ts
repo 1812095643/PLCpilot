@@ -60,6 +60,7 @@ export type UiAttachment = {
   dataBase64?: string
   textContent?: string
   previewUrl?: string
+  sourcePath?: string
 }
 
 export type UiMentionKind = 'file' | 'directory' | 'active_file' | 'session'
@@ -112,6 +113,7 @@ export type UiRetryPayload = {
 }
 
 export type UiMessage = {
+  imageGeneration?: import('../api/imageGeneration').ImageGenerationProgress
   id: string
   role: 'user' | 'assistant' | 'system'
   text: string

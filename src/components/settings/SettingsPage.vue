@@ -8,13 +8,14 @@ import SkillsSettingsPanel from './SkillsSettingsPanel.vue'
 import ToolsSettingsPanel from './ToolsSettingsPanel.vue'
 import ContextSettingsPanel from './ContextSettingsPanel.vue'
 import GeneralSettingsPanel from './GeneralSettingsPanel.vue'
+import OfficeCliSettingsPanel from './OfficeCliSettingsPanel.vue'
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import './settings.css'
 
 const props = defineProps<{ snapshot: Snapshot; theme: ThemePreference; accessMode: 'approval' | 'full'; accessModeDisabled: boolean }>()
 const emit = defineEmits<{ close: []; refresh: []; 'update:theme': [theme: ThemePreference]; 'update:access-mode': [mode: 'approval' | 'full']; notice: [message: string] }>()
 const category = defineModel<string>('category', { default: 'models' })
-const categories = [{ id: 'general', name: '通用' }, { id: 'models', name: '模型' }, { id: 'mcp', name: 'MCP 服务' }, { id: 'skills', name: 'Skills' }, { id: 'tools', name: '工具目录' }, { id: 'context', name: '记忆与上下文' }, { id: 'appearance', name: '外观' }, { id: 'retry', name: '重试' }, { id: 'storage', name: '工作区与存储' }, { id: 'updates', name: '软件更新' }]
+const categories = [{ id: 'general', name: '通用' }, { id: 'models', name: '模型' }, { id: 'documents', name: '文档引擎' }, { id: 'mcp', name: 'MCP 服务' }, { id: 'skills', name: 'Skills' }, { id: 'tools', name: '工具目录' }, { id: 'context', name: '记忆与上下文' }, { id: 'appearance', name: '外观' }, { id: 'retry', name: '重试' }, { id: 'storage', name: '工作区与存储' }, { id: 'updates', name: '软件更新' }]
 const retry = reactive({ max_retries: 5, base_delay_ms: 1000, max_delay_ms: 60000 })
 const saving = shallowRef(false)
 async function saveRetry(): Promise<void> { saving.value = true; try { await saveRetrySettings({ ...retry }); emit('notice', '重试设置已保存。') } catch (error) { emit('notice', String(error)) } finally { saving.value = false } }
@@ -33,6 +34,7 @@ onMounted(async () => { try { const preferences = await getPreferences(); Object
     <div class="settings-content">
       <GeneralSettingsPanel v-if="category === 'general'" @notice="emit('notice', $event)" />
       <div v-show="category === 'models'"><slot name="models" /></div>
+      <OfficeCliSettingsPanel v-if="category === 'documents'" @notice="emit('notice', $event)" />
       <div v-if="category === 'updates'"><slot name="updates" /></div>
       <McpSettingsPanel v-if="category === 'mcp'" :summaries="props.snapshot.mcp_servers" @refresh="emit('refresh')" />
       <SkillsSettingsPanel v-if="category === 'skills'" :skills="props.snapshot.skills" @refresh="emit('refresh')" />

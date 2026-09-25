@@ -34,9 +34,11 @@ pub async fn isolate_run(root: &AppState, request: &AgentRequest) -> Result<AppS
     // 目录扫描由显式工程操作和后台同步完成，避免每条消息都重复遍历大型工作区。
     let mut state = AppState::new(runtime);
     state.isolated = true;
+    state.document_scope = request.client_thread_id.clone().unwrap_or_else(|| "desktop-default".into());
     state.running = root.running.clone();
     state.mcp_catalog = root.mcp_catalog.clone();
     state.approvals = root.approvals.clone();
+    state.approval_waiters = root.approval_waiters.clone();
     let request_id = request.request_id.clone().unwrap_or_default();
     let thread_id = request.client_thread_id.clone().unwrap_or_else(|| "desktop-default".into());
     let mut running = root.running.lock().await;

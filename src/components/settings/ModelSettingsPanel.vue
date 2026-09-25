@@ -5,6 +5,7 @@ import { useModelProviders } from '../../composables/useModelProviders'
 import ProviderConnectionForm from './ProviderConnectionForm.vue'
 import ModelProfileEditor from './ModelProfileEditor.vue'
 import ModelDiscoveryList from './ModelDiscoveryList.vue'
+import ImageModelSettings from './ImageModelSettings.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
 
@@ -61,6 +62,7 @@ onMounted(async () => { await manager.reload(props.models.find(model => model.id
           </div>
           <ModelProfileEditor v-if="editingModelId !== null" :key="`${form.id}:${editingModelId}`" :model="editingModel" :provider="selectedProvider" :busy="blocked" @save="emit('save', $event)" @close="editingModelId = null" />
         </section>
+        <ImageModelSettings v-if="selectedProvider" :key="selectedProvider.id" :provider-id="selectedProvider.id" />
       </div>
     </div>
     <p class="provider-context">当前会话 {{ currentContextTokens.toLocaleString() }} tokens<span v-if="remainingContextPercent !== null"> · 剩余 {{ Math.round(remainingContextPercent) }}%</span> · 自动压缩{{ autoCompactionEnabled ? '已开启' : '已关闭' }}</p>
