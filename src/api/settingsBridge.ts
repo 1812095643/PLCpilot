@@ -12,6 +12,7 @@ export const setStartupEnabled = (enabled: boolean) => invoke<boolean>('set_star
 export const saveThemePreference = (theme: ThemePreference) => invoke<void>('save_theme_preference', { theme })
 export const saveRetrySettings = (retry: RetrySettings) => invoke<void>('save_retry_settings', { retry })
 export const saveContextSettings = (contextManagement: ContextSettings) => invoke<void>('save_context_settings', { context_management: contextManagement })
+export const resetMemoryData = () => invoke<void>('reset_memory_data')
 export const saveAccessMode = (accessMode: Preferences['access_mode']) => invoke<void>('save_access_mode', { access_mode: accessMode })
 export const getMcpConfigs = () => invoke<McpConfig[]>('get_mcp_configs')
 export const saveMcpServer = (server: McpConfig) => invoke<McpSummary[]>('save_mcp_server', { server })

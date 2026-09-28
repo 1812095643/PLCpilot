@@ -42,6 +42,7 @@ import { normalizePathForUi } from './pathUtils'
 import {
   approveChange,
   abortAgent,
+  archiveSession,
   steerAgent,
   compactContext,
   compileProject,
@@ -69,6 +70,7 @@ import {
   startNewSession,
   startTemporaryWorkspace,
   syncCurrentProject,
+  unarchiveSession,
   type AgentEvent,
   type AgentStreamPayload,
   type AgentResult,
@@ -228,6 +230,7 @@ const fallbackCommands: CommandSummary[] = [
   { command: '/sessions', label: '会话历史', detail: '列出本机保存的工作会话', category: 'session', supports_args: false },
   { command: '/memory', label: '项目记忆', detail: '管理当前项目的长期记忆', category: 'project', supports_args: false },
   { command: '/knowledge', label: '项目知识库', detail: '管理当前项目的知识条目', category: 'project', supports_args: false },
+  { command: '/memories', label: '记忆设置', detail: '控制使用、生成和清空项目记忆', category: 'session', supports_args: false },
   { command: '/projects', label: '项目列表', detail: '查看最近打开的工程目录', category: 'project', supports_args: false },
   { command: '/rename', label: '重命名会话', detail: '给当前会话设置一个易识别的名称', category: 'session', supports_args: true },
   { command: '/clear', label: '清空会话', detail: '移除当前对话记录，不改工程文件', category: 'session', supports_args: false },
@@ -320,7 +323,7 @@ const sidebarThreads = computed<SidebarThread[]>(() => {
     cwd: thread.project.project_directory || thread.project.path || '', busy: thread.isBusy,
     status: thread.liveOverlay?.activityLabel || (thread.queuePaused ? '队列已暂停' : ''), persisted: Boolean(thread.session.session_file),
   }))
-  const sessions = snapshot.value.sessions.filter((record) => !workspace.threads.value.some((thread) => thread.session.session_id === record.session_id)).map((record) => ({
+  const sessions = snapshot.value.sessions.filter((record) => !record.archived && !workspace.threads.value.some((thread) => thread.session.session_id === record.session_id)).map((record) => ({
     id: record.session_id, name: record.name || record.messages.find((message) => message.role === 'user')?.content.slice(0, 36) || '未命名会话',
     cwd: record.cwd || '', busy: false, status: '', persisted: true,
   }))
@@ -986,6 +989,7 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   if (text === '/tools') { activeView.value = 'skills'; showSettings.value = false; return }
   if (text === '/sessions') { activeView.value = 'sessions'; showSettings.value = false; return }
   if (text === '/memory' || text === '/knowledge') { activeView.value = 'knowledge'; showSettings.value = false; return }
+  if (text === '/memories') { settingsCategory.value = 'context'; showSettings.value = true; return }
   if (/^\/(approve|reject)\s+/u.test(text)) {
     const [action, id] = text.split(/\s+/u)
     const change = thread.pendingChanges.find((change) => change.id === id)
@@ -1531,14 +1535,22 @@ async function onRemoveProject(project: WorkspaceProject): Promise<void> {
 
 async function onResumeSession(record: SessionRecord): Promise<void> {
   try {
-    const existing = workspace.threads.value.find((thread) => thread.session.session_id === record.session_id)
-    if (existing) { workspace.select(existing); activeView.value = 'chat'; return }
-    if (record.cwd && !isSamePath(currentCwd.value, record.cwd)) {
-      const project = await selectProject(record.cwd)
-      snapshot.value = { ...snapshot.value, project }
-      projectPathDraft.value = project.path || record.cwd
+    let targetRecord = record
+    if (targetRecord.archived) {
+      const sessions = await unarchiveSession(targetRecord.path)
+      applySessionArchiveRecords(sessions)
+      const restored = sessions.find((item) => item.session_id === targetRecord.session_id && !item.archived)
+      if (!restored) throw new Error('恢复后的会话暂未找到，请刷新会话中心。')
+      targetRecord = restored
     }
-    const resumed = await resumeSession(record.path)
+    const existing = workspace.threads.value.find((thread) => thread.session.session_id === targetRecord.session_id)
+    if (existing) { workspace.select(existing); activeView.value = 'chat'; return }
+    if (targetRecord.cwd && !isSamePath(currentCwd.value, targetRecord.cwd)) {
+      const project = await selectProject(targetRecord.cwd)
+      snapshot.value = { ...snapshot.value, project }
+      projectPathDraft.value = project.path || targetRecord.cwd
+    }
+    const resumed = await resumeSession(targetRecord.path)
     workspace.create(snapshot.value.project, resumed.session_id)
     workspace.active.value.session = { ...workspace.active.value.session, session_id: resumed.session_id, session_file: resumed.path, name: resumed.name, message_count: resumed.message_count }
     restoreSessionModelSelection(resumed)
@@ -1731,6 +1743,43 @@ async function onDeleteSession(record: SessionRecord): Promise<void> {
     snapshot.value = { ...snapshot.value, sessions }
     for (const thread of workspace.threads.value.filter((thread) => thread.session.session_id === record.session_id)) workspace.remove(thread)
     showNotice('本地会话记录已清理。')
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+function applySessionArchiveRecords(sessions: SessionRecord[]): void {
+  snapshot.value = { ...snapshot.value, sessions }
+  for (const thread of [...workspace.threads.value]) {
+    const record = sessions.find((item) => item.session_id === thread.session.session_id)
+    if (!record) continue
+    if (record.archived) workspace.remove(thread)
+    else if (thread.session.session_file !== record.path) thread.session = { ...thread.session, session_file: record.path }
+  }
+}
+
+async function onArchiveSession(record: SessionRecord): Promise<void> {
+  if (record.archived) return
+  const thread = workspace.threads.value.find((item) => item.session.session_id === record.session_id)
+  if (thread && (thread.isBusy || thread.queuedSubmits.length)) {
+    showNotice('请先完成当前任务或处理排队消息，再归档这个会话。')
+    return
+  }
+  try {
+    applySessionArchiveRecords(await archiveSession(record.path))
+    await workspace.persist()
+    showNotice('会话已归档，可在会话中心切换到“已归档”查看。')
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function onUnarchiveSession(record: SessionRecord): Promise<void> {
+  if (!record.archived) return
+  try {
+    applySessionArchiveRecords(await unarchiveSession(record.path))
+    await workspace.persist()
+    showNotice('会话已恢复到最近会话。')
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
   }
@@ -2109,7 +2158,7 @@ onUnmounted(() => {
 
         </div>
 
-        <GlobalSessionCenter v-else-if="activeView === 'sessions'" :sessions="snapshot.sessions" :projects="snapshot.projects" :active-id="activeSessionId" @open="onResumeSession" @rename="onRenameSession" @delete="onDeleteSession" @notice="showNotice" />
+        <GlobalSessionCenter v-else-if="activeView === 'sessions'" :sessions="snapshot.sessions" :projects="snapshot.projects" :active-id="activeSessionId" @open="onResumeSession" @rename="onRenameSession" @delete="onDeleteSession" @archive="onArchiveSession" @unarchive="onUnarchiveSession" @notice="showNotice" />
 
         <ProjectContextCenter v-else-if="activeView === 'knowledge'" :project-path="currentProject.path || currentCwd" :project-name="currentProject.name || '当前项目'" @notice="showNotice" />
 

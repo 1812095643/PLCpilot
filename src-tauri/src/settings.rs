@@ -72,6 +72,37 @@ pub async fn save_context_settings(context_management: ContextPreferences) -> Re
     persist(&preferences)
 }
 
+/// 只清理已登记的事实和摘要；知识库与记忆共用目录，不能递归删除整个 memories。
+#[tauri::command]
+pub async fn reset_memory_data(state: State<'_, AppState>) -> Result<(), AppError> {
+    let running = state.running.lock().await;
+    let _legacy_run = state.agent_runs.try_lock()
+        .map_err(|_| AppError::Configuration("请先完成或停止运行中的任务，再清理记忆。".into()))?;
+    if !running.is_empty() {
+        return Err(AppError::Configuration("请先完成或停止运行中的任务，再清理记忆。".into()));
+    }
+    clear_project_memories(&app_data_root().join("memories").join("projects"))
+}
+
+fn clear_project_memories(root: &Path) -> Result<(), AppError> {
+    if !root.exists() { return Ok(()); }
+    if fs::symlink_metadata(root).map_err(|error| AppError::Configuration(error.to_string()))?.file_type().is_symlink() {
+        return Err(AppError::Configuration("记忆目录是外部链接，请先检查存储路径。".into()));
+    }
+    for entry in WalkDir::new(root).max_depth(2).follow_links(false) {
+        let entry = entry.map_err(|error| AppError::Configuration(format!("读取记忆目录未完成：{error}")))?;
+        if entry.depth() != 2 || !entry.file_type().is_file() { continue; }
+        let path = entry.path();
+        let Some(id) = path.file_stem().and_then(|value| value.to_str()) else { continue; };
+        if path.extension().and_then(|value| value.to_str()) != Some("json")
+            || !(id.starts_with("fact-") || id.starts_with("summary-")) || !valid_project_context_id(id) { continue; }
+        let bytes = fs::read(path).map_err(|error| AppError::Configuration(format!("读取记忆条目未完成：{error}")))?;
+        if serde_json::from_slice::<Value>(&bytes).ok().is_some_and(|record| record["kind"] == "knowledge") { continue; }
+        fs::remove_file(path).map_err(|error| AppError::Configuration(format!("清理记忆条目未完成：{error}")))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn save_theme_preference(theme: String) -> Result<(), AppError> {
     if !matches!(theme.as_str(), "light" | "dark" | "system") { return Err(AppError::Configuration("请选择明亮、暗黑或跟随系统。".into())); }
@@ -240,6 +271,27 @@ pub async fn probe_mcp_server(id: String, state: State<'_, AppState>) -> Result<
 #[cfg(test)]
 mod context_tests {
     use super::*;
+
+    #[test]
+    fn memory_reset_keeps_knowledge_and_unrelated_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("projects");
+        let project = root.join("project-hash");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("fact-old.json"), r#"{"kind":"fact"}"#).unwrap();
+        fs::write(project.join("summary-old.json"), r#"{"kind":"summary"}"#).unwrap();
+        fs::write(project.join("knowledge-manual.json"), r#"{"kind":"knowledge"}"#).unwrap();
+        fs::write(project.join("fact-imported.json"), r#"{"kind":"knowledge"}"#).unwrap();
+        fs::write(project.join("session.jsonl"), "history").unwrap();
+        fs::write(project.join("unknown.json"), "{}").unwrap();
+        clear_project_memories(&root).unwrap();
+        assert!(!project.join("fact-old.json").exists());
+        assert!(!project.join("summary-old.json").exists());
+        for name in ["knowledge-manual.json", "fact-imported.json", "session.jsonl", "unknown.json"] {
+            assert!(project.join(name).is_file(), "{name}");
+        }
+        clear_project_memories(&root).unwrap();
+    }
 
     #[test]
     fn old_preferences_enable_context_without_changing_existing_options() {

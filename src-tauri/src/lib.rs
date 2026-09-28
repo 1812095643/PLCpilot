@@ -453,6 +453,10 @@ pub struct SessionRecord {
     pub name: Option<String>,
     pub path: String,
     pub modified_at: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub notes: Vec<SessionNoteRecord>,
     pub message_count: usize,
     #[serde(default)]
     pub cwd: Option<String>,
@@ -469,6 +473,13 @@ pub struct SessionRecord {
     pub turn_durations: Vec<Value>,
     #[serde(default)]
     pub activities: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionNoteRecord {
+    pub path: String,
+    pub content: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1789,7 +1800,7 @@ async fn dispatch_local_rpc(
     let value = match command.as_str() {
         // 兼容 Codex app-server 的最小线程/轮次方法集合；底层仍复用本地
         // JSONL 会话和同一套审批、上下文校验，不启动额外的 WebSocket 服务。
-        "thread/list" => json!({"threads": list_session_records()}),
+        "thread/list" => json!({"threads": list_all_session_records()}),
         "thread/start" => {
             let mut guard = state.inner.lock().await;
             guard.session = AgentSessionSummary::default();
@@ -1804,7 +1815,7 @@ async fn dispatch_local_rpc(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let requested_path = args.get("path").and_then(Value::as_str).unwrap_or_default();
-            let record = list_session_records().into_iter().find(|item| {
+            let record = list_all_session_records().into_iter().find(|item| {
                 (!requested_id.is_empty() && item.session_id == requested_id)
                     || (!requested_path.is_empty()
                         && session_paths_equal(&item.path, requested_path))
@@ -1814,6 +1825,8 @@ async fn dispatch_local_rpc(
                 name: None,
                 path: String::new(),
                 modified_at: None,
+                archived: false,
+                notes: Vec::new(),
                 message_count: 0,
                 cwd: None,
                 model_profile_id: None,
@@ -2046,7 +2059,7 @@ async fn dispatch_local_rpc(
             let skill = get_skill_content_inner(id, &state).await?;
             Value::String(skill)
         }
-        "list_sessions" => serde_json::to_value(list_session_records())
+        "list_sessions" => serde_json::to_value(list_all_session_records())
             .map_err(|error| AppError::Internal(format!("编码会话列表未完成：{error}")))?,
         "resume_session" => {
             let path = required_string_arg(&args, "path")?;
@@ -2117,7 +2130,17 @@ async fn dispatch_local_rpc(
             serde_json::to_value(rename_session_inner(name, path, &state).await?)
                 .map_err(|error| AppError::Internal(format!("编码会话名称未完成：{error}")))?
         }
-        "delete_session" | "thread/archive" => {
+        "archive_session" | "thread/archive" => {
+            let path = required_string_arg(&args, "path")?;
+            serde_json::to_value(archive_session_inner(path, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码会话归档结果未完成：{error}")))?
+        }
+        "unarchive_session" | "thread/unarchive" => {
+            let path = required_string_arg(&args, "path")?;
+            serde_json::to_value(unarchive_session_inner(path, &state).await?)
+                .map_err(|error| AppError::Internal(format!("编码会话恢复结果未完成：{error}")))?
+        }
+        "delete_session" => {
             let path = required_string_arg(&args, "path")?;
             serde_json::to_value(delete_session_inner(path, &state).await?)
                 .map_err(|error| AppError::Internal(format!("编码会话列表未完成：{error}")))?
@@ -2535,6 +2558,7 @@ pub fn run() {
             settings::save_theme_preference,
             settings::save_retry_settings,
             settings::save_context_settings,
+            settings::reset_memory_data,
             settings::save_access_mode,
             settings::save_skill,
             settings::toggle_skill,
@@ -2555,6 +2579,8 @@ pub fn run() {
             compile_project,
             get_skill_content,
             list_sessions,
+            archive_session,
+            unarchive_session,
             search_sessions,
             list_project_context,
             save_project_context,
@@ -3295,6 +3321,8 @@ async fn rename_session_inner(
             name: guard.session.name.clone(),
             path: guard.session.session_file.clone().unwrap_or_default(),
             modified_at: None,
+            archived: false,
+            notes: Vec::new(),
             message_count: guard.session.message_count,
             cwd: None,
             model_profile_id: None,
@@ -3364,7 +3392,7 @@ async fn delete_session_inner(
     {
         guard.session = AgentSessionSummary::default();
     }
-    Ok(list_session_records())
+    Ok(list_all_session_records())
 }
 
 #[tauri::command]
@@ -3373,6 +3401,83 @@ async fn delete_session(
     state: State<'_, AppState>,
 ) -> Result<Vec<SessionRecord>, AppError> {
     delete_session_inner(path, &state).await
+}
+
+fn session_path_under(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+        && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+}
+
+fn move_session_between_roots(path: &str, source_root: &Path, target_root: &Path) -> Result<PathBuf, AppError> {
+    let source = dunce::canonicalize(path.trim())
+        .map_err(|error| AppError::Configuration(format!("会话路径不可访问：{error}")))?;
+    let source_root = dunce::canonicalize(source_root).unwrap_or_else(|_| source_root.to_path_buf());
+    if !source.is_file() || !session_path_under(&source, &source_root) {
+        return Err(AppError::Configuration("只能整理 PLC Pilot 自己保存的 JSONL 会话。".into()));
+    }
+    fs::create_dir_all(target_root).map_err(|error| AppError::Configuration(format!("创建会话目录未完成：{error}")))?;
+    let file_name = source.file_name().ok_or_else(|| AppError::Configuration("会话文件名不可用。".into()))?;
+    let mut target = target_root.join(file_name);
+    if target.exists() {
+        target = target_root.join(format!("{}-{}.jsonl", Uuid::new_v4(), file_name.to_string_lossy().trim_end_matches(".jsonl")));
+    }
+    fs::rename(&source, &target).map_err(|error| AppError::Configuration(format!("移动会话未完成：{error}")))?;
+    Ok(target)
+}
+
+async fn archive_session_inner(path: String, state: &AppState) -> Result<Vec<SessionRecord>, AppError> {
+    // 桌面任务各自持有独立的 agent_runs；必须检查共享运行表，并与新任务注册互斥。
+    let running = state.running.lock().await;
+    let _legacy_run = state.agent_runs.try_lock()
+        .map_err(|_| AppError::Internal("当前任务仍在运行，完成或停止后再归档会话".into()))?;
+    if !running.is_empty() {
+        return Err(AppError::Internal("当前任务仍在运行，完成或停止后再归档会话".into()));
+    }
+    let record = agent_runtime::session_record_for_path(path.trim())?;
+    let archived_root = dunce::canonicalize(archived_session_dir()).unwrap_or_else(|_| archived_session_dir());
+    let record_path = dunce::canonicalize(&record.path).map_err(|error| AppError::Configuration(format!("会话路径不可访问：{error}")))?;
+    if session_path_under(&record_path, &archived_root) {
+        return Ok(list_all_session_records());
+    }
+    let target = move_session_between_roots(&record.path, &agent_session_dir(), &archived_session_dir())?;
+    let mut guard = state.inner.lock().await;
+    if guard.session.session_id.as_deref() == Some(&record.session_id) {
+        guard.session.session_file = Some(target.to_string_lossy().into_owned());
+    }
+    drop(guard);
+    Ok(list_all_session_records())
+}
+
+#[tauri::command]
+async fn archive_session(path: String, state: State<'_, AppState>) -> Result<Vec<SessionRecord>, AppError> {
+    archive_session_inner(path, &state).await
+}
+
+async fn unarchive_session_inner(path: String, state: &AppState) -> Result<Vec<SessionRecord>, AppError> {
+    let running = state.running.lock().await;
+    let _legacy_run = state.agent_runs.try_lock()
+        .map_err(|_| AppError::Internal("当前任务仍在运行，完成或停止后再恢复会话".into()))?;
+    if !running.is_empty() {
+        return Err(AppError::Internal("当前任务仍在运行，完成或停止后再恢复会话".into()));
+    }
+    let record = agent_runtime::session_record_for_path(path.trim())?;
+    let active_root = dunce::canonicalize(agent_session_dir()).unwrap_or_else(|_| agent_session_dir());
+    let record_path = dunce::canonicalize(&record.path).map_err(|error| AppError::Configuration(format!("会话路径不可访问：{error}")))?;
+    if session_path_under(&record_path, &active_root) {
+        return Ok(list_all_session_records());
+    }
+    let target = move_session_between_roots(&record.path, &archived_session_dir(), &agent_session_dir())?;
+    let mut guard = state.inner.lock().await;
+    if guard.session.session_id.as_deref() == Some(&record.session_id) {
+        guard.session.session_file = Some(target.to_string_lossy().into_owned());
+    }
+    drop(guard);
+    Ok(list_all_session_records())
+}
+
+#[tauri::command]
+async fn unarchive_session(path: String, state: State<'_, AppState>) -> Result<Vec<SessionRecord>, AppError> {
+    unarchive_session_inner(path, &state).await
 }
 
 fn append_session_info(path: &str, name: &str) -> Result<(), AppError> {
@@ -3458,7 +3563,7 @@ async fn open_local_path(path: String, mode: String) -> Result<(), AppError> {
 
 #[tauri::command]
 async fn list_sessions() -> Result<Vec<SessionRecord>, AppError> {
-    Ok(list_session_records())
+    Ok(list_all_session_records())
 }
 
 fn project_context_memory_root(project_path: &str) -> Result<(String, PathBuf), AppError> {
@@ -3577,21 +3682,8 @@ impl EmptyIf for String {
 
 #[tauri::command]
 async fn search_sessions(query: String) -> Result<Vec<SessionRecord>, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let needle = query.trim().to_lowercase();
-        if needle.is_empty() { return Ok(list_session_records()); }
-        let root = agent_session_dir();
-        let mut records = Vec::new();
-        for entry in WalkDir::new(root).max_depth(3).follow_links(false).into_iter().filter_map(Result::ok) {
-            let path = entry.path();
-            if !entry.file_type().is_file() || path.extension().and_then(|value| value.to_str()) != Some("jsonl") { continue; }
-            let Some(record) = parse_session_record_with_mode(path, false) else { continue; };
-            let haystack = format!("{}\n{}\n{}", record.name.clone().unwrap_or_default(), record.cwd.clone().unwrap_or_default(), record.messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>().join("\n")).to_lowercase();
-            if haystack.contains(&needle) { records.push(record); }
-        }
-        records.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
-        Ok(records)
-    }).await.map_err(|error| AppError::Internal(format!("搜索会话任务未完成：{error}")))?
+    tauri::async_runtime::spawn_blocking(move || Ok(session_preview_cache::search_with_archived(&agent_session_dir(), &archived_session_dir(), &query)))
+        .await.map_err(|error| AppError::Internal(format!("搜索会话任务未完成：{error}")))?
 }
 
 #[tauri::command]
@@ -5763,6 +5855,10 @@ fn configure_bundled_runtime(command: &mut Command, path_override: Option<std::f
 
 fn agent_session_dir() -> PathBuf {
     app_data_root().join("sessions")
+}
+
+fn archived_session_dir() -> PathBuf {
+    app_data_root().join("archived_sessions")
 }
 
 fn agent_cwd(project: &ProjectContext) -> PathBuf {
@@ -9013,7 +9109,7 @@ async fn snapshot_from_app_state_ref(state: &AppState) -> Result<AppSnapshot, Ap
         skills: discover_skills(&project_for_skills).into_iter().filter(|skill| workbench::skill_allowed(mode, skill)).collect(),
         commands: available_commands(),
         tools,
-        sessions: list_session_records(),
+        sessions: list_all_session_records(),
         pending_changes,
         session,
     })
@@ -9178,6 +9274,13 @@ fn available_commands() -> Vec<CommandSummary> {
             "项目知识库",
             "管理当前项目的知识条目",
             "project",
+            false,
+        ),
+        (
+            "/memories",
+            "记忆设置",
+            "控制使用、生成和清空项目记忆",
+            "session",
             false,
         ),
         (
@@ -9450,6 +9553,10 @@ fn list_session_records() -> Vec<SessionRecord> {
     session_preview_cache::list(&agent_session_dir())
 }
 
+fn list_all_session_records() -> Vec<SessionRecord> {
+    session_preview_cache::list_with_archived(&agent_session_dir(), &archived_session_dir())
+}
+
 fn parse_session_record(path: &Path) -> Option<SessionRecord> {
     parse_session_record_with_mode(path, true)
 }
@@ -9468,6 +9575,7 @@ fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionR
     let mut messages = Vec::new();
     let mut ui_turns: Vec<Value> = Vec::new();
     let mut turn_durations: Vec<Value> = Vec::new();
+    let mut notes: HashMap<String, SessionNoteRecord> = HashMap::new();
     let mut activities: Vec<Value> = Vec::new();
     const RESPONSE_ANNOTATION_ENTRY: &str = "plc-pilot.response-text-annotations";
     for (line_index, line) in content.lines().enumerate() {
@@ -9572,6 +9680,20 @@ fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionR
                     }
                 }
             }
+            Some("custom") if entry.get("customType").and_then(Value::as_str) == Some("plc-pilot.task-note") => {
+                let Some(data) = entry.get("data") else { continue; };
+                let Some(path) = data.get("path").and_then(Value::as_str) else { continue; };
+                if preview && !matches!(path, "checkpoint.md" | "runtime.md") { continue; }
+                if data.get("content").is_some_and(Value::is_null) {
+                    notes.remove(path);
+                } else if let Some(content) = data.get("content").and_then(Value::as_str) {
+                    notes.insert(path.to_string(), SessionNoteRecord {
+                        path: path.to_string(),
+                        content: if preview { truncate(content, 2000) } else { content.to_string() },
+                        updated_at: entry.get("timestamp").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    });
+                }
+            }
             Some("custom")
                 if entry
                     .get("customType")
@@ -9626,11 +9748,15 @@ fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionR
             )
         })
         .count();
+    let mut notes = notes.into_values().collect::<Vec<_>>();
+    notes.sort_by(|left, right| left.path.cmp(&right.path));
     Some(SessionRecord {
         session_id,
         name,
         path: path.to_string_lossy().to_string(),
         message_count,
+        archived: false,
+        notes,
         cwd,
         model_profile_id,
         reasoning_effort,
@@ -11716,6 +11842,7 @@ mod tests {
                 "{\"type\":\"session_info\",\"id\":\"info-1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"name\":\"泵站诊断\"}\n",
                 "{\"type\":\"custom\",\"customType\":\"plc-pilot.model-profile\",\"data\":{\"profile_id\":\"model-large\",\"reasoning_effort\":\"high\"}}\n",
                 "{\"type\":\"custom\",\"customType\":\"plc-pilot.ui-turn-duration\",\"data\":{\"turn_index\":0,\"duration_ms\":12345}}\n",
+                "{\"type\":\"custom\",\"customType\":\"plc-pilot.task-note\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"data\":{\"path\":\"checkpoint.md\",\"content\":\"已完成读取\"}}\n",
                 "{\"type\":\"message\",\"id\":\"user-1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":\"检查 MAIN\"}}\n",
                 "{\"type\":\"message\",\"id\":\"assistant-1\",\"parentId\":\"user-1\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"已读取工程。\"}]}}\n",
                 "{\"type\":\"message\",\"id\":\"tool-1\",\"parentId\":\"assistant-1\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"message\":{\"role\":\"toolResult\",\"content\":\"内部结果\"}}\n"
@@ -11736,6 +11863,24 @@ mod tests {
         );
         assert_eq!(record.messages[1].content, "已读取工程。");
         assert_eq!(record.turn_durations[0]["duration_ms"], 12345);
+        assert_eq!(record.notes[0].path, "checkpoint.md");
+        assert_eq!(record.notes[0].content, "已完成读取");
+    }
+
+    #[test]
+    fn session_archive_moves_jsonl_between_active_and_archived_roots() {
+        let directory = tempfile::tempdir().expect("创建会话目录");
+        let active = directory.path().join("sessions");
+        let archived = directory.path().join("archived_sessions");
+        fs::create_dir_all(&active).expect("创建活动会话目录");
+        let source = active.join("session.jsonl");
+        fs::write(&source, "{\"type\":\"session\",\"id\":\"archive-test\"}\n").expect("写入会话");
+        let moved = move_session_between_roots(source.to_str().unwrap(), &active, &archived).expect("归档会话");
+        assert!(!source.exists());
+        assert!(moved.starts_with(&archived));
+        let restored = move_session_between_roots(moved.to_str().unwrap(), &archived, &active).expect("恢复会话");
+        assert!(restored.starts_with(&active));
+        assert!(restored.is_file());
     }
 
     #[test]

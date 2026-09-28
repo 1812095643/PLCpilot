@@ -184,6 +184,8 @@ export type SessionRecord = {
   name: string | null
   path: string
   modified_at: string | null
+  archived?: boolean
+  notes?: Array<{ path: string; content: string; updated_at: string }>
   message_count: number
   cwd?: string | null
   model_profile_id?: string | null
@@ -501,6 +503,8 @@ export const removeProject = (id: string) => invoke<WorkspaceProject[]>('remove_
 export const scanProject = () => invoke<ProjectContext>('scan_project')
 export const syncCurrentProject = () => invoke<ProjectContext>('sync_current_project')
 export const listSessions = () => invoke<SessionRecord[]>('list_sessions')
+export const archiveSession = (path: string) => invoke<SessionRecord[]>('archive_session', { path })
+export const unarchiveSession = (path: string) => invoke<SessionRecord[]>('unarchive_session', { path })
 export const searchSessions = (query: string) => invoke<SessionRecord[]>('search_sessions', { query })
 export const listProjectContext = (projectPath: string) => invoke<ProjectContextRecord[]>('list_project_context', { project_path: projectPath })
 export const saveProjectContext = (payload: { projectPath: string; id?: string; kind: 'fact' | 'knowledge'; title: string; content: string }) => invoke<ProjectContextRecord>('save_project_context', {
