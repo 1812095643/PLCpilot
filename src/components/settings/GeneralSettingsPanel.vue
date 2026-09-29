@@ -2,6 +2,7 @@
 import { onMounted, shallowRef } from 'vue'
 import { getStartupEnabled, setStartupEnabled } from '../../api/settingsBridge'
 
+const props = withDefaults(defineProps<{ showTitle?: boolean }>(), { showTitle: true })
 const emit = defineEmits<{ notice: [message: string] }>()
 const enabled = shallowRef(false)
 const loading = shallowRef(true)
@@ -34,7 +35,7 @@ onMounted(load)
 
 <template>
   <section class="general-settings" aria-label="通用设置">
-    <h2>通用</h2>
+    <h2 v-if="props.showTitle">通用</h2>
     <label class="settings-field-row startup-option">
       <span><strong>开机自启</strong><small>登录 Windows 后自动打开 PLC Pilot。</small></span>
       <input class="startup-switch" type="checkbox" role="switch" aria-label="开机自启"

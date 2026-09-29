@@ -4,6 +4,9 @@
       class="search-dropdown-trigger"
       type="button"
       :disabled="disabled"
+      :aria-label="label || displayLabel"
+      :aria-expanded="isOpen"
+      aria-haspopup="listbox"
       @click="onToggle"
     >
       <span class="search-dropdown-value">{{ displayLabel }}</span>
@@ -132,6 +135,7 @@ const props = defineProps<{
   allowRemove?: boolean
   removeLabel?: string
   displayLabelOverride?: string
+  label?: string
 }>()
 
 const emit = defineEmits<{

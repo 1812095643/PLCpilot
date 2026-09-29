@@ -2,10 +2,10 @@
 import { computed, shallowRef, watch } from 'vue'
 import { searchSessions } from '../../api/plcBridge'
 import type { SessionRecord, WorkspaceProject } from '../../api/plcBridge'
+import { normalizePathForComparison } from '../../pathUtils'
 import IconTablerSearch from '../icons/IconTablerSearch.vue'
-import IconTablerMessageCircle from '../icons/IconTablerMessageCircle.vue'
-import IconTablerTrash from '../icons/IconTablerTrash.vue'
-import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
+import SettingsProjectPicker from '../settings/SettingsProjectPicker.vue'
+import SessionManagementRow from '../settings/SessionManagementRow.vue'
 
 const props = defineProps<{ sessions: SessionRecord[]; projects: WorkspaceProject[]; activeId: string }>()
 const emit = defineEmits<{
@@ -20,51 +20,20 @@ const emit = defineEmits<{
 const query = shallowRef('')
 const projectFilter = shallowRef('')
 const archiveFilter = shallowRef<'active' | 'archived' | 'all'>('active')
-const notesSessionId = shallowRef('')
 const results = shallowRef<SessionRecord[]>([])
 const loading = shallowRef(false)
 
-const projectOptions = computed(() => {
-  const values = new Map<string, string>()
-  for (const session of props.sessions) {
-    const cwd = session.cwd?.trim()
-    if (!cwd) continue
-    values.set(cwd.toLowerCase(), cwd)
-  }
-  return [...values.values()].sort((left, right) => left.localeCompare(right))
-})
+const projectPaths = computed(() => props.sessions.map(session => session.cwd || '').filter(Boolean))
+const filters = [{ value: 'active', label: '最近会话' }, { value: 'archived', label: '已归档' }, { value: 'all', label: '全部' }] as const
 
 const visibleSessions = computed(() => {
   const source = query.value.trim() ? results.value : props.sessions
   return source.filter((session) => {
     if (archiveFilter.value === 'active' && session.archived) return false
     if (archiveFilter.value === 'archived' && !session.archived) return false
-    return !projectFilter.value || (session.cwd || '').toLowerCase() === projectFilter.value.toLowerCase()
+    return !projectFilter.value || normalizePathForComparison(session.cwd || '') === normalizePathForComparison(projectFilter.value)
   })
 })
-const notesSession = computed(() => visibleSessions.value.find((session) => session.session_id === notesSessionId.value) ?? null)
-
-function titleOf(session: SessionRecord): string {
-  return session.name?.trim() || session.messages.find((message) => message.role === 'user')?.content.slice(0, 48) || '未命名会话'
-}
-
-function previewOf(session: SessionRecord): string {
-  const message = [...session.messages].reverse().find((item) => item.role === 'assistant' && item.content.trim())
-    || session.messages.find((item) => item.role === 'user')
-  return message?.content.replace(/\s+/gu, ' ').trim().slice(0, 120) || '暂无正文预览'
-}
-
-function toggleNotes(session: SessionRecord): void {
-  notesSessionId.value = notesSessionId.value === session.session_id ? '' : session.session_id
-}
-
-function formatDate(value: string | null | undefined): string {
-  if (!value) return '刚刚'
-  const timestamp = Number(value)
-  const date = Number.isFinite(timestamp) ? new Date(timestamp * 1000) : new Date(value)
-  if (Number.isNaN(date.getTime())) return '时间未知'
-  return new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date)
-}
 
 watch([query, () => props.sessions], (_values, _oldValues, onCleanup) => {
   const value = query.value.trim()
@@ -87,43 +56,30 @@ watch([query, () => props.sessions], (_values, _oldValues, onCleanup) => {
 </script>
 
 <template>
-  <section class="session-center">
-    <header class="session-center-header">
-      <div>
-        <p class="session-eyebrow">GLOBAL RECENTS</p>
-        <h1>会话中心</h1>
-        <p class="session-lede">跨项目查找、恢复和管理本机保存的所有工作会话。</p>
-      </div>
-      <div class="session-count"><strong>{{ visibleSessions.length }}</strong><span>个会话</span></div>
-    </header>
-
+  <section class="session-management" aria-label="会话管理">
+    <header class="settings-toolbar"><h2>会话管理</h2><span class="settings-feedback">{{ visibleSessions.length }} 个会话</span></header>
     <div class="session-filters">
-      <label class="session-search"><IconTablerSearch /><input v-model="query" type="search" placeholder="搜索标题、目录或会话正文" aria-label="搜索会话" /><span v-if="loading" class="session-search-loading">搜索中…</span></label>
-      <select v-model="archiveFilter" aria-label="按归档状态筛选"><option value="active">最近会话</option><option value="archived">已归档</option><option value="all">全部会话</option></select><select v-model="projectFilter" aria-label="按项目筛选"><option value="">全部项目</option><option v-for="project in projectOptions" :key="project" :value="project">{{ project }}</option></select>
+      <label class="session-search"><IconTablerSearch /><input v-model="query" type="search" placeholder="搜索标题、目录或会话内容" aria-label="搜索会话" /></label>
+      <SettingsProjectPicker v-model="projectFilter" :projects="projects" :paths="projectPaths" include-all />
     </div>
-
-    <div v-if="visibleSessions.length === 0" class="session-empty"><IconTablerMessageCircle /><strong>{{ query ? '没有匹配的会话' : '还没有保存的会话' }}</strong><span>{{ query ? '换一个关键词试试。' : '发送第一条消息后，会话会自动出现在这里。' }}</span></div>
-    <div v-else class="session-list">
-      <article v-for="session in visibleSessions" :key="session.path" class="session-card" :class="{ active: session.session_id === props.activeId }">
-        <button class="session-card-main" type="button" @click="emit('open', session)">
-          <span class="session-card-icon"><IconTablerMessageCircle /></span>
-          <span class="session-card-copy"><strong>{{ titleOf(session) }}</strong><small>{{ session.cwd || '临时会话' }}</small><em>{{ previewOf(session) }}</em></span>
-          <time>{{ formatDate(session.modified_at) }}</time>
-        </button>
-        <div class="session-card-actions"><button v-if="session.notes?.length" type="button" title="查看任务笔记" aria-label="查看任务笔记" @click="toggleNotes(session)">笔记</button><button v-if="!session.archived" type="button" title="归档会话" aria-label="归档会话" @click="emit('archive', session)">归档</button><button v-else type="button" title="恢复会话" aria-label="恢复会话" @click="emit('unarchive', session)">恢复</button><button type="button" title="重命名会话" aria-label="重命名会话" @click="emit('rename', session)"><IconTablerFilePencil /></button><button type="button" title="删除会话" aria-label="删除会话" @click="emit('delete', session)"><IconTablerTrash /></button></div>
-      </article>
+    <div class="settings-tabs" role="tablist" aria-label="会话状态"><button v-for="filter in filters" :key="filter.value" type="button" role="tab" :aria-selected="archiveFilter === filter.value" @click="archiveFilter = filter.value">{{ filter.label }}</button></div>
+    <div v-if="loading" class="settings-empty" role="status">正在搜索会话…</div>
+    <div v-else-if="!visibleSessions.length" class="settings-empty"><strong>{{ query || projectFilter ? '没有匹配的会话' : archiveFilter === 'archived' ? '还没有归档的会话' : '还没有保存的会话' }}</strong><p>{{ query || projectFilter ? '试试其他关键词或项目。' : '对话会自动保存，归档后仍可在这里恢复。' }}</p></div>
+    <div v-else class="settings-list">
+      <SessionManagementRow v-for="session in visibleSessions" :key="session.path" :session="session" :active="session.session_id === activeId"
+        @open="emit('open', session)" @rename="emit('rename', session)" @delete="emit('delete', session)" @archive="emit('archive', session)" @unarchive="emit('unarchive', session)" />
     </div>
-    <section v-if="notesSession" class="session-notes-panel"><div class="session-notes-heading"><strong>任务笔记</strong><span>{{ notesSession.name || '当前会话' }}</span></div><article v-for="note in notesSession.notes" :key="note.path" class="session-note"><code>{{ note.path }}</code><p>{{ note.content }}</p><small>{{ formatDate(note.updated_at) }}</small></article></section>
   </section>
 </template>
 
 <style scoped>
-.session-center { min-height: 100%; overflow: auto; padding: 42px clamp(22px, 6vw, 88px) 80px; background: var(--plc-page-bg, #fff); color: var(--plc-text, #222); }
-.session-center-header { display: flex; align-items: end; justify-content: space-between; gap: 24px; max-width: 980px; margin: 0 auto 28px; }.session-eyebrow { margin: 0 0 7px; color: #007acc; font-size: 10px; font-weight: 700; letter-spacing: .16em; }.session-center h1 { margin: 0; font-size: 28px; letter-spacing: -.03em; }.session-lede { margin: 9px 0 0; color: var(--plc-muted, #777); font-size: 13px; }.session-count { display: grid; justify-items: end; color: var(--plc-muted, #777); }.session-count strong { color: var(--plc-text, #222); font-size: 25px; }.session-count span { font-size: 11px; }
-.session-filters { display: flex; gap: 10px; max-width: 980px; margin: 0 auto 18px; }.session-search { display: flex; align-items: center; gap: 8px; flex: 1; min-height: 38px; padding: 0 12px; border: 1px solid var(--plc-border, #dedede); border-radius: 8px; background: var(--plc-surface, #fafafa); }.session-search svg { width: 16px; color: var(--plc-muted, #888); }.session-search input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: inherit; font-size: 13px; }.session-search-loading { color: var(--plc-muted, #888); font-size: 11px; }.session-filters select { min-width: 170px; border: 1px solid var(--plc-border, #dedede); border-radius: 8px; padding: 0 10px; background: var(--plc-surface, #fafafa); color: inherit; }
-.session-list { display: grid; gap: 7px; max-width: 980px; margin: 0 auto; }.session-card { display: flex; align-items: stretch; border: 1px solid var(--plc-border, #e4e4e4); border-radius: 10px; background: var(--plc-surface, #fff); transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }.session-card:hover, .session-card.active { border-color: #6aa8d7; box-shadow: 0 6px 18px #007acc12; transform: translateY(-1px); }.session-card-main { display: flex; align-items: center; flex: 1; min-width: 0; gap: 12px; border: 0; background: transparent; color: inherit; cursor: pointer; text-align: left; padding: 13px 14px; }.session-card-icon { display: grid; place-items: center; width: 29px; height: 29px; flex: 0 0 auto; border-radius: 7px; background: #007acc14; color: #007acc; }.session-card-icon svg { width: 16px; }.session-card-copy { display: grid; min-width: 0; gap: 3px; }.session-card-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }.session-card-copy small, .session-card-copy em { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--plc-muted, #858585); font-size: 11px; font-style: normal; }.session-card-copy em { color: var(--plc-subtle, #999); }.session-card-main time { margin-left: auto; align-self: start; flex: 0 0 auto; color: var(--plc-muted, #888); font-size: 10px; }.session-card-actions { display: flex; align-items: center; gap: 2px; padding: 0 10px; opacity: 0; }.session-card:hover .session-card-actions, .session-card-actions:focus-within { opacity: 1; }.session-card-actions button { min-width: 27px; width: auto; height: 27px; border: 0; border-radius: 5px; padding: 0 5px; background: transparent; color: var(--plc-muted, #888); cursor: pointer; font-size: 10px; }.session-card-actions button:hover { background: var(--plc-hover, #f1f1f1); color: var(--plc-text, #222); }.session-card-actions svg { width: 14px; }
-.session-empty { display: grid; justify-items: center; gap: 9px; max-width: 980px; margin: 70px auto; color: var(--plc-muted, #888); text-align: center; }.session-empty svg { width: 30px; height: 30px; opacity: .6; }.session-empty strong { color: var(--plc-text, #333); font-size: 14px; }.session-empty span { font-size: 12px; }
-.session-notes-panel { display: grid; gap: 9px; max-width: 980px; margin: 12px auto 0; padding: 14px; border: 1px solid var(--plc-border, #e4e4e4); border-radius: 10px; background: var(--plc-surface, #fff); }.session-notes-heading { display: flex; justify-content: space-between; color: var(--plc-muted, #777); font-size: 11px; }.session-notes-heading strong { color: var(--plc-text, #333); font-size: 13px; }.session-note { padding-top: 8px; border-top: 1px solid var(--plc-border, #e4e4e4); }.session-note code { color: #007acc; font-size: 11px; }.session-note p { margin: 6px 0; max-height: 160px; overflow: auto; white-space: pre-wrap; color: var(--plc-text, #333); font: 12px/1.6 'Cascadia Code', Consolas, monospace; }.session-note small { color: var(--plc-muted, #888); font-size: 10px; }
-:global(:root.dark) .session-center { --plc-page-bg: #111; --plc-text: #e5e5e5; --plc-muted: #999; --plc-subtle: #777; --plc-border: #303030; --plc-surface: #1a1a1a; --plc-hover: #262626; }.session-center { --plc-page-bg: #fff; --plc-text: #222; --plc-muted: #777; --plc-subtle: #999; --plc-border: #e4e4e4; --plc-surface: #fff; --plc-hover: #f1f1f1; }
-@media (max-width: 680px) { .session-center { padding: 24px 14px 48px; }.session-center-header { align-items: start; }.session-filters { flex-direction: column; }.session-filters select { min-height: 38px; }.session-card-main time { display: none; }.session-card-actions { opacity: 1; padding-right: 5px; } }
+.session-management { min-width: 0; }
+.session-management .settings-toolbar { margin-bottom: 20px; }
+.session-filters { display: grid; grid-template-columns: minmax(0, 1fr) minmax(160px, 240px); gap: 12px; margin-bottom: 14px; }
+.session-search { display: flex; min-width: 0; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--settings-line); border-radius: 5px; background: var(--settings-field); }
+.session-search svg { flex: 0 0 15px; width: 15px; height: 15px; color: var(--settings-muted); }
+.session-search input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--settings-text); font-size: 12px; }
+.session-search:focus-within { outline: 2px solid var(--settings-muted); outline-offset: 2px; }
+.session-search input:focus-visible { outline: 0; }
+@media (max-width: 820px) { .session-filters { grid-template-columns: minmax(0, 1fr); gap: 8px; } }
 </style>

@@ -97,7 +97,7 @@ import type {
 } from './types/codex'
 import type { Diagnostic } from './api/plcBridge'
 
-type View = 'chat' | 'overview' | 'skills' | 'sessions' | 'knowledge'
+type View = 'chat' | 'overview' | 'skills'
 
 const snapshot = shallowRef<Snapshot>(EMPTY_SNAPSHOT)
 const appReady = shallowRef(false)
@@ -142,10 +142,10 @@ const liveOverlay = workspace.field('liveOverlay')
 const diagnostics = workspace.field('diagnostics')
 const diagnosticNote = workspace.field('diagnosticNote')
 const showSettings = shallowRef(false)
-const settingsCategory = shallowRef('models')
+const settingsCategory = shallowRef('general')
+const settingsSection = shallowRef('')
 const showCommandPalette = shallowRef(false)
-const showAbout = shallowRef(false)
-const showReward = shallowRef(false)
+const showAuthorDialog = shallowRef(false)
 /** 防止审批期间重复点击，同时不影响正在运行的 Agent busy 状态。 */
 const approvingChangeIds = shallowRef<Set<string>>(new Set())
 const GITHUB_REPOSITORY_URL = 'https://github.com/1812095643/PLCpilot'
@@ -985,11 +985,10 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
   if (text === '/new') { await startNewThread(); return }
   if (text === '/clear' && !thread.isBusy) { workspace.create(thread.project); return }
   if (text === '/model') { settingsCategory.value = 'models'; providerDiscoveryRequest.value += 1; showSettings.value = true; return }
-  if (text === '/skills' || text === '/mcp') { settingsCategory.value = text.slice(1); showSettings.value = true; return }
-  if (text === '/tools') { activeView.value = 'skills'; showSettings.value = false; return }
-  if (text === '/sessions') { activeView.value = 'sessions'; showSettings.value = false; return }
-  if (text === '/memory' || text === '/knowledge') { activeView.value = 'knowledge'; showSettings.value = false; return }
-  if (text === '/memories') { settingsCategory.value = 'context'; showSettings.value = true; return }
+  if (text === '/skills' || text === '/mcp' || text === '/tools') { settingsCategory.value = 'extensions'; settingsSection.value = text.slice(1); showSettings.value = true; return }
+  if (text === '/sessions') { settingsCategory.value = 'workspace'; settingsSection.value = 'sessions'; showSettings.value = true; return }
+  if (text === '/memory' || text === '/knowledge') { settingsCategory.value = 'workspace'; settingsSection.value = 'knowledge'; showSettings.value = true; return }
+  if (text === '/memories') { settingsCategory.value = 'workspace'; settingsSection.value = 'context'; showSettings.value = true; return }
   if (/^\/(approve|reject)\s+/u.test(text)) {
     const [action, id] = text.split(/\s+/u)
     const change = thread.pendingChanges.find((change) => change.id === id)
@@ -1544,7 +1543,7 @@ async function onResumeSession(record: SessionRecord): Promise<void> {
       targetRecord = restored
     }
     const existing = workspace.threads.value.find((thread) => thread.session.session_id === targetRecord.session_id)
-    if (existing) { workspace.select(existing); activeView.value = 'chat'; return }
+    if (existing) { workspace.select(existing); activeView.value = 'chat'; showSettings.value = false; return }
     if (targetRecord.cwd && !isSamePath(currentCwd.value, targetRecord.cwd)) {
       const project = await selectProject(targetRecord.cwd)
       snapshot.value = { ...snapshot.value, project }
@@ -1562,6 +1561,7 @@ async function onResumeSession(record: SessionRecord): Promise<void> {
     }
     activeView.value = 'chat'
     await refresh()
+    showSettings.value = false
     showNotice(`已恢复会话：${resumed.name || resumed.session_id.slice(0, 12)}`)
   } catch (error) {
     showNotice(error instanceof Error ? error.message : String(error))
@@ -2050,7 +2050,7 @@ onUnmounted(() => {
 <template>
   <AppSplashScreen v-if="showAppSplash" :ready="appReady" @finished="showAppSplash = false" />
   <AppUpdateNotice v-if="!showSettings && updater.state.available && updater.state.phase === 'available' && updater.state.dismissedVersion !== updater.state.available.version"
-    :version="updater.state.available.version" @open="settingsCategory = 'updates'; showSettings = true" @dismiss="updater.state.dismissedVersion = updater.state.available!.version" />
+    :version="updater.state.available.version" @open="settingsCategory = 'updates'; settingsSection = ''; showSettings = true" @dismiss="updater.state.dismissedVersion = updater.state.available!.version" />
   <DesktopLayout
     :is-initializing="showAppSplash"
     :is-sidebar-collapsed="isSidebarCollapsed"
@@ -2071,8 +2071,7 @@ onUnmounted(() => {
       <WorkspaceSidebar :projects="sidebarProjects" :threads="sidebarThreads" :active-id="activeThreadId" :theme="theme" :workbench-mode="workbenchMode" @update:theme="theme = $event" @update:workbench-mode="onWorkbenchModeChange"
         @new-thread="startNewThread" @select-thread="selectSidebarThread"
         @add-project="onPickProjectFolder" @remove-project="onRemoveProject" @rename-thread="renameSidebarThread" @delete-thread="deleteSidebarThread"
-        @open-settings="showSettings = true" @open-skills="activeView = 'skills'; showSettings = false" @open-overview="activeView = 'overview'; showSettings = false"
-        @open-sessions="activeView = 'sessions'; showSettings = false" @open-knowledge="activeView = 'knowledge'; showSettings = false" />
+        @open-settings="showSettings = true" @open-skills="activeView = 'skills'; showSettings = false" @open-overview="activeView = 'overview'; showSettings = false" />
     </template>
 
     <template #topbar>
@@ -2081,22 +2080,21 @@ onUnmounted(() => {
         :show-sidebar-toggle="!showSettings"
         :is-sidebar-collapsed="isSidebarCollapsed"
         @toggle-sidebar="isSidebarCollapsed = !isSidebarCollapsed"
-        @open-chat="activeView = 'chat'"
+        @open-chat="activeView = 'chat'; showSettings = false"
         @start-new-thread="startNewThread"
         @open-project="onPickProjectFolder"
         @open-command-palette="showCommandPalette = true"
-        @open-skills="activeView = 'skills'"
+        @open-skills="activeView = 'skills'; showSettings = false"
         @open-settings="showSettings = true"
         @window-error="showNotice"
-        @open-about="showAbout = true"
-        @open-reward="showReward = true"
+        @open-author="showAuthorDialog = true"
         @open-github="openGithubRepository"
-        @check-updates="settingsCategory = 'updates'; showSettings = true; updater.check()"
+        @check-updates="settingsCategory = 'updates'; settingsSection = ''; showSettings = true; updater.check()"
       />
     </template>
 
-    <template #header>
-      <ContentHeader :title="showSettings ? '设置' : activeView === 'sessions' ? '会话中心' : activeView === 'knowledge' ? '项目上下文' : currentTitle" :accent="activeView !== 'chat'">
+    <template v-if="activeView === 'chat'" #header>
+      <ContentHeader :title="currentTitle">
         <template #leading>
           <span class="plc-header-status" :data-state="isBusy ? 'busy' : currentProject.exists ? 'ok' : 'idle'" />
         </template>
@@ -2107,7 +2105,9 @@ onUnmounted(() => {
     </template>
 
     <template #content>
-      <SettingsPage v-if="showSettings" v-model:category="settingsCategory" :snapshot="snapshot" :theme="theme" :access-mode="accessMode" :access-mode-disabled="!accessModeReady || accessModeSaving || tasksRunning" @update:access-mode="onAccessModeChange" @close="showSettings = false" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
+      <SettingsPage v-if="showSettings" v-model:category="settingsCategory" v-model:section="settingsSection" :snapshot="snapshot" :theme="theme" :access-mode="accessMode" :access-mode-disabled="!accessModeReady || accessModeSaving || tasksRunning" @update:access-mode="onAccessModeChange" @close="showSettings = false; activeView = 'chat'" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
+        <template #sessions><GlobalSessionCenter :sessions="snapshot.sessions" :projects="snapshot.projects" :active-id="activeSessionId" @open="onResumeSession" @rename="onRenameSession" @delete="onDeleteSession" @archive="onArchiveSession" @unarchive="onUnarchiveSession" @notice="showNotice" /></template>
+        <template #knowledge><ProjectContextCenter :project-path="currentProject.path || currentCwd" :project-name="currentProject.name || '当前项目'" :projects="snapshot.projects" @notice="showNotice" /></template>
         <template #updates><UpdatesSettingsPanel :state="updater.state" :busy="updater.active.value" :tasks-running="tasksRunning" @check="updater.check" @install="updater.install" @auto-check="updater.setAutoCheck" @notice="showNotice" /></template>
         <template #models>
           <p v-if="!modelSettings.loaded.value || modelSettings.error.value" class="plc-model-loading" role="status">
@@ -2157,10 +2157,6 @@ onUnmounted(() => {
           </section>
 
         </div>
-
-        <GlobalSessionCenter v-else-if="activeView === 'sessions'" :sessions="snapshot.sessions" :projects="snapshot.projects" :active-id="activeSessionId" @open="onResumeSession" @rename="onRenameSession" @delete="onDeleteSession" @archive="onArchiveSession" @unarchive="onUnarchiveSession" @notice="showNotice" />
-
-        <ProjectContextCenter v-else-if="activeView === 'knowledge'" :project-path="currentProject.path || currentCwd" :project-name="currentProject.name || '当前项目'" @notice="showNotice" />
 
         <div v-else-if="activeView === 'overview'" class="plc-detail-layout">
           <section class="plc-detail-section plc-project-overview">
@@ -2232,11 +2228,11 @@ onUnmounted(() => {
           <button v-for="item in commands" :key="item.command" class="plc-command-row" type="button" @click="chooseCommand(item.command, item.supports_args)"><code>{{ item.command }}</code><span><strong>{{ item.label }}</strong><small>{{ item.detail }}</small></span><kbd>↵</kbd></button>
         </section>
       </div>
-      <div v-if="showAbout || showReward" class="plc-overlay" @click.self="showAbout = showReward = false">
-        <section class="plc-info-dialog" role="dialog" aria-modal="true" :aria-label="showAbout ? '关于作者' : '打赏作者'">
-          <div class="plc-modal-heading"><div><p class="plc-eyebrow">PLC Pilot</p><h2>{{ showAbout ? '关于作者' : '打赏作者' }}</h2></div><button class="plc-close-button" type="button" aria-label="关闭" @click="showAbout = showReward = false"><IconTablerX /></button></div>
-          <p v-if="showAbout" class="plc-info-dialog-copy">作者：蔡徐坤</p>
-          <template v-else><p class="plc-info-dialog-copy">感谢支持 PLC Pilot。扫码支持作者持续改进。</p><img class="plc-reward-image" src="/assets/reward-alipay.jpg" alt="支付宝打赏二维码" /></template>
+      <div v-if="showAuthorDialog" class="plc-overlay" @click.self="showAuthorDialog = false">
+        <section class="plc-info-dialog" role="dialog" aria-modal="true" aria-label="关于作者与打赏">
+          <div class="plc-modal-heading"><div><p class="plc-eyebrow">PLC Pilot</p><h2>关于作者与打赏</h2></div><button class="plc-close-button" type="button" aria-label="关闭" @click="showAuthorDialog = false"><IconTablerX /></button></div>
+          <p class="plc-info-dialog-copy">作者：蔡徐坤</p>
+          <p class="plc-info-dialog-copy">感谢支持 PLC Pilot。扫码支持作者持续改进。</p><img class="plc-reward-image" src="/assets/reward-alipay.jpg" alt="支付宝打赏二维码" />
         </section>
       </div>
       <div v-if="appDialog" class="plc-overlay plc-dialog-overlay" @click.self="closeAppDialog(appDialog.kind === 'confirm' ? false : null)">

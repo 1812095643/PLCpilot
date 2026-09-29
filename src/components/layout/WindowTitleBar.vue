@@ -30,8 +30,7 @@ const emit = defineEmits<{
   'open-skills': []
   'open-settings': []
   'window-error': [message: string]
-  'open-about': []
-  'open-reward': []
+  'open-author': []
   'open-github': []
   'check-updates': []
 }>()
@@ -74,8 +73,7 @@ function menuItems(key: MenuKey): MenuItem[] {
       return [
         { label: '工作台设置', action: () => emit('open-settings') },
         { label: '检查更新', action: () => emit('check-updates') },
-        { label: '关于作者 · 蔡徐坤', action: () => emit('open-about') },
-        { label: '打赏作者', action: () => emit('open-reward') },
+        { label: '关于作者 · 打赏作者', action: () => emit('open-author') },
         { label: 'GitHub · PLCpilot', action: () => emit('open-github') },
         { label: '命令面板', action: () => emit('open-command-palette') },
       ]
