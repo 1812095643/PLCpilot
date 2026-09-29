@@ -2,6 +2,7 @@
 import { defineAsyncComponent } from 'vue'
 import { IconX, IconFile, IconFolderOpen, IconExternalLink, IconLayoutSidebarRightCollapse, IconRefresh, IconDeviceFloppy, IconArrowBackUp, IconArrowForwardUp } from '@tabler/icons-vue'
 import { openLocalPath } from '../../api/plcBridge'
+import FileTypeIcon from '../content/FileTypeIcon.vue'
 import type { DocumentSnapshot, DocumentSelection, DocumentOperation } from '../../api/documents'
 const props = defineProps<{ tabs: DocumentSnapshot[]; active: DocumentSnapshot | null; loading: boolean; busy: boolean }>()
 const emit = defineEmits<{ select: [id: string]; close: [id: string]; hide: []; refresh: [path: string]; quote: [selection: DocumentSelection]; notice: [message: string]; apply: [operations: DocumentOperation[]]; save: []; history: [redo: boolean] }>()
@@ -18,7 +19,7 @@ async function external(mode: 'reveal' | 'default') { if (!props.active) return;
   <section class="document-workspace" aria-label="文件工作区">
     <header class="document-heading"><span>文件工作区</span><div class="document-actions"><button title="收起文件工作区" aria-label="收起文件工作区" @click="emit('hide')"><IconLayoutSidebarRightCollapse /></button></div></header>
     <nav v-if="tabs.length" class="document-tabs" aria-label="已打开的文件">
-      <div v-for="tab in tabs" :key="tab.id" class="document-tab" :class="{ active: tab.id === active?.id }"><button class="document-tab-name" :title="tab.path" :aria-current="tab.id === active?.id ? 'page' : undefined" @click="emit('select', tab.id)"><IconFile /><span>{{ tab.name }}</span></button><button class="document-tab-close" :aria-label="`关闭 ${tab.name}`" @click="emit('close', tab.id)"><IconX /></button></div>
+      <div v-for="tab in tabs" :key="tab.id" class="document-tab" :class="{ active: tab.id === active?.id }"><button class="document-tab-name" :title="tab.path" :aria-current="tab.id === active?.id ? 'page' : undefined" @click="emit('select', tab.id)"><FileTypeIcon :name="tab.name" class="document-tab-icon" /><span>{{ tab.name }}</span></button><button class="document-tab-close" :aria-label="`关闭 ${tab.name}`" @click="emit('close', tab.id)"><IconX /></button></div>
     </nav>
     <div v-if="active" class="document-toolbar"><span class="document-format">{{ active.kind.toUpperCase() }}</span><span class="document-size">{{ active.dirty ? '未保存' : `${(active.size / 1024).toFixed(1)} KB` }}</span><span class="toolbar-spacer" /><template v-if="active.can_edit"><button :disabled="busy || !active.can_undo" title="撤销" aria-label="撤销" @click="emit('history', false)"><IconArrowBackUp /></button><button :disabled="busy || !active.can_redo" title="重做" aria-label="重做" @click="emit('history', true)"><IconArrowForwardUp /></button><button :disabled="busy || !active.dirty" title="保存文件" aria-label="保存文件" @click="emit('save')"><IconDeviceFloppy /></button></template><button title="在文件管理器中显示" aria-label="在文件管理器中显示" @click="external('reveal')"><IconFolderOpen /></button><button title="使用默认应用打开" aria-label="使用默认应用打开" @click="external('default')"><IconExternalLink /></button></div>
     <div v-if="loading" class="document-loading" role="status"><IconRefresh class="loading-spin" />正在读取文件…</div>
@@ -37,6 +38,7 @@ async function external(mode: 'reveal' | 'default') { if (!props.active) return;
 
 <style scoped>
 .document-workspace { --document-bg: #fafafa; --document-text: #292929; --document-muted: #858585; --document-line: #e5e5e5; --document-field: #eeeeee; background: var(--document-bg); color: var(--document-text); height: 100%; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.document-tab-name .document-tab-icon { width: 16px; height: 16px; }
 :global(.dark .document-workspace) { --document-bg: #1e1e1e; --document-text: #dedede; --document-muted: #929292; --document-line: #353535; --document-field: #292929; }
 .document-heading { display: flex; justify-content: space-between; align-items: center; height: 46px; padding: 0 16px; border-bottom: 1px solid var(--document-line); font-size: 12px; font-weight: 500; flex-shrink: 0; }
 .document-actions,.document-toolbar { display: flex; align-items: center; gap: 5px; }.document-actions button,.document-toolbar button,.document-tab-close { background: transparent; border: 0; padding: 5px; color: var(--document-muted); cursor: pointer; border-radius: 5px; }.document-actions svg,.document-toolbar svg { width: 17px; height: 17px; }.document-actions button:hover,.document-toolbar button:hover,.document-tab-close:hover { color: var(--document-text); background: var(--document-field); }

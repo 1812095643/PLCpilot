@@ -1,10 +1,11 @@
 {
   "name": "plc-pilot",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "private": true,
   "description": "支持 CODESYS、CAREL STone 与自由聊天的本地 AI Agent 工作台",
   "type": "module",
   "workspaces": [
+    "agent-host",
     "stone-mcp"
   ],
   "scripts": {
@@ -25,9 +26,9 @@
     "package:portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.84.4",
-    "@earendil-works/pi-ai": "^0.84.4",
-    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@earendil-works/pi-agent-core": "0.87.1",
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
     "@tabler/icons-vue": "^3.46.0",
     "@tauri-apps/api": "^2.8.0",
     "highlight.js": "^11.11.1",

@@ -168,7 +168,7 @@
                     :src="attachmentPreviewUrl(attachment)"
                     :alt="attachment.name"
                   />
-                  <IconTablerFilePencil v-else class="message-file-attachment-icon" aria-hidden="true" />
+                  <FileTypeIcon v-else :name="attachment.name" :mime-type="attachment.mimeType" class="message-file-attachment-icon" />
                   <div class="message-file-attachment-copy">
                     <strong :title="attachment.name">{{ attachment.name }}</strong>
                     <span>{{ formatAttachmentSize(attachment.size) }} · {{ attachment.status === 'ready' ? '已发送' : attachment.error || '未就绪' }}</span>
@@ -844,10 +844,12 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UiAttachment, UiFileChange, UiLiveOverlay, UiMessage, UiMentionReference, UiPlanStep, UiResponseTextAnnotation } from '../../types/codex'
 import ImageGenerationCard from './ImageGenerationCard.vue'
+import FileTypeIcon from './FileTypeIcon.vue'
 import type { WorkbenchMode } from '../../api/plcBridge'
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { openLocalPath, openWebUrl } from '../../api/plcBridge'
 import { classifyLinkTarget } from '../../utils/linkTarget'
+import { nextMarkdownLink, parseMarkdownLink } from '../../utils/markdownLinks'
 import { isTauri } from '@tauri-apps/api/core'
 import { useMobile } from '../../composables/useMobile'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
@@ -1565,11 +1567,11 @@ function isFilePath(value: string): boolean {
   const looksLikeRelative = value.startsWith('./') || value.startsWith('../') || value.startsWith('~/')
   if (looksLikeUnixAbsolute || looksLikeWindowsAbsolute || looksLikeRelative) return true
 
-  const looksLikeBareFilename = /^[A-Za-z0-9._@() -]+\.[A-Za-z0-9]{1,12}$/u.test(value)
+  const looksLikeBareFilename = /^[\p{L}\p{N}._@() -]+\.[A-Za-z0-9]{1,12}$/u.test(value)
   if (looksLikeBareFilename) return true
 
   // Bare relative paths should look like actual path segments, not arbitrary prose containing "/".
-  return /^[A-Za-z0-9._@() -]+(?:[\\/][A-Za-z0-9._@() -]+)+$/u.test(value)
+  return /^[\p{L}\p{N}._@() -]+(?:[\\/][\p{L}\p{N}._@() -]+)+$/u.test(value)
 }
 
 function getBasename(pathValue: string): string {
@@ -1615,6 +1617,9 @@ function normalizePathDots(pathValue: string): string {
   if (driveMatch) {
     root = `${driveMatch[1]}/`
     rest = (driveMatch[2] ?? '').replace(/^\/+/u, '')
+  } else if (rest.startsWith('//')) {
+    root = '//'
+    rest = rest.slice(2)
   } else if (rest.startsWith('/')) {
     root = '/'
     rest = rest.slice(1)
@@ -1761,14 +1766,9 @@ function readAsteriskLinkWrapper(
 }
 
 function parseMarkdownLinkToken(value: string): { label: string; target: string } | null {
-  const trimmed = value.trim()
-  if (!trimmed.startsWith('[') || !trimmed.endsWith(')')) return null
-  const labelCloseIndex = trimmed.indexOf(']')
-  if (labelCloseIndex <= 1) return null
-  if (trimmed[labelCloseIndex + 1] !== '(') return null
-  const labelRaw = trimmed.slice(1, labelCloseIndex).trim()
-  const targetRaw = trimmed.slice(labelCloseIndex + 2, -1).trim()
-  if (labelRaw.includes('\n') || targetRaw.includes('\n')) return null
+  const parsed = parseMarkdownLink(value)
+  if (!parsed) return null
+  const { label: labelRaw, target: targetRaw } = parsed
   const label = trimLinkWrappers(labelRaw).core.trim() || labelRaw
   const target = trimLinkWrappers(targetRaw).core.trim()
   if (!target) return null
@@ -2837,53 +2837,8 @@ function splitTextByFileUrls(
   let cursor = 0
   let scanFrom = 0
 
-  const findNextMarkdownLink = (
-    source: string,
-    fromIndex: number,
-  ): { start: number; end: number; token: string } | null => {
-    let linkStart = source.indexOf('[', fromIndex)
-    while (linkStart >= 0) {
-      const labelEnd = source.indexOf(']', linkStart + 1)
-      if (labelEnd < 0) return null
-      if (source[labelEnd + 1] !== '(') {
-        linkStart = source.indexOf('[', linkStart + 1)
-        continue
-      }
-
-      let depth = 1
-      let index = labelEnd + 2
-      let hasNewLine = false
-      while (index < source.length) {
-        const char = source[index]
-        if (char === '\n') {
-          hasNewLine = true
-          break
-        }
-        if (char === '(') depth += 1
-        if (char === ')') {
-          depth -= 1
-          if (depth === 0) {
-            const token = source.slice(linkStart, index + 1)
-            if (parseMarkdownLinkToken(token)) {
-              return { start: linkStart, end: index + 1, token }
-            }
-            break
-          }
-        }
-        index += 1
-      }
-
-      if (hasNewLine) {
-        linkStart = source.indexOf('[', linkStart + 1)
-        continue
-      }
-      linkStart = source.indexOf('[', linkStart + 1)
-    }
-    return null
-  }
-
   while (scanFrom < text.length) {
-    const match = findNextMarkdownLink(text, scanFrom)
+    const match = nextMarkdownLink(text, scanFrom)
     if (!match) break
     const { start, end, token } = match
     const asteriskWrapper = readAsteriskLinkWrapper(text, start, end, cursor, token)
@@ -4840,6 +4795,11 @@ onBeforeUnmount(() => {
 .message-file-attachment[data-status='error'] {
   @apply border-rose-200 bg-rose-50/60;
 }
+
+:global(.dark .message-file-attachment) { background: #252526; border-color: #3c3c3c; }
+:global(:root.dark .message-file-attachment-copy strong) { color: #e5e5e5; }
+:global(:root.dark .message-file-attachment-copy span) { color: #a3a3a3; }
+:global(.dark .message-file-attachment[data-status='error']) { background: #3a2222; border-color: #764040; }
 
 .message-file-attachment-preview,
 .message-file-attachment-icon {

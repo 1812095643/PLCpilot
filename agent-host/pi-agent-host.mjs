@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { hideProcessWindows, createApprovedTools, executeApprovedCommand, abortApprovedCommand, recordApproval } from "./builtin-tools.mjs";
 import { createProjectMemory, createContextExtension, contextSettings, redactContext } from "./context-memory.mjs";
 import { createRetryEvents } from "./retry-events.mjs";
+import { FILE_OUTPUT_GUIDANCE, attachmentPromptText } from "./file-output.mjs";
 import { createDiagnosticLogger, registerDiagnosticSecrets, observeProcess } from "../shared/diagnostics.mjs";
 
 const diagnosticLog = createDiagnosticLogger("agent-host");
@@ -318,23 +319,6 @@ function codexImageInputs(attachments) {
       return data ? { type: "image", data, mimeType } : null;
     })
     .filter(Boolean);
-}
-
-function attachmentPromptText(attachments) {
-  return attachments
-    .map((attachment) => {
-      const name = String(attachment?.name ?? "未命名附件").trim() || "未命名附件";
-      if (typeof attachment?.text_content === "string" && attachment.text_content.length > 0) {
-        return `附件「${name}」的内容：\n${attachment.text_content}`;
-      }
-      if (attachment?.kind === "image" && !attachment?.error) {
-        return `附件「${name}」是一张图片，请直接查看本轮附加的图片。`;
-      }
-      if (attachment?.error) return `附件「${name}」暂时无法读取：${attachment.error}`;
-      return `附件「${name}」已添加，类型为 ${String(attachment?.mime_type ?? "未知")}。`;
-    })
-    .filter(Boolean)
-    .join("\n\n");
 }
 
 function responseAnnotationPromptText(annotations) {
@@ -793,8 +777,10 @@ async function ensureSession(config) {
     collaboration_mode: config.collaboration_mode ?? "default",
   }, signal);
   const customTools = [...(config.mcp_tools ?? []).map((tool) => makeToolDefinition(tool, sendRequest)), ...createApprovedTools(cwd, sendRequest)];
-  const systemPrompt = String(config.system_prompt ?? "").trim() ||
-    "你是 PLC Pilot，必须先读取上下文，再提出可审查的工程操作。";
+  const systemPrompt = [
+    String(config.system_prompt ?? "").trim() || "你是 PLC Pilot，必须先读取上下文，再提出可审查的工程操作。",
+    FILE_OUTPUT_GUIDANCE,
+  ].join("\n\n");
   const contextPreferences = config.context_management ?? {};
   const contextSecrets = [String(modelConfig.api_key ?? "")];
   const memoryStore = await createProjectMemory(join(dirname(sessionDir), "memories"), cwd, contextSecrets);
@@ -826,6 +812,7 @@ async function ensureSession(config) {
   const toolNames = ["read", "grep", "find", "ls", "notes", "history", ...(contextPreferences.project_memory === false ? [] : ["memory"]), ...customTools.map((tool) => tool.name)];
   const settingsManager = SettingsManager.inMemory({
     compaction: contextSettings(model.contextWindow, contextPreferences),
+    cacheWarming: "off",
     retry: {
       enabled: retryPreferences.max_retries > 0,
       maxRetries: retryPreferences.max_retries,
@@ -905,10 +892,14 @@ async function ensureSession(config) {
     mode: "json",
     onError: (error) => sendEvent(makeEvent("context", "上下文扩展暂不可用", redactContext(error.error, contextSecrets), "warning")),
   });
-  activeSession.agent.shouldStopAfterTurn = ({ toolResults }) => toolResults.some((result) => {
-    const decision = result?.details?.plcDecision;
-    return decision === "pending" || decision === "blocked";
-  });
+  // Pi 0.87 使用 finishTurn；先调用 SDK 自带的边界钩子，保留笔记、压缩和扩展续接。
+  const finishTurn = activeSession.agent.finishTurn?.bind(activeSession.agent);
+  activeSession.agent.finishTurn = async (turn, signal) => {
+    const decision = await finishTurn?.(turn, signal);
+    if (["error", "aborted"].includes(turn.message.stopReason)) return decision;
+    return turn.toolResults.some((result) => ["pending", "blocked"].includes(result?.details?.plcDecision))
+      ? { action: "end" } : decision;
+  };
   // 恢复会话时优先保留 JSONL 中已有的名称；只有显式重命名或新会话没有名称时才写入。
   const requestedName = String(config.session_name ?? "").trim();
   if (requestedName && requestedName !== activeSession.sessionName) {

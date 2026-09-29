@@ -54,10 +54,12 @@ watch(() => props.discovery, () => { selected.value = []; query.value = '' })
 .discovered-search { width:100%; min-height:34px; border:1px solid var(--settings-line); border-radius:6px; background:var(--settings-field); padding:7px 10px; color:var(--settings-text); font:inherit; font-size:12px; box-sizing:border-box; }
 .discovered-toolbar label,.discovered-row { display:flex; align-items:center; gap:10px; cursor:pointer; }
 input[type='checkbox'] { width:14px; height:14px; flex-shrink:0; margin:0; accent-color:#007acc; }
-.discovered-list { max-height:250px; overflow:auto; display:flex; flex-direction:column; gap:2px; }
-.discovered-row { min-height:38px; padding:7px 9px; border-radius:6px; font-size:12px; }.discovered-row:hover { background:var(--settings-field); }
-.discovered-name { display:flex; flex-direction:column; gap:3px; min-width:0; flex:1; }.discovered-name strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:450; }
-.discovered-row small,.discovered-empty { color:var(--settings-muted); font-size:11px; }.discovered-row.added { cursor:default; }
+.discovered-list { max-height:320px; overflow:auto; display:grid; grid-auto-rows:max-content; align-content:start; gap:2px; min-width:0; }
+.discovered-row { display:grid; grid-template-columns:16px minmax(0,1fr) auto; min-height:52px; padding:9px; border-radius:6px; font-size:12px; line-height:1.5; box-sizing:border-box; }.discovered-row:hover { background:var(--settings-field); }
+.discovered-name { display:grid; gap:3px; min-width:0; }.discovered-name strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500; }
+.discovered-name small { display:block; overflow-wrap:anywhere; line-height:1.5; }
+.discovered-row small,.discovered-empty { color:var(--settings-muted); font-size:11px; }.discovered-row.added { cursor:default; background:var(--settings-field); }
+.discovered-row>small { white-space:nowrap; }.discovered-row:focus-within { outline:1px solid #007acc; outline-offset:-1px; }
 .discovered-footer { padding-top:12px; border-top:1px solid var(--settings-line); flex-wrap:wrap; }
 .discovered-footer button { border:0; border-radius:6px; padding:8px 13px; background:var(--settings-text); color:var(--settings-bg, #fff); cursor:pointer; font-size:12px; }
 .discovered-footer button:disabled { opacity:.4; cursor:default; } input:focus-visible,button:focus-visible { outline:2px solid #007acc; outline-offset:2px; }

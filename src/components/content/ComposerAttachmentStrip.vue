@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { ComposerAttachment } from '../../composables/useComposerAttachments'
-import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
+import FileTypeIcon from './FileTypeIcon.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 
 defineProps<{
@@ -32,7 +32,7 @@ function statusLabel(attachment: ComposerAttachment): string {
         <img :src="attachment.previewUrl" :alt="attachment.name" />
       </div>
       <div v-else class="composer-attachment-icon" aria-hidden="true">
-        <IconTablerFilePencil />
+        <FileTypeIcon :name="attachment.name" :mime-type="attachment.mimeType" />
       </div>
       <div class="composer-attachment-copy" role="button" tabindex="0" :aria-label="`预览 ${attachment.name}`" @click="emit('preview', attachment)" @keydown.enter.prevent="emit('preview', attachment)" @keydown.space.prevent="emit('preview', attachment)">
         <strong :title="attachment.name">{{ attachment.name }}</strong>

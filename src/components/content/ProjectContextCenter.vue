@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { deleteProjectContext, listProjectContext, saveProjectContext } from '../../api/plcBridge'
 import type { ProjectContextRecord } from '../../api/plcBridge'
+import { normalizePathForUi } from '../../pathUtils'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
 
@@ -58,7 +59,7 @@ onMounted(() => { void reload() })
 
 <template>
   <section class="context-center">
-    <header class="context-header"><div><p class="context-eyebrow">PROJECT CONTEXT</p><h1>{{ projectName || '当前项目' }}</h1><p>{{ projectPath || '选择项目后即可管理项目级记忆和知识。' }}</p></div><IconTablerBolt class="context-mark" /></header>
+    <header class="context-header"><div><p class="context-eyebrow">PROJECT CONTEXT</p><h1>{{ projectName || '当前项目' }}</h1><p>{{ normalizePathForUi(projectPath) || '选择项目后即可管理项目级记忆和知识。' }}</p></div><IconTablerBolt class="context-mark" /></header>
     <div class="context-tabs"><button :class="{ active: tab === 'memory' }" type="button" @click="tab = 'memory'">项目记忆 <span>{{ records.filter((record) => record.kind !== 'knowledge').length }}</span></button><button :class="{ active: tab === 'knowledge' }" type="button" @click="tab = 'knowledge'">项目知识库 <span>{{ records.filter((record) => record.kind === 'knowledge').length }}</span></button><span class="context-tab-spacer" /><button type="button" @click="startNew">新建</button><button v-if="tab === 'knowledge'" type="button" @click="fileInput?.click()">导入文本</button><input ref="fileInput" hidden type="file" accept=".md,.txt,.json,.html,.htm,.st,.py,.js,.ts,.tsx,.vue,.csv,.xml,.yaml,.yml" @change="importTextFile" /></div>
     <div class="context-layout">
       <div class="context-list">

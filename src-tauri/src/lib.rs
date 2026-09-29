@@ -3611,14 +3611,14 @@ fn valid_project_context_id(value: &str) -> bool {
         && value.chars().all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn list_project_context(project_path: String) -> Result<Vec<ProjectContextRecord>, AppError> {
     tauri::async_runtime::spawn_blocking(move || project_context_records(&project_path))
         .await
         .map_err(|error| AppError::Internal(format!("读取项目上下文任务未完成：{error}")))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn save_project_context(
     project_path: String,
     id: Option<String>,
@@ -3658,7 +3658,7 @@ async fn save_project_context(
     }).await.map_err(|error| AppError::Internal(format!("保存项目上下文任务未完成：{error}")))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn delete_project_context(project_path: String, id: String) -> Result<(), AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         if !valid_project_context_id(&id) {
@@ -11310,6 +11310,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_context_commands_create_update_and_delete_knowledge() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let project = tempfile::tempdir().unwrap();
+            let path = project.path().to_string_lossy().into_owned();
+            assert!(list_project_context(path.clone()).await.unwrap().is_empty());
+            let saved = save_project_context(path.clone(), None, "knowledge".into(), "协议".into(), "状态字只读".into()).await.unwrap();
+            assert_eq!(list_project_context(path.clone()).await.unwrap()[0].content, "状态字只读");
+            save_project_context(path.clone(), Some(saved.id.clone()), "knowledge".into(), "协议".into(), "状态字不可写".into()).await.unwrap();
+            assert_eq!(list_project_context(path.clone()).await.unwrap()[0].content, "状态字不可写");
+            delete_project_context(path.clone(), saved.id).await.unwrap();
+            assert!(list_project_context(path.clone()).await.unwrap().is_empty());
+            let (_, directory) = project_context_memory_root(&path).unwrap();
+            fs::remove_dir(directory).unwrap();
+        });
+    }
     use std::fs;
 
     #[test]
