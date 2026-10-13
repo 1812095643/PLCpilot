@@ -8,6 +8,8 @@ pub fn tools()->Vec<McpTool>{vec![
     McpTool{server_id:BUILTIN_SERVER_ID.into(),name:"document_edit".into(),description:Some("对已读取的文档按对象 ID 局部编辑并保存，默认等待审批。必须提交 document_inspect 返回的 document_id 和 version。replace_text: target/before/after；set_cell: sheet/address/value/formula；replace_image: target/path。不重建原文档，外部变化或未保存的人工修改会阻止写入。".into()),input_schema:json!({"type":"object","properties":{"document_id":{"type":"string"},"version":{"type":"string"},"operations":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","properties":{"op":{"type":"string","enum":["replace_text","set_cell","replace_image"]},"target":{"type":"string"},"before":{"type":"string"},"after":{"type":"string"},"sheet":{"type":"string"},"address":{"type":"string"},"value":{},"formula":{"type":"string"},"path":{"type":"string"}},"required":["op"]}}},"required":["document_id","version","operations"],"additionalProperties":false})}
 ]}
 
+fn non_empty_argument<'a>(args:&'a Value,key:&str)->Option<&'a str>{args.get(key).and_then(Value::as_str).map(str::trim).filter(|value|!value.is_empty())}
+
 pub async fn allowed_path(state:&AppState,path:&str)->Result<String,AppError>{
     let canonical=dunce::canonicalize(path).ok();
     if let Some(candidate)=canonical.as_ref(){
@@ -24,13 +26,27 @@ fn summary(node:&DocumentNode,depth:usize)->Value{
 }
 
 pub async fn inspect(state:&AppState,args:Value)->Result<ToolCallResult,AppError>{
-    let snapshot=if let Some(id)=args["document_id"].as_str(){document_get(id.into(),state.document_scope.clone())?}else{
+    // 模型经常会同时带上空的 document_id 和真实 path。空字符串不代表已打开的
+    // 文档，必须回退到 path 打开，否则会把一次合法的首次读取误判成“文件标签已关闭”。
+    let snapshot=if let Some(id)=non_empty_argument(&args,"document_id"){document_get(id.into(),state.document_scope.clone())?}else{
         let path=args["path"].as_str().ok_or_else(||error("请提供文档 path 或 document_id。"))?;
         let path=allowed_path(state,path).await?;
         document_open(state.document_scope.clone(),Some(path),None).await?
     };
-    let nodes=if let Some(target)=args["target"].as_str(){vec![summary(patch::find_node(&snapshot.nodes,target).ok_or_else(||error("对象不存在，请重新读取结构。"))?,2)]}else{snapshot.nodes.iter().take(100).map(|n|summary(n,0)).collect()};
+    let nodes=if let Some(target)=non_empty_argument(&args,"target"){vec![summary(patch::find_node(&snapshot.nodes,target).ok_or_else(||error("对象不存在，请重新读取结构。"))?,2)]}else{snapshot.nodes.iter().take(100).map(|n|summary(n,0)).collect()};
     Ok(crate::json_content(&json!({"document_id":snapshot.id,"version":snapshot.version,"path":snapshot.path,"kind":snapshot.kind,"dirty":snapshot.dirty,"warnings":snapshot.warnings,"node_count":snapshot.nodes.len(),"nodes":nodes}),false))
+}
+
+#[cfg(test)]
+mod tests{
+    use super::non_empty_argument;
+    use serde_json::json;
+
+    #[test]
+    fn empty_document_id_does_not_mask_path(){
+        assert_eq!(non_empty_argument(&json!({"document_id":"","path":"C:/资料/说明.docx"}),"document_id"),None);
+        assert_eq!(non_empty_argument(&json!({"document_id":" doc-1 "}),"document_id"),Some("doc-1"));
+    }
 }
 
 pub async fn propose(state:&AppState,mut args:Value)->Result<PendingChangeSummary,AppError>{

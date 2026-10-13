@@ -213,6 +213,31 @@ function extractHttpStatus(value) {
   return Number.isFinite(status) ? status : null;
 }
 
+// 供应商/中转层可能在响应已经开始后才断开 SSE。Pi 的默认分类只覆盖
+// 常见 HTTP 状态和部分网络错误；这些网关错误也必须进入同一条 AgentSession
+// 重试链路。重试前 Pi 会保留原始失败消息，并用 context_edit 将它从下一次
+// provider 上下文中省略，避免把半截工具参数再次交给模型或执行层。
+function isTransientStreamError(value) {
+  const text = String(value ?? "").toLowerCase();
+  if (!text) return false;
+  if (/context[_ ]?length|too many tokens|insufficient_quota|quota exceeded|billing|invalid[_ ]request|policy/.test(text)) return false;
+  return [
+    "upstream_stream_read_error",
+    "upstream_http2_stream_error",
+    "stream_read_error",
+    "stream closed before response.completed",
+    "idle timeout waiting for sse",
+    "response stream was interrupted",
+    "und_err_socket",
+    "socket hang up",
+    "econnreset",
+    "connection reset",
+    "connection closed",
+    "fetch failed",
+    "network error",
+  ].some((marker) => text.includes(marker));
+}
+
 function formatRetryDelay(delayMs) {
   return delayMs >= 1000 ? `${(delayMs / 1000).toFixed(1)} 秒` : `${delayMs} 毫秒`;
 }
@@ -850,15 +875,16 @@ async function ensureSession(config) {
     globalThis.fetch = retryAwareFetch;
   }
 
-  // Pi 0.84 的通用分类覆盖 408/409/429/5xx 和连接错误，但网关暂时路由
-  // 不到模型时常见的 404 没有进入同一条恢复链路。扩展实例方法只补这
-  // 一个状态码，具体预算、退避、可中止等待和历史处理仍完全由 Pi 实现。
+  // 补齐 Pi 默认分类未识别的网关断流与 404；预算、退避、可中止等待、
+  // 失败上下文省略和当前轮次续接仍由 Pi 原生 AgentSession 负责。
   const originalIsRetryableError = activeSession._isRetryableError?.bind(activeSession);
   if (originalIsRetryableError) {
     activeSession._isRetryableError = (message) => {
       if (originalIsRetryableError(message)) return true;
-      return message?.stopReason === "error"
-        && /\b404\b/.test(String(message.errorMessage ?? ""));
+      return message?.stopReason === "error" && (
+        /\b404\b/.test(String(message.errorMessage ?? ""))
+        || isTransientStreamError(message.errorMessage)
+      );
     };
   }
 

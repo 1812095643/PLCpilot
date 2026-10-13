@@ -1,3 +1,13 @@
+0.1.21 修复上游响应流中断后的任务续接和文档读取参数。
+
+- upstream_stream_read_error、upstream_http2_stream_error、stream_read_error 等网关断流进入 Pi 原生重试链路，按设置退避等待，默认最多额外重试五次。
+- 重连期间显示恢复状态并保留原始会话；失败的半截工具参数不执行，也不进入下一次模型上下文，已完成的工具结果继续保留。
+- 修复 document_inspect 首次读取时携带空 document_id 或空 target 导致“文件标签已关闭”或“对象不存在”；正确按真实 path 打开并读取文档结构。
+- 内置提示约定优先使用 document_inspect → document_edit 局部修改 Word、Excel、PPT、PDF，保留已有内容和格式。
+- 发布前逐项验证三种 Responses 断流错误、审批续接、工具结果保留、五次重试上限及 DOCX 原文件修改保存。
+
+安装版和便携版继续包含 Node.js、Python、PDFium 和内置 Skills。更新保留模型、凭据、项目和会话记录。
+
 0.1.20 精简会话与项目上下文管理界面，统一到设置页面。
 
 - 会话管理、项目上下文移入设置分类，主侧栏不再重复提供入口；斜杠命令继续直达对应设置。

@@ -70,6 +70,20 @@ fn pdf_reads_renders_and_edits_real_text_objects(){
     let output=pdf::apply(&original,&[DocumentOperation::ReplaceText{target:pages[0].children[0].id.clone(),before:"Hello Pilot".into(),after:"Hello PLC".into()}]).unwrap();assert!(pdf::read(&output).unwrap()[0].text.contains("Hello PLC"));
 }
 
+#[tokio::test]
+async fn agent_inspects_word_with_empty_id_and_target_then_edits_original(){
+    let root=tempfile::tempdir().unwrap();let path=root.path().join("文档.docx");fs::write(&path,docx()).unwrap();
+    let state=crate::AppState::new(crate::RuntimeState::default());let scope=state.document_scope.clone();
+    let opened=document_open(scope.clone(),Some(path.to_string_lossy().into_owned()),None).await.unwrap();
+    let result=agent::inspect(&state,json!({"path":path,"document_id":"","target":""})).await.unwrap();
+    let inspected:serde_json::Value=serde_json::from_str(result.content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(inspected["document_id"],opened.id);assert_eq!(inspected["kind"],"docx");assert_eq!(inspected["nodes"][0]["text"],"设备温度为 20 度。");
+    let edited=document_apply(opened.id.clone(),scope.clone(),opened.version,vec![DocumentOperation::ReplaceText{target:opened.nodes[0].id.clone(),before:"20".into(),after:"25".into()}]).await.unwrap();
+    let saved=document_save(edited.id,scope.clone(),edited.version).await.unwrap();
+    assert_eq!(docx::read(&mut ooxml::Package::open(&fs::read(&path).unwrap()).unwrap()).unwrap()[0].text,"设备温度为 25 度。");
+    document_close(saved.id,scope).unwrap();
+}
+
 #[test]
 fn html_is_classified_as_previewable_source(){
     let root=tempfile::tempdir().unwrap();let path=root.path().join("preview.html");

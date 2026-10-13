@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fileMarkdownLink, attachmentPromptText } from "./file-output.mjs";
+import { FILE_OUTPUT_GUIDANCE, fileMarkdownLink, attachmentPromptText } from "./file-output.mjs";
 import { nextMarkdownLink, parseMarkdownLink } from "../src/utils/markdownLinks.ts";
 import { classifyLinkTarget } from "../src/utils/linkTarget.ts";
 
@@ -26,4 +26,10 @@ test("长路径前缀被规范化；未知路径、网址和错误附件不会�
   assert.match(prompt, /读取中断/);
   assert.doesNotMatch(prompt, /旧正文/);
   assert.match(prompt, /markdown_link/);
+});
+
+test("文档交付提示要求结构化 Office 编辑链路", () => {
+  assert.match(FILE_OUTPUT_GUIDANCE, /document_inspect/);
+  assert.match(FILE_OUTPUT_GUIDANCE, /document_edit/);
+  assert.match(FILE_OUTPUT_GUIDANCE, /不要用 write、propose_write 或 apply_patch/);
 });
