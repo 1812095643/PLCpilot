@@ -26,7 +26,7 @@ if (!existsSync(archive)) {
   await writeFile(archive, Buffer.from(await response.arrayBuffer()))
 }
 if (createHash('sha256').update(await readFile(archive)).digest('hex') !== checksum) throw new Error('PDFium SHA256 mismatch')
-execFileSync(process.platform === 'win32' ? 'tar.exe' : 'tar', ['-xf', archive, '-C', cache], { windowsHide: true })
+execFileSync(process.platform === 'win32' ? join(process.env.SystemRoot, 'System32', 'tar.exe') : 'tar', ['-xf', archive, '-C', cache], { windowsHide: true })
 const filename = library.split('/').at(-1)
 await copyFile(join(cache, library), join(target, filename))
 for (const entry of await readdir(cache, { withFileTypes: true })) {

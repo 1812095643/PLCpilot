@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm, readFile, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, mkdir, writeFile, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -180,7 +180,7 @@ test("Pi edit 可读取工作目录外的附件并进入统一写入审批", asy
   host.send({ ...host.config, cwd: workspace });
   const call = await host.waitFor((event) => event.type === "tool_request");
   assert.equal(call.tool_name, "propose_write");
-  assert.equal(call.arguments.path, externalPath);
+  assert.equal(call.arguments.path, await realpath(externalPath));
   assert.equal(call.arguments.expected, "before");
   assert.equal(call.arguments.content, "after");
   assert.equal(await readFile(externalPath, "utf8"), "before");

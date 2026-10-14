@@ -46,6 +46,7 @@ jobs:
         with:
           workspaces: src-tauri -> target
           key: ${{ matrix.platform }}
+          cache-on-failure: true
       - uses: actions/cache@v4
         with:
           path: tmp/plc-pilot-runtime-cache

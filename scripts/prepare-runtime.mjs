@@ -9,7 +9,7 @@ const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const runtimeRoot = join(projectRoot, 'runtime-stage')
 const archiveRoot = join(projectRoot, 'tmp', 'plc-pilot-runtime-cache')
 const windows = process.platform === 'win32'
-const tar = windows ? 'tar.exe' : 'tar'
+const tar = windows ? join(process.env.SystemRoot, 'System32', 'tar.exe') : 'tar'
 const nodeSource = process.env.PLC_PILOT_NODE_SOURCE || process.execPath
 const nodeSourceRoot = dirname(nodeSource)
 const pipWheel = join(archiveRoot, 'pip-26.0.1-py3-none-any.whl')
