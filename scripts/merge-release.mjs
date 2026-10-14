@@ -1,11 +1,16 @@
 import { createReadStream } from 'node:fs'
 import { readFile, writeFile, stat } from 'node:fs/promises'
-import { createHash } from 'node:crypto'
+import { createHash, createPublicKey, verify } from 'node:crypto'
 import { basename, join, resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
 const directory = resolve(process.argv[2] || join(root, 'release-stage'))
 const { version } = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
+const configuration = JSON.parse(await readFile(join(root, 'src-tauri/tauri.conf.json'), 'utf8'))
+const keyText = Buffer.from(configuration.plugins.updater.pubkey, 'base64').toString('utf8').trim().split(/\r?\n/)
+const rawKey = Buffer.from(keyText[1], 'base64')
+if (rawKey.length !== 42 || rawKey.subarray(0, 2).toString() !== 'Ed') throw new Error('Invalid updater public key')
+const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), rawKey.subarray(10)]), format: 'der', type: 'spki' })
 const expected = ['windows-x86_64', 'darwin-x86_64', 'darwin-aarch64', 'linux-x86_64']
 const manifest = { version, notes: (await readFile(join(root, 'release-notes.md'), 'utf8')).trim(), pub_date: new Date().toISOString(), platforms: {} }
 const checksums = new Map()
@@ -17,10 +22,16 @@ for (const platform of expected) {
     if (basename(item.name) !== item.name || checksums.has(item.name)) throw new Error(`Invalid or duplicate artifact: ${item.name}`)
     const file = join(directory, item.name)
     const hash = createHash('sha256')
-    for await (const chunk of createReadStream(file)) hash.update(chunk)
+    const signedHash = createHash('blake2b512')
+    for await (const chunk of createReadStream(file)) { hash.update(chunk); signedHash.update(chunk) }
     const sha256 = hash.digest('hex')
     if (sha256 !== item.sha256 || (await stat(file)).size !== item.size) throw new Error(`Artifact mismatch: ${item.name}`)
-    if (!(await readFile(`${file}.sig`, 'utf8')).trim()) throw new Error(`Artifact is unsigned: ${item.name}`)
+    const signatureText = (await readFile(`${file}.sig`, 'utf8')).trim()
+    const lines = Buffer.from(signatureText, 'base64').toString('utf8').trim().split(/\r?\n/)
+    const signature = Buffer.from(lines[1] || '', 'base64')
+    if (signature.length !== 74 || signature.subarray(0, 2).toString() !== 'ED' || !signature.subarray(2, 10).equals(rawKey.subarray(2, 10))) throw new Error(`Invalid signing identity: ${item.name}`)
+    if (!verify(null, signedHash.digest(), publicKey, signature.subarray(10))) throw new Error(`Artifact signature failed: ${item.name}`)
+    if (!lines[2]?.startsWith('trusted comment: ') || !verify(null, Buffer.concat([signature.subarray(10), Buffer.from(lines[2].slice(17))]), publicKey, Buffer.from(lines[3] || '', 'base64'))) throw new Error(`Trusted comment signature failed: ${item.name}`)
     checksums.set(item.name, sha256)
   }
   for (const [key, asset] of Object.entries(part.platforms)) {

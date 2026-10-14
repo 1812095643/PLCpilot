@@ -11890,6 +11890,7 @@ mod tests {
     fn selected_skill_is_present_in_request_prompt() {
         let request = AgentRequest {
             message: "审查互锁".to_string(),
+            workbench_mode: Some(workbench::WorkbenchMode::Codesys),
             skills: vec!["builtin://plc-safety".to_string()],
             ..AgentRequest::default()
         };
