@@ -112,6 +112,15 @@ export type UiRetryPayload = {
   responseAnnotations: UiResponseTextAnnotation[]
 }
 
+/** 同一用户轮次内的可切换回复版本；只保存正式正文，不重复渲染后台过程。 */
+export type UiResponseVariant = {
+  id: string
+  text: string
+  model?: string
+  reasoningEffort?: ReasoningEffort
+  createdAt: string
+}
+
 export type UiMessage = {
   imageGeneration?: import('../api/imageGeneration').ImageGenerationProgress
   id: string
@@ -151,6 +160,10 @@ export type UiMessage = {
   activityDurationMs?: number
   /** 失败轮次的原始请求参数，仅 turnError 消息使用。 */
   retryPayload?: UiRetryPayload
+  /** 同一轮重试/重新生成得到的多个正式回复。 */
+  responseVariants?: UiResponseVariant[]
+  /** 当前展示的回复版本下标。 */
+  activeResponseVariant?: number
 }
 
 export type UiLiveOverlay = {

@@ -20,7 +20,7 @@ pub fn tools() -> Vec<McpTool> {
             description: Some("读取 Excel、Word、PowerPoint、PDF 文件正文；返回真实解析出的文本。".into()),
             input_schema: json!({
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "当前工作目录内的文件路径"}},
+                "properties": {"path": {"type": "string", "description": "本机文件路径；支持工作目录外的绝对路径"}},
                 "required": ["path"],
                 "additionalProperties": false
             }),
@@ -32,7 +32,7 @@ pub fn tools() -> Vec<McpTool> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "当前工作目录内的目标文件路径"},
+                    "path": {"type": "string", "description": "本机目标文件路径；支持工作目录外和尚未创建的输出目录"},
                     "operation": {"type": "string", "enum": ["create", "overwrite"], "default": "overwrite"},
                     "content": {"type": "string", "description": "纯文本内容；适用于 Word/PDF，也可作为 Excel 单表 TSV"},
                     "paragraphs": {"type": "array", "items": {"type": "string"}},
@@ -52,7 +52,8 @@ pub async fn read(state: &AppState, arguments: Value) -> Result<ToolCallResult, 
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Project("read_office_document 需要 path。".into()))?;
     let project = state.inner.lock().await.project.clone();
-    let (path, relative) = resolve_project_file(&project, requested, false)?;
+    let path = crate::file_access::resolve_file(&project, requested, false)?;
+    let relative = path.to_string_lossy().into_owned();
     let file = attachments::read_local_file(&path).map_err(AppError::Project)?;
     if let Some(error) = file.error {
         return Err(AppError::Project(format!("读取 {relative} 未完成：{error}")));
@@ -72,7 +73,8 @@ pub async fn propose(state: &AppState, mut arguments: Value) -> Result<PendingCh
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Project("write_office_document 需要 path。".into()))?;
-    let (path, relative) = resolve_project_file(&project, requested, true)?;
+    let path = crate::file_access::resolve_file(&project, requested, true)?;
+    let relative = path.to_string_lossy().into_owned();
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -298,5 +300,24 @@ mod tests {
         let pptx = render_pptx(&json!({"slides":[{"title":"A","body":"B"}]})).expect("生成 pptx");
         assert!(zip::ZipArchive::new(Cursor::new(pptx)).expect("读取 pptx 包").by_name("ppt/slides/slide1.xml").is_ok());
         assert!(render_pdf(&json!({"content":"hello"})).expect("生成 pdf").starts_with(b"%PDF-1.4"));
+    }
+
+    #[tokio::test]
+    async fn external_office_output_can_be_created_and_read_without_a_plc_project() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output/nested/book.xlsx");
+        let state = AppState::new(RuntimeState::default());
+        let summary = propose(&state, json!({"path": output, "operation": "create", "sheets": [{"name": "数据", "rows": [["温度", 42]]}]})).await.unwrap();
+        assert_eq!(summary.status, "pending");
+        assert!(!output.exists());
+        let pending = state.inner.lock().await.pending[&summary.id].clone();
+        assert!(!apply(&pending).unwrap().is_error);
+        let content = read(&state, json!({"path": output})).await.unwrap();
+        assert!(content.content[0]["text"].as_str().unwrap().contains("42"));
+        for tool in ["read_document", "read_office_document"] {
+            let result = crate::call_builtin_tool(&state, tool, json!({"path": output})).await.unwrap();
+            assert!(!result.is_error);
+            assert!(result.content[0]["text"].as_str().unwrap().contains("42"));
+        }
     }
 }

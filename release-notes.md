@@ -1,3 +1,15 @@
+0.1.22 修复目录外文件访问与会话重试，新增 macOS、Linux 发行包。
+
+- 普通文档、Office、文本编辑和补丁支持工作目录外的附件及输出路径；审批模式批准后写入，完全访问模式自动执行，保留文件变化检查。
+- 手动重试留在同一会话，不再新增“重试本轮”会话；回复提供左右版本切换。
+- GitHub Actions 并行构建 Windows x64、Mac Apple 芯片、Mac Intel 和 Linux x64，全部成功后统一发布安装包、签名、SHA-256 与自动更新清单。
+- 各平台内置对应架构的 Node.js、Python、Office 核心依赖和 PDFium，不依赖开发电脑环境；Mac/Linux 命令使用 Bash。
+- OfficeCLI 按系统下载对应版本，支持外部文件；系统链接使用各平台默认浏览器或应用打开。
+- Windows 提供 EXE、MSI 和便携 ZIP；Mac 提供 DMG 与更新归档；Linux 提供 AppImage 与 DEB。Mac 包使用本地签名，尚未进行苹果公证；Linux DEB 用户通过包管理器更新，AppImage 支持软件内更新。
+- CODESYS、STone 厂商程序的本机连接仍要求 Windows；Mac/Linux 可使用自由聊天、文件与文档工具、Skills 及兼容的 MCP 服务。
+
+---
+
 0.1.21 修复上游响应流中断后的任务续接和文档读取参数。
 
 - upstream_stream_read_error、upstream_http2_stream_error、stream_read_error 等网关断流进入 Pi 原生重试链路，按设置退避等待，默认最多额外重试五次。

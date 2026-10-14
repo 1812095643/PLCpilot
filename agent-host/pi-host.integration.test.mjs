@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -133,6 +133,75 @@ test("Pi 0.87 宿主真实流式、审批等待续接、附件链接和恢复后
   const resumed = await host.waitFor((event) => event.type === "result" || event.type === "error", from);
   assert.equal(resumed.type, "result", JSON.stringify(resumed));
   assert.equal(resumed.session.session_id, result.session.session_id);
+});
+
+test("重新生成沿用同一 JSONL 会话树，不创建新的会话文件", async (t) => {
+  const host = await fixture(t, async (requests, response) => {
+    const text = requests.length === 1 ? "第一版回复" : "第二版回复";
+    stream(response, { role: "assistant", content: text });
+    stream(response, {}, "stop");
+    done(response);
+  });
+  host.send(host.config);
+  const first = await host.waitFor((event) => event.type === "result" || event.type === "error");
+  assert.equal(first.type, "result", JSON.stringify(first));
+  const from = host.events.length;
+  host.send({
+    ...host.config,
+    request_id: "retry-same-session",
+    session_file: first.session.session_file,
+    retry_turn_index: 0,
+    message: host.config.message,
+  });
+  const second = await host.waitFor((event) => event.type === "result" || event.type === "error", from);
+  assert.equal(second.type, "result", JSON.stringify(second));
+  assert.equal(second.text, "第二版回复");
+  assert.equal(second.session.session_id, first.session.session_id);
+  assert.equal(second.session.session_file, first.session.session_file);
+});
+
+test("Pi edit 可读取工作目录外的附件并进入统一写入审批", async (t) => {
+  let externalPath;
+  const host = await fixture(t, async (requests, response) => {
+    if (requests.length === 1) {
+      stream(response, { role: "assistant", tool_calls: [{ index: 0, id: "external-edit", type: "function", function: { name: "edit", arguments: JSON.stringify({ path: externalPath, oldText: "before", newText: "after" }) } }] });
+      stream(response, {}, "tool_calls");
+      done(response);
+      return;
+    }
+    stream(response, { role: "assistant", content: "附件修改已处理" });
+    stream(response, {}, "stop");
+    done(response);
+  });
+  const workspace = join(host.root, "workspace");
+  externalPath = join(host.root, "attachment.txt");
+  await mkdir(workspace);
+  await writeFile(externalPath, "before");
+  host.send({ ...host.config, cwd: workspace });
+  const call = await host.waitFor((event) => event.type === "tool_request");
+  assert.equal(call.tool_name, "propose_write");
+  assert.equal(call.arguments.path, externalPath);
+  assert.equal(call.arguments.expected, "before");
+  assert.equal(call.arguments.content, "after");
+  assert.equal(await readFile(externalPath, "utf8"), "before");
+  host.send({ type: "tool_result", request_id: call.request_id, decision: "executed", content: [{ type: "text", text: "写入结果已确认" }], is_error: false });
+  const result = await host.waitFor((event) => event.type === "result" || event.type === "error");
+  assert.equal(result.type, "result", JSON.stringify(result));
+});
+
+test("审批后的命令使用当前系统原生命令工具执行", async (t) => {
+  const host = await fixture(t, async () => { throw new Error("命令宿主不应请求模型"); });
+  host.send({ type: "execute_approved", arguments: {
+    cwd: host.root,
+    command: process.platform === "win32" ? "Write-Output 'native-command-ok'" : "printf 'native-command-ok\\n'",
+    timeout: 5,
+    record_in_session: false,
+  } });
+  const result = await host.waitFor((event) => event.type === "result" || event.type === "error");
+  assert.equal(result.type, "result", JSON.stringify(result));
+  assert.equal(result.is_error, false);
+  assert.match(JSON.stringify(result.content), /native-command-ok/);
+  assert.equal(host.requests.length, 0);
 });
 
 test("Pi 0.87 finishTurn 阻止被拒绝工具继续运行，同时保留笔记边界", async (t) => {

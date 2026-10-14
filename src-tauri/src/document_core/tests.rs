@@ -84,6 +84,25 @@ async fn agent_inspects_word_with_empty_id_and_target_then_edits_original(){
     document_close(saved.id,scope).unwrap();
 }
 
+#[tokio::test]
+async fn agent_reads_and_approves_external_word_without_opening_preview_first(){
+    let root=tempfile::tempdir().unwrap();let workspace=root.path().join("workspace");let external=root.path().join("attachments");
+    fs::create_dir_all(&workspace).unwrap();fs::create_dir_all(&external).unwrap();
+    let path=external.join("用户附件.docx");let original=docx();fs::write(&path,&original).unwrap();
+    let mut runtime=crate::RuntimeState::default();runtime.project=crate::resolve_project_path(&workspace.to_string_lossy()).unwrap();
+    let mut state=crate::AppState::new(runtime);state.document_scope=uuid::Uuid::new_v4().to_string();
+    let inspected=agent::inspect(&state,json!({"path":path})).await.unwrap();
+    let details:serde_json::Value=serde_json::from_str(inspected.content[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(details["kind"],"docx");assert_eq!(details["nodes"][0]["text"],"设备温度为 20 度。");
+    let summary=agent::propose(&state,json!({"document_id":details["document_id"],"version":details["version"],"operations":[{"op":"replace_text","target":details["nodes"][0]["id"],"before":"20","after":"25"}]})).await.unwrap();
+    assert_eq!(summary.status,"pending");assert_eq!(fs::read(&path).unwrap(),original);
+    let pending=state.inner.lock().await.pending[&summary.id].clone();
+    assert!(!agent::apply_approved(&pending).await.unwrap().is_error);
+    assert_eq!(docx::read(&mut ooxml::Package::open(&fs::read(&path).unwrap()).unwrap()).unwrap()[0].text,"设备温度为 25 度。");
+    assert!(document_get(details["document_id"].as_str().unwrap().into(),"another-thread".into()).is_err());
+    document_close(details["document_id"].as_str().unwrap().into(),state.document_scope).unwrap();
+}
+
 #[test]
 fn html_is_classified_as_previewable_source(){
     let root=tempfile::tempdir().unwrap();let path=root.path().join("preview.html");

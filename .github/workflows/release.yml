@@ -1,4 +1,4 @@
-name: 发布 Windows 安装包与更新
+name: 发布 Windows、macOS 与 Linux
 
 on:
   push:
@@ -6,80 +6,115 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: windows-latest
-    timeout-minutes: 60
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: windows-x86_64
+            bundles: nsis,msi
+          - runner: macos-15
+            platform: darwin-aarch64
+            bundles: app,dmg
+          - runner: macos-15-intel
+            platform: darwin-x86_64
+            bundles: app,dmg
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+            bundles: appimage,deb
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     defaults:
       run:
-        shell: pwsh
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '22.19.0'
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
-      - name: 核对发布版本
+          key: ${{ matrix.platform }}
+      - uses: actions/cache@v4
+        with:
+          path: tmp/plc-pilot-runtime-cache
+          key: runtime-${{ matrix.platform }}-${{ hashFiles('scripts/prepare-runtime.mjs', 'scripts/prepare-documents.mjs', 'scripts/patent-runtime-requirements.txt') }}
+      - name: 安装 Linux 构建依赖
+        if: runner.os == 'Linux'
         run: |
-          $version = (Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
-          if ($env:GITHUB_REF_TYPE -ne 'tag' -or $env:GITHUB_REF_NAME -ne "v$version") { throw '请从与当前版本对应的 v 标签发布。' }
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev libfuse2 xdg-utils
+      - name: 核对发布版本
+        run: node -e 'const v=require("./package.json").version;const r=process.env.GITHUB_REF;if(r!=="refs/heads/main"&&r!=="refs/tags/v"+v)throw Error("Release requires main or its matching version tag")'
       - run: npm ci
-      - name: 验证更新保护与构建发布包
+      - name: 构建资源与验证工具链
+        run: |
+          set -euo pipefail
+          npm run build
+          node --test shared/diagnostics.test.mjs stone-mcp/test/stone.test.mjs agent-host/*.test.mjs src/utils/conversationTurns.test.mjs
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - name: 构建签名安装包
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          APPLE_SIGNING_IDENTITY: '-'
+          APPIMAGE_EXTRACT_AND_RUN: '1'
         run: |
-          if (!$env:TAURI_SIGNING_PRIVATE_KEY) { throw '请先配置 TAURI_SIGNING_PRIVATE_KEY 仓库密钥。' }
-          npm run build
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          node --test shared/diagnostics.test.mjs stone-mcp/test/stone.test.mjs agent-host/*.test.mjs src/utils/conversationTurns.test.mjs
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo test --manifest-path src-tauri/Cargo.toml --lib
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          npx tauri build --config '{"build":{"beforeBuildCommand":""}}'
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          npm run package:portable
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $version = (Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
-          npx tauri signer sign "output/PLC-Pilot-Portable-$version-win-x64.zip"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          npm run package:stone-mcp
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $stoneVersion = (Get-Content stone-mcp/package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
-          npx tauri signer sign "output/PLC-Pilot-STone-MCP-$stoneVersion.zip"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          npx tauri build --bundles '${{ matrix.bundles }}' --config '{"build":{"beforeBuildCommand":""}}'
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            npm run package:portable
+            npm run package:stone-mcp
+          fi
           node scripts/prepare-release.mjs
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: 校验打包后的内置运行时
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: node scripts/check-packaged-runtime.mjs
       - uses: actions/upload-artifact@v4
         with:
-          name: Windows-发布文件
-          path: release-stage/
+          name: ${{ matrix.platform }}
+          path: release-stage/${{ matrix.platform }}/
+          if-no-files-found: error
           retention-days: 7
-      - name: 上传完整产物后发布
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-stage
+          merge-multiple: true
+      - name: 核验各平台安装包、签名与更新清单
+        run: node scripts/merge-release.mjs release-stage
+      - name: 上传完整附件后公开发布
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          $existing = gh release view $tag --json isDraft 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            if (!(($existing | ConvertFrom-Json).isDraft)) { throw '该版本已经公开，请提升版本号后发布，避免覆盖用户正在下载的文件。' }
-          } else {
-            gh release create $tag --verify-tag --draft --title "PLC Pilot $tag" --notes-file release-notes.md
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          }
-          $version = (Get-Content package.json -Raw -Encoding UTF8 | ConvertFrom-Json).version
-          $assets = @(Get-ChildItem (Join-Path release-stage $version) -File | ForEach-Object FullName)
-          gh release upload $tag @assets --clobber
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          gh release edit $tag --draft=false --latest
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          set -euo pipefail
+          tag="v$(node -p 'require("./package.json").version')"
+          if gh release view "$tag" --json isDraft > "$RUNNER_TEMP/plc-release.json" 2>/dev/null; then
+            node -e 'if(!require(process.env.RUNNER_TEMP+"/plc-release.json").isDraft)throw Error("Release is already public; increment the version")'
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --draft --title "PLC Pilot $tag" --notes-file release-notes.md
+          fi
+          gh release upload "$tag" release-stage/*.exe release-stage/*.msi release-stage/*.zip release-stage/*.sig release-stage/*.dmg release-stage/*.tar.gz release-stage/*.AppImage release-stage/*.deb release-stage/latest.json release-stage/SHA256SUMS.txt --clobber
+          gh release edit "$tag" --draft=false --latest

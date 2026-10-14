@@ -8,11 +8,11 @@
 
 <p align="center">
   <a href="https://github.com/1812095643/PLCpilot/releases/latest"><img src="https://img.shields.io/github/v/release/1812095643/PLCpilot?display_name=tag&sort=semver" alt="最新版本"></a>
-  <a href="https://github.com/1812095643/PLCpilot/actions/workflows/release.yml"><img src="https://github.com/1812095643/PLCpilot/actions/workflows/release.yml/badge.svg" alt="Windows 发布构建"></a>
+  <a href="https://github.com/1812095643/PLCpilot/actions/workflows/release.yml"><img src="https://github.com/1812095643/PLCpilot/actions/workflows/release.yml/badge.svg" alt="跨平台发布构建"></a>
   <a href="https://github.com/1812095643/PLCpilot/releases"><img src="https://img.shields.io/github/downloads/1812095643/PLCpilot/total" alt="下载量"></a>
 </p>
 
-PLC Pilot 是一个面向工业自动化与日常开发的 Windows 桌面 AI Agent 工作台，支持 CODESYS、CAREL STone 和自由聊天三种模式。你可以用它分析与修改控制工程、检索厂商接口，也可以处理通用编程、Office 文档和文件任务。
+PLC Pilot 是一个面向工业自动化与日常开发的桌面 AI Agent 工作台，提供 Windows、macOS 和 Linux 版本，支持 CODESYS、CAREL STone 和自由聊天三种模式。你可以用它分析与修改控制工程、检索厂商接口，也可以处理通用编程、Office 文档和文件任务。CODESYS、STone 厂商程序的本机连接要求 Windows；Mac/Linux 默认进入自由聊天，可使用文档、代码、Skills 和兼容的 MCP 服务。
 
 多服务商模型、MCP、Skills、审批、会话和诊断共用一套工作流。PLC 工程师、自动化调试工程师和软件开发者可以按任务切换模式，并通过 MCP 与 Skills 扩展工具能力。
 
@@ -20,13 +20,15 @@ PLC Pilot 作为独立桌面应用运行。交互结构参考 Codex 等本地 Ag
 
 ## 下载
 
-当前稳定版本：[v0.1.21](https://github.com/1812095643/PLCpilot/releases/tag/v0.1.21)
+当前稳定版本：[v0.1.22](https://github.com/1812095643/PLCpilot/releases/tag/v0.1.22)
 
-- [Windows 安装版（EXE）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.21/PLC-Pilot-0.1.21-x64-setup.exe)：适合大多数用户。
-- [Windows 安装版（MSI）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.21/PLC-Pilot-0.1.21-x64.msi)：适合组织化部署。
-- [Windows 便携版（ZIP）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.21/PLC-Pilot-Portable-0.1.21-win-x64.zip)：完整解压后运行，不写入系统 PATH。
-- [CAREL STone MCP 独立包](https://github.com/1812095643/PLCpilot/releases/download/v0.1.21/PLC-Pilot-STone-MCP-0.1.1.zip)：需要单独运行 STone MCP 时使用。
-- [更新清单](https://github.com/1812095643/PLCpilot/releases/download/v0.1.21/latest.json) · [SHA-256 校验](https://github.com/1812095643/PLCpilot/releases/download/v0.1.21/SHA256SUMS.txt)
+- [Windows 安装版（EXE）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/PLC-Pilot-0.1.22-x64-setup.exe)：适合大多数用户。
+- [Windows 安装版（MSI）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/PLC-Pilot-0.1.22-x64.msi)：适合组织化部署。
+- [Windows 便携版（ZIP）](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/PLC-Pilot-Portable-0.1.22-win-x64.zip)：完整解压后运行，不写入系统 PATH。
+- macOS：[Apple 芯片](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/PLC-Pilot-0.1.22-macos-arm64.dmg) · [Intel](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/PLC-Pilot-0.1.22-macos-x64.dmg)。尚未进行苹果公证；首次运行请在系统隐私与安全设置中确认打开。
+- Linux x64：[AppImage](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/PLC-Pilot-0.1.22-linux-x64.AppImage) · [DEB](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/PLC-Pilot-0.1.22-linux-x64.deb)。AppImage 添加执行权限后运行，DEB 使用系统包管理器安装及更新。
+- [CAREL STone MCP 独立包](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/PLC-Pilot-STone-MCP-0.1.1.zip)：需要单独运行 STone MCP 时使用。
+- [更新清单](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/latest.json) · [SHA-256 校验](https://github.com/1812095643/PLCpilot/releases/download/v0.1.22/SHA256SUMS.txt)
 
 安装版和便携版都包含精简的 Node.js、npm/npx、Python 和 pip 运行时。首次安装第三方 MCP 或 Python 依赖时仍需要网络。CODESYS、CAREL STone 和 WebView2 属于外部软件；便携版需要系统已有 WebView2，安装版可联网补装。
 
@@ -69,7 +71,7 @@ PLC Pilot 作为独立桌面应用运行。交互结构参考 Codex 等本地 Ag
 - 支持 OpenAI Responses、OpenAI 兼容 Chat Completions、Anthropic Messages 和 Ollama。
 - 获取模型时支持勾选导入，并同步接口返回的显示名称、上下文长度、最大输出和思考档位。
 - 每个模型可单独配置上下文长度、最大输出和思考深度；对话页可快速切换已启用模型。
-- URL、模型和 Key 保存在 C 盘应用配置目录；敏感凭据使用 Windows DPAPI 保护，不写入项目文件或普通会话正文。
+- URL、模型和 Key 保存在系统应用数据目录，不写入项目文件或普通会话正文。Windows 凭据使用 DPAPI 保护；Mac/Linux 凭据文件限制为当前用户可读写。
 
 ### CODESYS 工程闭环
 
@@ -155,7 +157,7 @@ PLC Pilot 的配置、模型凭据、会话、草稿、更新状态和日志默�
 
 ### 环境
 
-- Windows，建议使用最新 WebView2 Runtime
+- Windows 10/11（需要 WebView2）、macOS 11 及以上，或具备 WebKitGTK 4.1 的 Linux 桌面环境
 - Node.js 22 或兼容的 npm 环境
 - Rust stable 和 Cargo
 - 真实 CODESYS/CAREL STone 工程操作需要对应软件和许可
@@ -211,7 +213,7 @@ shared/                    跨运行时诊断与协议测试
 
 ## 发布流程
 
-维护者发布新版本时，需要同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、锁文件和 `release-notes.md`，再推送与版本一致的 `v*` 标签。GitHub Actions 会执行类型检查、前端构建、Rust 测试、MCP 测试、Windows 安装包、MSI、便携包和 STone MCP 打包，并生成签名更新清单。
+维护者发布新版本时，需要同步更新 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、锁文件和 `release-notes.md`，再推送与版本一致的 `v*` 标签。GitHub Actions 在 Windows、Mac 两种架构和 Linux 分别执行检查、构建和包内运行时验证；全部成功后统一公开 Release，并生成跨平台签名更新清单。
 
 更新源固定为本仓库的 GitHub Release。软件内“设置 → 软件更新”和“帮助 → 检查更新”共用同一套检查、签名校验、下载、保存草稿和回滚流程。
 

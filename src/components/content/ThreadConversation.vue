@@ -550,6 +550,26 @@
                 </button>
               </div>
 
+              <div v-if="responseVariantCount(message) > 1" class="response-variant-switcher" role="group" aria-label="切换回复版本">
+                <button
+                  type="button"
+                  class="response-variant-button"
+                  :disabled="responseVariantIndex(message) <= 0"
+                  aria-label="上一份回复"
+                  title="上一份回复"
+                  @click="selectResponseVariant(message, responseVariantIndex(message) - 1)"
+                >‹</button>
+                <span class="response-variant-count">{{ responseVariantIndex(message) + 1 }} / {{ responseVariantCount(message) }}</span>
+                <button
+                  type="button"
+                  class="response-variant-button"
+                  :disabled="responseVariantIndex(message) >= responseVariantCount(message) - 1"
+                  aria-label="下一份回复"
+                  title="下一份回复"
+                  @click="selectResponseVariant(message, responseVariantIndex(message) + 1)"
+                >›</button>
+              </div>
+
               <div v-if="showMessageToolbar(message)" class="message-toolbar" :class="{ 'message-toolbar-error': isTurnErrorMessage(message) }" :data-role="message.role">
                 <span v-if="isTurnErrorMessage(message)" class="turn-error-inline-guidance">{{ turnErrorGuidance(message) }}</span>
                 <button v-if="isTurnErrorMessage(message) && message.retryPayload" type="button" class="message-action-button" :disabled="props.isTurnInProgress" aria-label="重试本轮消息" @click="emit('retry-message', message)"><IconTablerRefresh class="icon-svg" /><span>重试</span></button>
@@ -598,6 +618,7 @@
         <div class="message-row">
           <div class="message-toolbar response-toolbar" role="group" aria-label="完整回复操作">
             <button type="button" class="message-action-button" :data-copied="isMessageCopied(responseFooters.get(message.id)!)" aria-label="复制完整回复" title="复制完整回复" @click="copyMessage(responseFooters.get(message.id)!)"><IconTablerCopy class="icon-svg" /><span>{{ isMessageCopied(responseFooters.get(message.id)!) ? '已复制' : '复制' }}</span></button>
+            <button v-if="responseFooters.get(message.id)!.retryPayload" type="button" class="message-action-button" :disabled="props.isTurnInProgress" aria-label="重新生成这份回复" title="重新生成这份回复" @click="emit('retry-message', responseFooters.get(message.id)!)"><IconTablerRefresh class="icon-svg" /><span>重试</span></button>
             <button type="button" class="message-action-button" :disabled="props.isTurnInProgress" aria-label="从这次完整回复 Fork 会话" title="从这次完整回复 Fork 会话" @click="emit('fork-message', responseFooters.get(message.id)!)"><IconTablerGitFork class="icon-svg" /><span>Fork</span></button>
           </div>
         </div>
@@ -1366,6 +1387,7 @@ const emit = defineEmits<{
   'edit-message': [message: UiMessage]
   'resend-message': [message: UiMessage]
   'retry-message': [message: UiMessage]
+  'select-response-variant': [message: UiMessage, index: number]
   'fork-message': [message: UiMessage]
   notice: [message: string]
   'add-response-annotation': [annotation: UiResponseTextAnnotation]
@@ -1948,6 +1970,24 @@ function responseAnnotationsForMessage(message: UiMessage): UiResponseTextAnnota
     && annotation.selectedText.trim().length > 0
     && annotation.body.trim().length > 0
   ))
+}
+
+function responseVariantCount(message: UiMessage): number {
+  return message.role === 'assistant' ? (message.responseVariants?.length ?? 0) : 0
+}
+
+function responseVariantIndex(message: UiMessage): number {
+  const count = responseVariantCount(message)
+  if (count <= 0) return 0
+  return Math.min(Math.max(message.activeResponseVariant ?? count - 1, 0), count - 1)
+}
+
+function selectResponseVariant(message: UiMessage, index: number): void {
+  const count = responseVariantCount(message)
+  if (count <= 0) return
+  const nextIndex = Math.min(Math.max(index, 0), count - 1)
+  if (nextIndex === responseVariantIndex(message)) return
+  emit('select-response-variant', message, nextIndex)
 }
 
 function messageCopyContent(message: UiMessage): string {
@@ -4471,6 +4511,48 @@ onBeforeUnmount(() => {
 /* 工具块与正文统一由列表 gap 留白；负边距叠加会把工具后的正文挤到标题上。 */
 .conversation-response-footer .response-toolbar { margin-top:0; opacity:1; }
 .message-row:focus-within .message-toolbar { opacity:1; }
+
+.response-variant-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 7px;
+  color: var(--muted-text, #737373);
+  font-size: 10px;
+}
+
+.response-variant-button {
+  display: inline-grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease;
+}
+
+.response-variant-button:hover:not(:disabled),
+.response-variant-button:focus-visible {
+  border-color: var(--border-color, #d4d4d4);
+  background: var(--surface-muted, #f5f5f5);
+  color: var(--text-color, #1f1f1f);
+  outline: none;
+}
+
+.response-variant-button:disabled { cursor: default; opacity: .3; }
+.response-variant-count { min-width: 28px; text-align: center; }
+
+:global(.dark) .response-variant-button:hover:not(:disabled),
+:global(.dark) .response-variant-button:focus-visible {
+  border-color: #404040;
+  background: #242424;
+  color: #f5f5f5;
+}
 
 .message-row:hover .message-toolbar {
   @apply opacity-100;

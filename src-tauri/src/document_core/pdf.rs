@@ -1,9 +1,8 @@
 //! PDF 对象坐标统一为左上角原点的 pt；渲染和选框消费同一份尺寸。
-use std::{io::Cursor,path::PathBuf,sync::{Mutex,OnceLock}};
+use std::{io::Cursor,sync::{Mutex,OnceLock}};
 use pdfium_render::prelude::*;
 use serde_json::json;
 use base64::{engine::general_purpose::STANDARD,Engine};
-use tauri::Manager;
 use super::{error,AppError,DocumentNode,DocumentOperation};
 static PDFIUM:OnceLock<Pdfium>=OnceLock::new();
 static PDF_LOCK:Mutex<()>=Mutex::new(());
@@ -11,9 +10,7 @@ fn convert(e:impl std::fmt::Display)->AppError{error(format!("PDF 处理未完�
 
 pub(super) fn engine()->Result<&'static Pdfium,AppError>{
     if let Some(engine)=PDFIUM.get(){return Ok(engine)}
-    let mut paths=vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../runtime-stage/pdf/pdfium.dll")];
-    if let Some(app)=super::APP.get(){if let Ok(root)=app.path().resource_dir(){paths.insert(0,root.join("runtime/pdf/pdfium.dll"));}}
-    let path=paths.into_iter().find(|p|p.is_file()).ok_or_else(||error("PDF 运行库缺失，请修复安装或重新安装完整包。"))?;
+    let path=crate::bundled_runtime_file("runtime/pdf/pdfium.dll").ok_or_else(||error("PDF 运行库缺失，请修复安装或重新安装完整包。"))?;
     let binding=Pdfium::bind_to_library(path).map_err(convert)?;
     let _=PDFIUM.set(Pdfium::new(binding));
     PDFIUM.get().ok_or_else(||error("PDF 运行库尚未就绪。"))

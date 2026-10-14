@@ -2,7 +2,11 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum WorkbenchMode { #[default] Codesys, Chat, Stone }
+pub enum WorkbenchMode {
+    #[cfg_attr(windows, default)] Codesys,
+    #[cfg_attr(not(windows), default)] Chat,
+    Stone,
+}
 
 pub fn tool_allowed(mode: WorkbenchMode, server: &str, name: &str) -> bool {
     let codesys = server.to_lowercase().contains("codesys") || name.to_lowercase().contains("codesys")

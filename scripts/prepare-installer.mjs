@@ -3,6 +3,8 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+if (process.platform !== 'win32') process.exit(0)
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const windowsRoot = join(root, 'src-tauri/windows')
 const configuration = JSON.parse(await readFile(join(windowsRoot, 'installer-strings.json'), 'utf8'))

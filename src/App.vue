@@ -92,12 +92,19 @@ import type {
   UiMessage,
   UiMentionReference,
   UiResponseTextAnnotation,
+  UiResponseVariant,
   UiRetryPayload,
   UiThreadTokenUsage,
 } from './types/codex'
 import type { Diagnostic } from './api/plcBridge'
 
 type View = 'chat' | 'overview' | 'skills'
+
+type SubmitRunContext = {
+  /** 重新生成时沿用同一用户轮次，并把旧正式回复保留为可切换版本。 */
+  retryTurnIndex?: number
+  retryVariants?: UiResponseVariant[]
+}
 
 const snapshot = shallowRef<Snapshot>(EMPTY_SNAPSHOT)
 const appReady = shallowRef(false)
@@ -977,7 +984,72 @@ function resumeSubmitQueue(): void {
   void drainSubmitQueue()
 }
 
-async function onSubmit(payload: SubmitPayload, thread = workspace.active.value): Promise<void> {
+function createRetryPayload(
+  payload: SubmitPayload,
+  text: string,
+  attachments: UiAttachment[],
+  modelProfileId: string,
+  model: string,
+  reasoningEffort: UiRetryPayload['reasoningEffort'],
+  collaborationMode: CollaborationModeKind,
+  references: UiMentionReference[],
+  responseAnnotations: UiResponseTextAnnotation[],
+): UiRetryPayload {
+  return {
+    text,
+    modelProfileId,
+    model,
+    reasoningEffort,
+    collaborationMode,
+    skills: payload.skills,
+    attachments,
+    references,
+    responseAnnotations,
+  }
+}
+
+function attachResponseRetryMetadata(
+  thread: WorkspaceThread,
+  turnIndex: number,
+  payload: SubmitPayload,
+  text: string,
+  attachments: UiAttachment[],
+  modelProfileId: string,
+  model: string,
+  reasoningEffort: UiRetryPayload['reasoningEffort'],
+  collaborationMode: CollaborationModeKind,
+  references: UiMentionReference[],
+  responseAnnotations: UiResponseTextAnnotation[],
+  previousVariants: UiResponseVariant[] = [],
+): void {
+  const finalIndex = [...thread.messages].map((message, index) => ({ message, index })).reverse().find(({ message }) => (
+    message.role === 'assistant'
+    && message.turnIndex === turnIndex
+    && message.text.trim().length > 0
+    && !['turnError', 'turnInterrupted', 'localCommand'].includes(message.messageType || '')
+    && !(message.messageType || '').endsWith('.live')
+  ))?.index
+  if (finalIndex === undefined) return
+  const finalMessage = thread.messages[finalIndex]
+  const currentVariant: UiResponseVariant = {
+    id: newId('response-variant'),
+    text: finalMessage.text,
+    model,
+    reasoningEffort,
+    createdAt: new Date().toISOString(),
+  }
+  const variants = [...previousVariants, currentVariant]
+  thread.messages = thread.messages.map((message, index) => index === finalIndex
+    ? {
+        ...message,
+        responseVariants: variants,
+        activeResponseVariant: variants.length - 1,
+        retryPayload: createRetryPayload(payload, text, attachments, modelProfileId, model, reasoningEffort, collaborationMode, references, responseAnnotations),
+      }
+    : message)
+}
+
+async function onSubmit(payload: SubmitPayload, thread = workspace.active.value, runContext: SubmitRunContext = {}): Promise<void> {
   const { messages, isBusy, liveOverlay, pendingResponseAnnotations, streamingRequestId, streamingAssistantId, selectedModel, selectedModelProfileId, reasoningEffort, collaborationMode } = workspace.refs(thread)
   const { displayedText: streamingText, start: startTextStream, reset: resetTextStream, append: appendTextDelta, flush: flushTextStream, stop: stopTextStream } = thread.textStream
   const text = payload.text.trim()
@@ -1295,6 +1367,7 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
       clientThreadId: thread.id,
       workspacePath: thread.project.path || undefined,
       sessionFile: thread.session.session_file || undefined,
+      retryTurnIndex: runContext.retryTurnIndex,
       onEvent: onAgentStream,
     }
     const result = await runAgent(agentText, history, {
@@ -1332,6 +1405,7 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
     messages.value = [...currentMessages, ...queuedMessages]
     const finishedAt = globalThis.performance?.now?.() ?? Date.now()
     appendAgentResult(result, text, payload.skills, visibleAttachments, payload.references, responseAnnotations, finishedAt - startedAt, requestModelProfileId, requestModel, requestReasoningEffort, requestCollaborationMode, thread, nativeTurnIndex)
+    attachResponseRetryMetadata(thread, pendingTurnIndex, payload, text, visibleAttachments, requestModelProfileId, requestModel, requestReasoningEffort, requestCollaborationMode, payload.references, responseAnnotations, runContext.retryVariants)
     maybeNameTemporarySession(thread, text, visibleAttachments, firstTurn)
     pendingResponseAnnotations.value = []
     // 正文和工具轨迹已经落地，连接检查/MCP 状态刷新不应继续占住发送按钮。
@@ -1364,17 +1438,9 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
         sessionTurnIndex: nativeTurnIndex ?? null,
         turnId: `turn-${pendingTurnIndex}`,
         turnIndex: pendingTurnIndex,
-        retryPayload: {
-          text,
-          modelProfileId: requestModelProfileId,
-          model: requestModel,
-          reasoningEffort: requestReasoningEffort,
-          collaborationMode: requestCollaborationMode,
-          skills: payload.skills,
-          attachments,
-          references: payload.references,
-          responseAnnotations,
-        } satisfies UiRetryPayload,
+        retryPayload: createRetryPayload(payload, text, attachments, requestModelProfileId, requestModel, requestReasoningEffort, requestCollaborationMode, payload.references, responseAnnotations),
+        responseVariants: runContext.retryVariants?.length ? runContext.retryVariants : undefined,
+        activeResponseVariant: runContext.retryVariants?.length ? runContext.retryVariants.length - 1 : undefined,
       },
       ...queuedMessages,
     ]
@@ -1388,8 +1454,8 @@ async function onSubmit(payload: SubmitPayload, thread = workspace.active.value)
       references: payload.references,
       responseAnnotations,
     })
-    // Rust/Pi 可能已经创建了包含失败轮次的 JSONL；刷新快照拿到 session_file，
-    // 让后续手动重试可以从失败用户消息之前建立干净分支。
+    // Rust/Pi 可能已经把失败轮次写入当前 JSONL；刷新快照拿到 session_file，
+    // 让后续手动重试可以在同一会话树中回到该轮父节点继续生成。
     try {
       await refresh()
     } catch {
@@ -1603,7 +1669,7 @@ async function onResendMessage(message: UiMessage): Promise<void> {
 
 async function onRetryMessage(message: UiMessage): Promise<void> {
   const retryPayload = message.retryPayload
-  if (message.messageType !== 'turnError' || !retryPayload || isBusy.value) return
+  if (!retryPayload || isBusy.value) return
   const currentProfile = snapshot.value.models.find((model) => model.id === selectedModelProfileId.value && model.enabled)
   if (!currentProfile) {
     showNotice('原模型配置已删除或停用，请先在 Composer 中选择可用模型后重新发送。')
@@ -1613,16 +1679,35 @@ async function onRetryMessage(message: UiMessage): Promise<void> {
   const configurationChanged = currentProfile.id !== retryPayload.modelProfileId || currentProfile.model !== retryPayload.model
     || retryReasoningEffort !== retryPayload.reasoningEffort
 
-  // Pi 已把失败用户轮次写入 JSONL 时，先复制失败轮次之前的内容再重试。
-  // 这样重试只会写入一条新的用户消息，不会重复历史或重放已完成工具。
-  if (workspace.active.value.session.session_file && message.sessionTurnIndex !== null) {
-    const forked = await forkMessageSession(message, 'before_turn', '重试本轮')
-    if (!forked) return
-  } else {
-    messages.value = messages.value.filter((item) => (
-      item.turnId !== message.turnId || isQueuedMessage(item)
-    ))
+  const retryTurnIndex = typeof message.turnIndex === 'number'
+    ? message.turnIndex
+    : typeof message.sessionTurnIndex === 'number' ? message.sessionTurnIndex : null
+  if (retryTurnIndex === null) {
+    showNotice('这条回复缺少轮次信息，暂时无法在原会话中重新生成。')
+    return
   }
+
+  const turnMessages = messages.value.filter((item) => item.turnIndex === retryTurnIndex && !isQueuedMessage(item))
+  const previousVariants = turnMessages
+    .filter((item) => item.role === 'assistant')
+    .flatMap((item) => item.responseVariants ?? [])
+  const fallbackVariant = previousVariants.length === 0
+    ? turnMessages
+      .filter((item) => item.role === 'assistant' && item.text.trim() && !['turnError', 'turnInterrupted'].includes(item.messageType || ''))
+      .map((item): UiResponseVariant => ({
+        id: `response-variant-${item.id}`,
+        text: item.text,
+        model: item.model,
+        reasoningEffort: item.reasoningEffort,
+        createdAt: new Date().toISOString(),
+      }))
+    : []
+  const variants = [...previousVariants, ...fallbackVariant]
+
+  // 不再调用 fork_session，也不切换 WorkspaceThread。Pi 会在同一份 JSONL
+  // 会话树中回到该用户节点的父级，再追加新的回复分支；界面只替换当前轮，
+  // 通过正文末尾的左右按钮切换历史版本。
+  messages.value = messages.value.filter((item) => item.turnIndex !== retryTurnIndex || isQueuedMessage(item))
 
   selectedModelProfileId.value = currentProfile.id
   selectedModel.value = currentProfile.model
@@ -1641,13 +1726,24 @@ async function onRetryMessage(message: UiMessage): Promise<void> {
     reasoningEffort: retryReasoningEffort,
     collaborationMode: retryPayload.collaborationMode,
     mode: 'steer',
-  })
+  }, workspace.active.value, { retryTurnIndex, retryVariants: variants })
 }
 
 async function onForkMessage(message: UiMessage): Promise<void> {
   if (message.role !== 'assistant') return
   const record = await forkMessageSession(message, 'through_turn', '从回复分支')
   if (record) showNotice('已创建回复分支，会话历史已保留到这条回复。')
+}
+
+function onSelectResponseVariant(message: UiMessage, index: number): void {
+  const variants = message.responseVariants ?? []
+  if (message.role !== 'assistant' || variants.length === 0) return
+  const nextIndex = Math.min(Math.max(index, 0), variants.length - 1)
+  const variant = variants[nextIndex]
+  if (!variant) return
+  messages.value = messages.value.map((item) => item.id === message.id
+    ? { ...item, text: variant.text, activeResponseVariant: nextIndex }
+    : item)
 }
 
 function onEditResponseAnnotation(annotation: UiResponseTextAnnotation): void {
@@ -2137,6 +2233,7 @@ onUnmounted(() => {
             @edit-message="onEditMessage"
             @resend-message="onResendMessage"
             @retry-message="onRetryMessage"
+            @select-response-variant="onSelectResponseVariant"
             @fork-message="onForkMessage"
             @notice="showNotice"
             @preview-file="documentWorkspace.open({ path: $event })"

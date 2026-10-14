@@ -28,6 +28,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+static BUNDLED_RESOURCE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// 工具发现只负责建立工具目录，不应像真实工具调用一样等待数十秒。
 /// 不可用服务会保留诊断并在后台再次尝试，不阻塞模式切换和首字节响应。
@@ -57,6 +58,7 @@ mod agent_control;
 mod settings;
 mod updates;
 mod generic_tools;
+mod file_access;
 mod office_tools;
 mod diagnostics;
 mod model_providers;
@@ -567,6 +569,9 @@ pub struct AgentRequest {
     pub workspace_path: Option<String>,
     #[serde(default)]
     pub session_file: Option<String>,
+    /// 在同一会话树中回到指定用户轮次前，重新生成该轮回复。
+    #[serde(default)]
+    pub retry_turn_index: Option<usize>,
     /// 前端轮次 ID；同时用于实时文本增量事件的归属。
     #[serde(default)]
     pub request_id: Option<String>,
@@ -1043,7 +1048,7 @@ impl Default for RuntimeState {
     fn default() -> Self {
         let model = ModelConfig::default();
         Self {
-            workbench_mode: workbench::WorkbenchMode::Codesys,
+            workbench_mode: workbench::WorkbenchMode::default(),
             model_providers: Vec::new(),
             active_model_id: model.id.clone(),
             models: vec![model.clone()],
@@ -2486,6 +2491,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::Builder::new().app_name("PLC Pilot").build())
         .setup(|app| {
+            if let Ok(root) = app.path().resource_dir() { let _ = BUNDLED_RESOURCE_ROOT.set(root); }
             document_core::initialize(app.handle().clone());
             diagnostics::info("app.ready", json!({}));
             let state = app.state::<AppState>().inner().clone();
@@ -3538,7 +3544,12 @@ fn open_with_default_app(target: &std::ffi::OsStr) -> Result<(), AppError> {
         Ok(())
     }
     #[cfg(not(windows))]
-    { let _ = target; Err(AppError::Configuration("当前平台暂不支持系统默认应用打开。".into())) }
+    {
+        let command = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        Command::new(command).arg(target).spawn()
+            .map_err(|error| AppError::Configuration(format!("系统未能打开目标：{error}")))?;
+        Ok(())
+    }
 }
 
 /// 用户点击链接菜单后交由系统打开，存在性检查不等同于可执行文件安全认证。
@@ -3558,7 +3569,19 @@ async fn open_local_path(path: String, mode: String) -> Result<(), AppError> {
         open_with_default_app(target.as_os_str())
     }
     #[cfg(not(windows))]
-    { let _ = target; Err(AppError::Configuration("当前平台暂不支持系统默认应用打开。".into())) }
+    {
+        if mode.trim() == "reveal" {
+            #[cfg(target_os = "macos")]
+            {
+                Command::new("open").arg("-R").arg(&target).spawn()
+                    .map_err(|error| AppError::Configuration(format!("打开文件管理器未完成：{error}")))?;
+                return Ok(());
+            }
+            #[cfg(not(target_os = "macos"))]
+            return open_with_default_app(if target.is_file() { target.parent().unwrap_or(&target).as_os_str() } else { target.as_os_str() });
+        }
+        open_with_default_app(target.as_os_str())
+    }
 }
 
 #[tauri::command]
@@ -5754,10 +5777,22 @@ fn agent_node_command(app: &AppHandle) -> String {
 
 /// 定位随安装包或便携目录分发的文件；发布版不得借用构建机源码目录。
 fn bundled_runtime_file(relative: &str) -> Option<PathBuf> {
+    let relative = if cfg!(windows) { relative } else {
+        match relative {
+            "runtime/node/node.exe" => "runtime/node/node",
+            "runtime/node/npm.cmd" => "runtime/node/npm",
+            "runtime/node/npx.cmd" => "runtime/node/npx",
+            "runtime/python/python.exe" => "runtime/python/bin/python3",
+            "runtime/pdf/pdfium.dll" if cfg!(target_os = "macos") => "runtime/pdf/libpdfium.dylib",
+            "runtime/pdf/pdfium.dll" => "runtime/pdf/libpdfium.so",
+            other => other,
+        }
+    };
     let executable_root = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from));
     let mut roots = Vec::new();
+    if let Some(root) = BUNDLED_RESOURCE_ROOT.get() { roots.push(root.clone()); }
     if let Some(root) = executable_root {
         roots.push(root.clone());
         roots.push(root.join("resources"));
@@ -5796,6 +5831,7 @@ fn resolve_runtime_command(command: &str) -> String {
 /// 发布版只允许包内资源；源码目录只在 debug 模式回退，防止构建机依赖掩盖漏包。
 fn resolve_mcp_argument(argument: &str) -> Result<String, AppError> {
     if argument != "__PLC_PILOT_STONE_MCP__" { return Ok(argument.to_string()); }
+    if let Some(path) = bundled_runtime_file("stone-mcp/stone-mcp-server.mjs") { return Ok(path.to_string_lossy().into_owned()); }
     if let Some(root) = std::env::current_exe().ok().and_then(|path| path.parent().map(PathBuf::from)) {
         for candidate in [root.join("stone-mcp/stone-mcp-server.mjs"), root.join("resources/stone-mcp/stone-mcp-server.mjs")] {
             if candidate.is_file() { return Ok(candidate.to_string_lossy().into_owned()); }
@@ -5812,8 +5848,8 @@ fn resolve_mcp_argument(argument: &str) -> Result<String, AppError> {
 fn bundled_runtime_path_env(existing: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
     let mut paths = Vec::new();
     let user_runtime = app_data_root().join("runtime");
-    paths.push(user_runtime.join("npm"));
-    paths.push(user_runtime.join("python").join("Python312").join("Scripts"));
+    paths.push(user_runtime.join(if cfg!(windows) { "npm" } else { "npm/bin" }));
+    paths.push(user_runtime.join("python").join(if cfg!(windows) { "Python312/Scripts" } else { "bin" }));
     if let Some(path) = bundled_runtime_file("runtime/node/node.exe") {
         if let Some(parent) = path.parent() { paths.push(parent.to_path_buf()); }
     }
@@ -5999,6 +6035,7 @@ async fn run_pi_host(
         "project": project,
         "model": model_payload,
         "session_file": previous_session.session_file,
+        "retry_turn_index": request.retry_turn_index,
         "session_name": session_name,
         "session_dir": agent_session_dir(),
         "mcp_tools": tool_payload,
@@ -7030,36 +7067,16 @@ fn resolve_project_reference(
     project: &ProjectContext,
     requested: &str,
 ) -> Result<(PathBuf, String), AppError> {
-    let root = project_root(project)?;
+    let root = dunce::canonicalize(agent_cwd(project))
+        .map_err(|error| AppError::Project(format!("工作目录无法访问：{error}")))?;
     let requested = requested.trim().trim_matches('"');
     if requested.is_empty() {
         return Err(AppError::Project("@ 引用路径不能为空".to_string()));
     }
-    let raw = PathBuf::from(requested);
-    let candidate = if raw.is_absolute() {
-        raw
-    } else {
-        if raw
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return Err(AppError::Project("@ 引用路径不能包含上级目录".to_string()));
-        }
-        root.join(raw)
-    };
-    if !candidate.exists() {
-        return Err(AppError::Project(format!("@ 引用路径不存在：{requested}")));
-    }
-    let resolved = fs::canonicalize(&candidate)
-        .map_err(|error| AppError::Project(format!("解析 @ 引用路径未完成：{error}")))?;
-    if !resolved.starts_with(&root) {
-        return Err(AppError::Project(
-            "@ 引用路径必须位于当前工程目录内".to_string(),
-        ));
-    }
+    let resolved = file_access::resolve_path(&root, Path::new(requested), false)?;
     let relative = resolved
         .strip_prefix(&root)
-        .map_err(|_| AppError::Project("@ 引用路径不在当前工程目录内".to_string()))?
+        .unwrap_or(&resolved)
         .to_string_lossy()
         .replace('\\', "/");
     Ok((resolved, relative))
@@ -7131,7 +7148,7 @@ fn normalize_mention_references(
                 reference.kind
             )));
         }
-        if !project.exists {
+        if kind == "active_file" && !project.exists {
             return Err(AppError::Project(
                 "引用工程文件前请先选择一个存在的 CODESYS 工程".to_string(),
             ));
@@ -7745,7 +7762,7 @@ async fn call_builtin_tool(
 ) -> Result<ToolCallResult, AppError> {
     if tool_name == "document_inspect" { return document_core::agent::inspect(state, arguments).await; }
     let project = state.inner.lock().await.project.clone();
-    if !project.exists {
+    if !project.exists && !matches!(tool_name, "read_document" | "read_office_document") {
         return Err(AppError::Project(
             "请先选择一个存在的 CODESYS 工程或 Bridge 源目录".to_string(),
         ));
@@ -7770,10 +7787,10 @@ async fn call_builtin_tool(
         )),
         "read_document" => {
             let requested = arguments["path"].as_str().ok_or_else(|| AppError::Project("read_document 需要 path。".into()))?;
-            let (path, _) = resolve_project_file(&project, requested, false)?;
+            let path = file_access::resolve_file(&project, requested, false)?;
             let file = attachments::read_local_file(&path).map_err(AppError::Project)?;
             if let Some(error) = file.error { return Err(AppError::Project(error)); }
-            Ok(json_content(&json!({"name":file.name,"size":file.size,"mime_type":file.mime_type,"text":file.text_content}), false))
+            Ok(json_content(&json!({"path":path,"name":file.name,"size":file.size,"mime_type":file.mime_type,"text":file.text_content}), false))
         }
         "read_office_document" => office_tools::read(state, arguments).await,
         "search_project" => Ok(json_content(
@@ -9561,8 +9578,41 @@ fn parse_session_record(path: &Path) -> Option<SessionRecord> {
     parse_session_record_with_mode(path, true)
 }
 
+/// Pi 会把同一会话的重新生成保存为一棵 JSONL 会话树。解析历史时只投影
+/// 当前叶子所在的路径，避免把已放弃的回复分支再次显示成连续对话；没有
+/// parentId/id 的旧格式仍按原来的线性文件兼容处理。
+fn active_session_entry_ids(content: &str) -> Option<HashSet<String>> {
+    let mut parents = HashMap::<String, Option<String>>::new();
+    let mut leaf = None;
+    let mut has_parent_links = false;
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else { continue; };
+        if entry.get("type").and_then(Value::as_str) == Some("session") { continue; }
+        let Some(id) = entry.get("id").and_then(Value::as_str).filter(|value| !value.is_empty()) else { continue; };
+        leaf = Some(id.to_string());
+        if entry.get("parentId").is_some() || entry.get("parent_id").is_some() {
+            has_parent_links = true;
+        }
+        let parent = entry
+            .get("parentId")
+            .or_else(|| entry.get("parent_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        parents.insert(id.to_string(), parent);
+    }
+    if !has_parent_links || leaf.is_none() { return None; }
+    let mut active = HashSet::new();
+    let mut current = leaf;
+    while let Some(id) = current {
+        if !active.insert(id.clone()) { break; }
+        current = parents.get(&id).cloned().flatten();
+    }
+    Some(active)
+}
+
 fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionRecord> {
     let content = std::fs::read_to_string(path).ok()?;
+    let active_entry_ids = active_session_entry_ids(&content);
     let mut session_id = path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -9582,6 +9632,21 @@ fn parse_session_record_with_mode(path: &Path, preview: bool) -> Option<SessionR
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if let Some(active_entry_ids) = &active_entry_ids {
+            let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or_default();
+            let tree_entry = entry_type != "session" && matches!(
+                entry_type,
+                "message" | "custom" | "custom_message" | "context_edit" | "label" | "compaction" | "branch_summary" | "model_change" | "thinking_level_change" | "usage"
+            );
+            if tree_entry
+                && entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !active_entry_ids.contains(id))
+            {
+                continue;
+            }
+        }
         match entry.get("type").and_then(Value::as_str) {
             Some("session") => {
                 if let Some(id) = entry.get("id").and_then(Value::as_str) {
@@ -11459,7 +11524,9 @@ mod tests {
             path: outside.to_string_lossy().to_string(),
             ..normalized[0].clone()
         };
-        assert!(normalize_mention_references(&project, &[outside_reference], None).is_err());
+        let normalized_outside = normalize_mention_references(&project, &[outside_reference], None).expect("规范化工作目录外引用");
+        assert!(Path::new(&normalized_outside[0].path).is_absolute());
+        assert!(reference_context(&project, &normalized_outside).contains("PROGRAM OUTSIDE"));
         let _ = fs::remove_file(outside);
     }
 
@@ -11883,6 +11950,30 @@ mod tests {
         assert_eq!(record.turn_durations[0]["duration_ms"], 12345);
         assert_eq!(record.notes[0].path, "checkpoint.md");
         assert_eq!(record.notes[0].content, "已完成读取");
+    }
+
+    #[test]
+    fn session_parser_uses_active_response_branch() {
+        let directory = tempfile::tempdir().expect("创建临时会话目录");
+        let path = directory.path().join("branched-session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"session-branch\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"C:/plc\"}\n",
+                "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"第一轮\"}}\n",
+                "{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":\"第一轮回复\"}}\n",
+                "{\"type\":\"message\",\"id\":\"u2-old\",\"parentId\":\"a1\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"message\":{\"role\":\"user\",\"content\":\"第二轮\"}}\n",
+                "{\"type\":\"message\",\"id\":\"a2-old\",\"parentId\":\"u2-old\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"message\":{\"role\":\"assistant\",\"content\":\"旧回复\"}}\n",
+                "{\"type\":\"message\",\"id\":\"u2-new\",\"parentId\":\"a1\",\"timestamp\":\"2026-01-01T00:00:05Z\",\"message\":{\"role\":\"user\",\"content\":\"第二轮\"}}\n",
+                "{\"type\":\"message\",\"id\":\"a2-new\",\"parentId\":\"u2-new\",\"timestamp\":\"2026-01-01T00:00:06Z\",\"message\":{\"role\":\"assistant\",\"content\":\"新回复\"}}\n",
+            ),
+        )
+        .expect("写入分支会话");
+        let record = parse_session_record_with_mode(&path, false).expect("解析分支会话");
+        let contents = record.messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>();
+        assert!(contents.contains(&"第一轮回复"));
+        assert!(contents.contains(&"新回复"));
+        assert!(!contents.contains(&"旧回复"));
     }
 
     #[test]

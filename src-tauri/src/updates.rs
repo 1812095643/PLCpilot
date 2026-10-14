@@ -43,12 +43,14 @@ fn executable_directory() -> Result<PathBuf, String> {
 
 fn portable() -> Result<bool, String> { Ok(executable_directory()?.join("portable.json").is_file()) }
 
+fn supports_in_app_updates() -> bool { !cfg!(target_os = "linux") || std::env::var_os("APPIMAGE").is_some() }
+
 #[tauri::command]
 pub fn get_update_preferences() -> Result<Value, String> {
     let path = app_data_root().join("updates/preferences.json");
     let preferences = if path.is_file() {
         serde_json::from_slice::<UpdatePreferences>(&fs::read(path).map_err(describe)?).map_err(describe)?
-    } else { UpdatePreferences { auto_check: true } };
+    } else { UpdatePreferences { auto_check: supports_in_app_updates() } };
     let last_result = fs::read(app_data_root().join("updates/result.json")).ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes)).ok());
     Ok(json!({ "autoCheck": preferences.auto_check, "version": APP_VERSION, "portable": portable()?, "lastResult": last_result }))
@@ -76,6 +78,7 @@ fn release_asset(update: &Update) -> Result<&Value, String> {
 
 #[tauri::command]
 pub async fn check_app_update(app: AppHandle, manager: State<'_, UpdateManager>) -> Result<Option<AvailableUpdate>, String> {
+    if !supports_in_app_updates() { return Err("Linux DEB 安装版请通过“查看全部版本与安装包”下载新包，再用系统包管理器更新。AppImage 支持软件内更新。".into()); }
     let mut pending = manager.pending.try_lock().map_err(|_| "正在处理更新，请稍候。")?;
     let mut builder = app.updater_builder().timeout(Duration::from_secs(25));
     if portable()? { builder = builder.target("windows-x86_64-portable"); }
@@ -155,7 +158,11 @@ pub async fn install_app_update(app: AppHandle, version: String, manager: State<
         let _ = job.0.kill();
         return Err("更新辅助程序未及时响应，请重试。当前程序保持运行。".into());
     }
-    prepared.update.install(prepared.bytes.as_ref().ok_or("请重新下载更新。")?).map_err(describe)
+    prepared.update.install(prepared.bytes.as_ref().ok_or("请重新下载更新。")?).map_err(describe)?;
+    #[cfg(not(windows))]
+    app.restart();
+    #[cfg(windows)]
+    Ok(())
 }
 
 /// 只接受便携包内四个程序条目；拒绝路径穿越、链接、重复条目和异常解压体积。

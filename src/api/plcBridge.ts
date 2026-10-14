@@ -376,6 +376,8 @@ export type AgentRunOptions = {
   clientThreadId?: string
   workspacePath?: string
   sessionFile?: string
+  /** 在同一 JSONL 会话中回到指定用户轮次前，重新生成该轮回复。 */
+  retryTurnIndex?: number
   /** 本轮进程级通知流的即时消息处理器。 */
   onEvent?: (payload: AgentStreamPayload) => void
 }
@@ -708,6 +710,7 @@ export const runAgent = async (
       client_thread_id: options.clientThreadId,
       workspace_path: options.workspacePath,
       session_file: options.sessionFile,
+      retry_turn_index: Number.isInteger(options.retryTurnIndex) ? options.retryTurnIndex : undefined,
     },
   })
   try {

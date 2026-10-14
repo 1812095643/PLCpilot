@@ -8,8 +8,15 @@ use sha2::Digest;
 use std::os::windows::process::CommandExt;
 
 pub const OFFICECLI_VERSION:&str="1.0.152";
-const OFFICECLI_URL:&str="https://github.com/iOfficeAI/OfficeCLI/releases/download/v1.0.152/officecli-win-x64.exe";
-const OFFICECLI_SHA256:&str="047705402974c3690a4437e55f620d03afac4beba4fdd28fdb59af610a3afff2";
+fn release_asset()->Result<(&'static str,&'static str),AppError>{
+    match (std::env::consts::OS,std::env::consts::ARCH){
+        ("windows","x86_64")=>Ok(("officecli-win-x64.exe","047705402974c3690a4437e55f620d03afac4beba4fdd28fdb59af610a3afff2")),
+        ("macos","aarch64")=>Ok(("officecli-mac-arm64","e2ed6eba5cd46d6800139f2835097828b8ccd7c8c9b679463b50e45ba2f1dbf5")),
+        ("macos","x86_64")=>Ok(("officecli-mac-x64","5071abef56c1d4a4d60e28ed12bc66183d8dc6a9783529c3f1a9cf6bdfe6c2dd")),
+        ("linux","x86_64")=>Ok(("officecli-linux-x64","e54d3c1d248372365f0634aac56d6f1918bd04d6e71afc792ad50e075f56cfe9")),
+        _=>Err(AppError::Configuration("当前系统架构没有可安装的 OfficeCLI。".into())),
+    }
+}
 
 #[derive(Clone,Serialize,Deserialize,Default)]
 pub struct OfficeCliPreferences { #[serde(default="default_engine")] pub mode:String }
@@ -33,14 +40,16 @@ pub async fn set_office_engine_mode(mode:String)->Result<OfficeCliStatus,AppErro
 #[tauri::command]
 pub async fn install_officecli()->Result<OfficeCliStatus,AppError>{
     if executable().is_file(){return Ok(status());}
+    let (asset,checksum)=release_asset()?;
     let client=reqwest::Client::builder().timeout(std::time::Duration::from_secs(180)).build().map_err(|e|AppError::Network(e.to_string()))?;
-    let response=client.get(OFFICECLI_URL).send().await.map_err(|e|AppError::Network(format!("下载 OfficeCLI 未完成：{e}")))?;
+    let response=client.get(format!("https://github.com/iOfficeAI/OfficeCLI/releases/download/v{OFFICECLI_VERSION}/{asset}")).send().await.map_err(|e|AppError::Network(format!("下载 OfficeCLI 未完成：{e}")))?;
     if !response.status().is_success(){return Err(AppError::Network(format!("下载 OfficeCLI 返回 HTTP {}",response.status())));}
     let bytes=response.bytes().await.map_err(|e|AppError::Network(e.to_string()))?;
     if bytes.len()>64*1024*1024{return Err(AppError::Configuration("OfficeCLI 下载文件超过安全上限。".into()));}
-    if format!("{:x}",sha2::Sha256::digest(&bytes))!=OFFICECLI_SHA256{return Err(AppError::Configuration("OfficeCLI SHA-256 校验不一致，安装已停止。".into()));}
+    if format!("{:x}",sha2::Sha256::digest(&bytes))!=checksum{return Err(AppError::Configuration("OfficeCLI SHA-256 校验不一致，安装已停止。".into()));}
     fs::create_dir_all(root()).map_err(|e|AppError::Configuration(e.to_string()))?;
     let temporary=root().join(format!("officecli.{}.tmp",Uuid::new_v4()));fs::write(&temporary,&bytes).map_err(|e|AppError::Configuration(e.to_string()))?;
+    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(&temporary,fs::Permissions::from_mode(0o755)).map_err(|e|AppError::Configuration(e.to_string()))?; }
     if let Err(e)=fs::rename(&temporary,executable()){let _=fs::remove_file(&temporary);return Err(AppError::Configuration(format!("安装 OfficeCLI 未完成：{e}")));}
     let _=set_office_engine_mode("auto".into()).await?;Ok(status())
 }
@@ -76,11 +85,8 @@ pub async fn batch(file:&str,commands:Value)->Result<ToolCallResult,AppError>{le
 pub async fn propose(state:&AppState,mut arguments:Value)->Result<PendingChangeSummary,AppError>{
     let operation=arguments.get("operation").and_then(Value::as_str).unwrap_or_default().to_string();if !is_mutating(&operation){return Err(AppError::Configuration("只读 OfficeCLI 操作不应生成审批动作。".into()));}
     let requested=arguments.get("file").and_then(Value::as_str).ok_or_else(||AppError::Project("OfficeCLI 缺少 file。".into()))?;
-    let path=dunce::canonicalize(requested).map_err(|e|AppError::Project(format!("OfficeCLI 文件不可访问：{e}")))?;
     let project=state.inner.lock().await.project.clone();
-    if let Some(root)=project.working_directory.as_deref().or(project.project_directory.as_deref()){
-        let root=dunce::canonicalize(root).unwrap_or_else(|_|PathBuf::from(root));if !path.starts_with(&root){return Err(AppError::Project("OfficeCLI 只能访问当前工作目录内的文件。".into()));}
-    }
+    let path=crate::file_access::resolve_file(&project,requested,false)?;
     let bytes=fs::read(&path).map_err(|e|AppError::Project(e.to_string()))?;arguments["file"]=json!(path.to_string_lossy());arguments["expected_sha256"]=json!(format!("{:x}",sha2::Sha256::digest(&bytes)));
     let id=Uuid::new_v4().to_string();let summary=PendingChangeSummary{id:id.clone(),title:format!("OfficeCLI {}",operation),description:format!("{} · {} 字节 · OfficeCLI {}",path.file_name().unwrap_or_default().to_string_lossy(),bytes.len(),OFFICECLI_VERSION),diff:format!("文件：{}\n操作：{}\n参数：{}\n\n批准后通过 OfficeCLI 原子执行，并复核文件未被外部修改。",path.display(),operation,serde_json::to_string_pretty(&arguments).unwrap_or_default()),server_id:BUILTIN_SERVER_ID.into(),tool_name:"officecli".into(),risk:"OfficeCLI 将修改本地 Office 文件，需要人工审批。".into(),status:"pending".into()};let pending=PendingChange{summary:summary.clone(),arguments};state.inner.lock().await.pending.insert(id.clone(),pending.clone());state.approvals.lock().await.insert(id,pending);Ok(summary)
 }
@@ -109,4 +115,26 @@ pub async fn apply_document_operations(file:&str,kind:&str,nodes:&[crate::docume
     }
     if commands.is_empty(){return Err(AppError::Configuration("没有可转换为 OfficeCLI 的修改操作。".into()));}
     batch(file,json!(commands)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn external_officecli_edit_enters_approval_without_touching_original() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let path = root.path().join("external.docx");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&path, "original bytes").unwrap();
+        let mut runtime = RuntimeState::default();
+        runtime.project = resolve_project_path(&workspace.to_string_lossy()).unwrap();
+        let state = AppState::new(runtime);
+        let summary = propose(&state, json!({"file":path,"operation":"set","path":"/body/p[1]","props":{"text":"changed"}})).await.unwrap();
+        assert_eq!(summary.status, "pending");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original bytes");
+        assert!(state.approvals.lock().await.contains_key(&summary.id));
+        assert!(release_asset().is_ok());
+    }
 }

@@ -5,21 +5,15 @@ static PATCH_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn tools() -> Vec<McpTool> {
     vec![
-        McpTool { server_id: BUILTIN_SERVER_ID.into(), name: "read_document".into(), description: Some("读取工作目录中的 Excel、PDF、Word 或文本文件，返回提取的实际正文。二进制文档应使用此工具。".into()), input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}) },
+        McpTool { server_id: BUILTIN_SERVER_ID.into(), name: "read_document".into(), description: Some("读取本机 Excel、PDF、Word 或文本文件，支持工作目录外附件的绝对路径，返回提取的实际正文。二进制文档应使用此工具。".into()), input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}) },
         McpTool { server_id: BUILTIN_SERVER_ID.into(), name: "apply_patch".into(), description: Some(format!("提交 Codex 格式的多文件补丁，先生成 Diff，用户审批后才写入。{}", codex_apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS)), input_schema: json!({"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"],"additionalProperties":false}) },
         McpTool { server_id: BUILTIN_SERVER_ID.into(), name: "propose_write".into(), description: Some("提交完整文件正文，支持新建文件；用户审批后才写入。".into()), input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"expected":{"type":"string"}},"required":["path","content"],"additionalProperties":false}) },
-        McpTool { server_id: BUILTIN_SERVER_ID.into(), name: "exec_command".into(), description: Some("提交 PowerShell 命令，固定在当前工作目录执行。命令必须由用户审批；输出嵌入工具详情，不打开终端窗口。".into()), input_schema: json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","minimum":1,"maximum":120}},"required":["command"],"additionalProperties":false}) },
+        McpTool { server_id: BUILTIN_SERVER_ID.into(), name: "exec_command".into(), description: Some(format!("提交 {} 命令，固定在当前工作目录执行。命令遵循当前审批或完全访问模式；输出嵌入工具详情，不打开终端窗口。", if cfg!(windows) { "PowerShell" } else { "Bash" })), input_schema: json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number","minimum":1,"maximum":120}},"required":["command"],"additionalProperties":false}) },
     ]
 }
 
 fn checked_path(cwd: &Path, requested: &Path) -> Result<PathBuf, AppError> {
-    let root = dunce::canonicalize(cwd).map_err(|error| AppError::Project(error.to_string()))?;
-    let candidate = if requested.is_absolute() { requested.to_path_buf() } else { root.join(requested) };
-    if candidate.components().any(|part| matches!(part, std::path::Component::ParentDir)) { return Err(AppError::Project("补丁路径不能包含上级目录。".into())); }
-    let existing = candidate.ancestors().find(|path| path.exists()).ok_or_else(|| AppError::Project("路径没有可读取的父目录。".into()))?;
-    let resolved = dunce::canonicalize(existing).map_err(|error| AppError::Project(error.to_string()))?;
-    if !resolved.starts_with(&root) { return Err(AppError::Project("文件操作必须位于本轮工作目录内。".into())); }
-    Ok(resolved.join(candidate.strip_prefix(existing).map_err(|error| AppError::Project(error.to_string()))?))
+    crate::file_access::resolve_path(cwd, requested, true)
 }
 
 fn absolute_hunks(patch: &str, cwd: &Path) -> Result<Vec<Hunk>, AppError> {
@@ -85,7 +79,7 @@ pub async fn propose(state: &AppState, tool: &str, mut arguments: Value) -> Resu
     arguments["session_file"] = json!(session_file);
     arguments["expected_files"] = json!(expected);
     let id = Uuid::new_v4().to_string();
-    let summary = PendingChangeSummary { id: id.clone(), title: if tool == "exec_command" { "审批后运行 PowerShell 命令".into() } else { format!("审批后应用文件修改（{} 个文件）", expected.len()) }, description: cwd.to_string_lossy().into_owned(), diff: preview, server_id: BUILTIN_SERVER_ID.into(), tool_name: tool.into(), risk: "需要人工审批".into(), status: "pending".into() };
+    let summary = PendingChangeSummary { id: id.clone(), title: if tool == "exec_command" { format!("审批后运行 {} 命令", if cfg!(windows) { "PowerShell" } else { "Bash" }) } else { format!("审批后应用文件修改（{} 个文件）", expected.len()) }, description: cwd.to_string_lossy().into_owned(), diff: preview, server_id: BUILTIN_SERVER_ID.into(), tool_name: tool.into(), risk: "需要人工审批".into(), status: "pending".into() };
     let pending = PendingChange { summary: summary.clone(), arguments };
     state.inner.lock().await.pending.insert(id.clone(), pending.clone());
     // Agent 使用隔离状态运行，但审批按钮属于桌面控制面；同时登记共享注册表，
@@ -151,4 +145,57 @@ pub async fn host_action(app: &AppHandle, state: &AppState, pending: &PendingCha
     if action == "execute_approved" { state.running.lock().await.remove(&key); }
     let _ = child.kill().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_state(path: &Path) -> AppState {
+        let mut runtime = RuntimeState::default();
+        runtime.project = resolve_project_path(&path.to_string_lossy()).unwrap();
+        AppState::new(runtime)
+    }
+
+    #[tokio::test]
+    async fn external_text_write_waits_for_approval_and_keeps_conflict_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        let external = root.path().join("external.txt");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(&external, "before").unwrap();
+        let state = workspace_state(&cwd);
+        let summary = propose(&state, "propose_write", json!({"path": external, "content": "after", "expected": "before"})).await.unwrap();
+        assert_eq!(summary.status, "pending");
+        assert_eq!(fs::read_to_string(&external).unwrap(), "before");
+        let pending = state.inner.lock().await.pending[&summary.id].clone();
+        assert!(state.approvals.lock().await.contains_key(&summary.id));
+        assert!(!apply_patch(&pending).unwrap().is_error);
+        assert_eq!(fs::read_to_string(&external).unwrap(), "after");
+
+        let summary = propose(&state, "propose_write", json!({"path": external, "content": "next"})).await.unwrap();
+        let pending = state.inner.lock().await.pending[&summary.id].clone();
+        fs::write(&external, "manual change").unwrap();
+        assert!(apply_patch(&pending).is_err());
+        assert_eq!(fs::read_to_string(&external).unwrap(), "manual change");
+    }
+
+    #[tokio::test]
+    async fn external_patch_supports_parent_paths_and_new_output_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        let external = root.path().join("external");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("input.txt"), "before\n").unwrap();
+        let state = workspace_state(&cwd);
+        let patch = "*** Begin Patch\n*** Update File: ../external/input.txt\n@@\n-before\n+after\n*** Add File: ../external/output/nested/result.txt\n+created\n*** End Patch";
+        let summary = propose(&state, "apply_patch", json!({"patch": patch})).await.unwrap();
+        assert_eq!(fs::read_to_string(external.join("input.txt")).unwrap(), "before\n");
+        assert!(!external.join("output").exists());
+        let pending = state.inner.lock().await.pending[&summary.id].clone();
+        assert!(!apply_patch(&pending).unwrap().is_error);
+        assert_eq!(fs::read_to_string(external.join("input.txt")).unwrap(), "after\n");
+        assert_eq!(fs::read_to_string(external.join("output/nested/result.txt")).unwrap(), "created\n");
+    }
 }

@@ -1,9 +1,13 @@
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { access, readFile, realpath } from "node:fs/promises";
-import { isAbsolute, relative, sep } from "node:path";
 import { randomUUID } from "node:crypto";
-import { createEditTool, createFindTool, createLsTool, createPowerShellTool, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createBashTool, createEditTool, createFindTool, createLsTool, createPowerShellTool, SessionManager } from "@earendil-works/pi-coding-agent";
+
+export const commandToolName = process.platform === "win32" ? "powershell" : "bash";
+const createCommandTool = (cwd) => process.platform === "win32"
+  ? createPowerShellTool(cwd, { exposeSessionEnvironment: false })
+  : createBashTool(cwd);
 
 /** Pi 的检索工具会启动 rg/fd；统一补 Windows 创建参数，不更改工具或进程算法。 */
 export function hideProcessWindows() {
@@ -25,22 +29,18 @@ export function createApprovedTools(cwd, sendRequest) {
   const request = async (name, args, callId, signal) => toolResult(await sendRequest({ request_id: randomUUID(), tool_call_id: callId, server_id: "builtin", tool_name: name, arguments: args }, signal));
   const originalFind = createFindTool(cwd);
   const originalLs = createLsTool(cwd);
-  const powershell = createPowerShellTool(cwd, { exposeSessionEnvironment: false });
+  const shell = createCommandTool(cwd);
   const originalEdit = createEditTool(cwd);
   return [
     { ...originalFind, name: "glob", label: "查找文件" },
     { ...originalLs, name: "Get-ChildItem", label: "列出目录" },
-    { ...powershell, name: "powershell", execute: (id, params, signal) => request("exec_command", params, id, signal) },
+    { ...shell, name: commandToolName, execute: (id, params, signal) => request("exec_command", params, id, signal) },
     {
       ...originalEdit,
       description: `${originalEdit.description} 修改先提交用户审批，审批前不会写盘。`,
       execute: async (id, params, signal) => {
         let before; let approval;
-        const validate = async (path) => {
-          const root = await realpath(cwd); const target = await realpath(path); const child = relative(root, target);
-          if (child === ".." || child.startsWith(`..${sep}`) || isAbsolute(child)) throw new Error("文件必须位于当前工作目录内。");
-          return target;
-        };
+        const validate = (path) => realpath(path);
         // 使用 Pi 官方的可插拔 EditOperations 计算修改；写入操作交给审批层。
         const editor = createEditTool(cwd, { operations: {
           readFile: async (path) => { const data = await readFile(await validate(path)); before = data.toString("utf8"); return data; },
@@ -70,7 +70,7 @@ export function recordApproval(argumentsValue, content) {
 }
 
 export async function executeApprovedCommand(argumentsValue, onUpdate) {
-  const tool = createPowerShellTool(argumentsValue.cwd, { exposeSessionEnvironment: false });
+  const tool = createCommandTool(argumentsValue.cwd);
   commandController = new AbortController();
   commandPromise = tool.execute(randomUUID(), { command: argumentsValue.command, timeout: Math.min(120, argumentsValue.timeout ?? 120) }, commandController.signal, (result) => {
     onUpdate(result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n"));

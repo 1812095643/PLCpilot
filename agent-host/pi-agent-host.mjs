@@ -947,7 +947,17 @@ function persistTurnDuration(durationMs) {
 
 async function runPrompt(config) {
   const session = await ensureSession(config);
-  activeTurnIndex = session.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message?.role === "user").length;
+  const retryTurnIndex = Number.isInteger(config.retry_turn_index) ? config.retry_turn_index : null;
+  if (retryTurnIndex !== null) {
+    // 重新生成沿用 Pi 的会话树：回到当前分支中对应用户消息的父节点，
+    // 再由同一份 JSONL 追加新用户/助手分支。这样不会创建新的侧边栏会话，
+    // 也不会把失败轮次重复发送到原分支上下文。
+    const branchUsers = session.sessionManager.getBranch().filter((entry) => entry.type === "message" && entry.message?.role === "user");
+    const target = branchUsers[retryTurnIndex];
+    if (!target) throw new Error(`找不到第 ${retryTurnIndex + 1} 个用户轮次，无法重新生成回复`);
+    await session.navigateTree(target.id, { summarize: false });
+  }
+  activeTurnIndex = session.sessionManager.getBranch().filter((entry) => entry.type === "message" && entry.message?.role === "user").length;
   activeRunTurnIndex = activeTurnIndex;
   session.sessionManager.appendCustomEntry("plc-pilot.ui-turn", {
     turn_index: activeTurnIndex, text: config.display_message ?? config.message,
