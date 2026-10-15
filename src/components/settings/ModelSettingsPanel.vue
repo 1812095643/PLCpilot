@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, shallowRef, watch } from 'vue'
-import type { ModelForm, ModelSummary, ModelProviderSummary } from '../../api/plcBridge'
+import type { ModelForm, ModelSummary, ModelProviderSummary, DiscoveredModel } from '../../api/plcBridge'
 import { useModelProviders } from '../../composables/useModelProviders'
 import ProviderConnectionForm from './ProviderConnectionForm.vue'
 import ModelProfileEditor from './ModelProfileEditor.vue'
@@ -18,6 +18,11 @@ const editingModelId = shallowRef<string | null>(null)
 const confirmingDelete = shallowRef(false)
 const selectedProvider = computed(() => providers.value.find(provider => provider.id === form.value.id) ?? null)
 const providerModels = computed(() => props.models.filter(model => model.provider_id === form.value.id))
+const imageModelCandidates = computed(() => {
+  const candidates = new Map<string, DiscoveredModel>(providerModels.value.map(model => [model.model, { id: model.model, name: model.name || model.model, owned_by: null }]))
+  for (const model of discovery.value?.models ?? []) candidates.set(model.id, model)
+  return [...candidates.values()]
+})
 const editingModel = computed(() => providerModels.value.find(model => model.id === editingModelId.value) ?? null)
 const counts = computed(() => new Map(providers.value.map(provider => [provider.id, props.models.filter(model => model.provider_id === provider.id).length])))
 const blocked = computed(() => busy.value || props.isSaving)
@@ -62,7 +67,7 @@ onMounted(async () => { await manager.reload(props.models.find(model => model.id
           </div>
           <ModelProfileEditor v-if="editingModelId !== null" :key="`${form.id}:${editingModelId}`" :model="editingModel" :provider="selectedProvider" :busy="blocked" @save="emit('save', $event)" @close="editingModelId = null" />
         </section>
-        <ImageModelSettings v-if="selectedProvider" :key="selectedProvider.id" :provider-id="selectedProvider.id" />
+        <ImageModelSettings v-if="selectedProvider" :key="selectedProvider.id" :provider-id="selectedProvider.id" :available-models="imageModelCandidates" />
       </div>
     </div>
     <p class="provider-context">当前会话 {{ currentContextTokens.toLocaleString() }} tokens<span v-if="remainingContextPercent !== null"> · 剩余 {{ Math.round(remainingContextPercent) }}%</span> · 自动压缩{{ autoCompactionEnabled ? '已开启' : '已关闭' }}</p>

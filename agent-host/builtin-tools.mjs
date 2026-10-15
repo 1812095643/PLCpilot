@@ -72,7 +72,7 @@ export function recordApproval(argumentsValue, content) {
 export async function executeApprovedCommand(argumentsValue, onUpdate) {
   const tool = createCommandTool(argumentsValue.cwd);
   commandController = new AbortController();
-  commandPromise = tool.execute(randomUUID(), { command: argumentsValue.command, timeout: Math.min(120, argumentsValue.timeout ?? 120) }, commandController.signal, (result) => {
+  commandPromise = tool.execute(randomUUID(), { command: argumentsValue.command, ...(argumentsValue.timeout == null ? {} : { timeout: argumentsValue.timeout }) }, commandController.signal, (result) => {
     onUpdate(result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n"));
   });
   try {

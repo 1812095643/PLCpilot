@@ -2,7 +2,8 @@ import { build } from "esbuild";
 import { copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createReadTool, createGrepTool, createFindTool, createLsTool, createEditTool, createPowerShellTool, createBashTool } from "@earendil-works/pi-coding-agent";
 
 await build({
@@ -11,6 +12,9 @@ await build({
   platform: "node",
   format: "esm",
   target: "node22",
+  alias: {
+    "#pi-http-dispatcher": join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "core/http-dispatcher.js"),
+  },
   minify: true,
   banner: {
     js: "import { createRequire as createPlcRequire } from 'node:module'; const require = createPlcRequire(import.meta.url);",

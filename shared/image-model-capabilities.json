@@ -1,0 +1,20 @@
+{
+  "source": "https://developers.openai.com/api/docs/guides/image-generation",
+  "checked_at": "2026-10-15",
+  "standard": {
+    "sizes": ["auto", "1024x1024", "1536x1024", "1024x1536"],
+    "qualities": ["auto", "low", "medium", "high"]
+  },
+  "flexible": {
+    "sizes": ["auto", "1024x1024", "1536x1024", "1024x1536", "1536x864", "864x1536", "2048x2048", "2048x1152", "1152x2048", "3840x2160", "2160x3840"],
+    "constraints": {
+      "multiple": 16,
+      "max_edge": 3840,
+      "min_pixels": 655360,
+      "max_pixels": 8294400,
+      "max_ratio": 3,
+      "experimental_above_pixels": 3686400
+    }
+  },
+  "quality_2_5": ["auto", "low", "medium", "high", "xhigh", "max"]
+}

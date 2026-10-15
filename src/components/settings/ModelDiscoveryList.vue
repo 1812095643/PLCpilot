@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { computed, shallowRef, watch } from 'vue'
-import type { ModelDiscoveryResult } from '../../api/plcBridge'
+import type { ModelDiscoveryResult, DiscoveredModel } from '../../api/plcBridge'
 
-const props = defineProps<{ discovery: ModelDiscoveryResult; addedModelIds: string[]; saving: boolean }>()
+const props = defineProps<{ discovery?: ModelDiscoveryResult; models?: DiscoveredModel[]; purpose?: 'chat' | 'image'; addedModelIds: string[]; saving: boolean }>()
 const emit = defineEmits<{ add: [models: ModelDiscoveryResult['models']] }>()
 const query = shallowRef('')
 const selected = shallowRef<string[]>([])
-const visible = computed(() => props.discovery.models.filter((model) => `${model.id} ${model.name}`.toLowerCase().includes(query.value.trim().toLowerCase())))
+const sourceModels = computed(() => props.models ?? props.discovery?.models ?? [])
+const visible = computed(() => sourceModels.value.filter((model) => `${model.id} ${model.name}`.toLowerCase().includes(query.value.trim().toLowerCase())))
 const available = computed(() => visible.value.filter((model) => !props.addedModelIds.includes(model.id)))
 const selectedIds = computed(() => selected.value.filter((id) => !props.addedModelIds.includes(id)))
-const selectedModels = computed(() => props.discovery.models.filter((model) => selectedIds.value.includes(model.id)))
+const selectedModels = computed(() => sourceModels.value.filter((model) => selectedIds.value.includes(model.id)))
 const allSelected = computed(() => available.value.length > 0 && available.value.every((model) => selected.value.includes(model.id)))
 
 function toggle(id: string): void {
@@ -27,12 +28,12 @@ function metadataLabel(model: ModelDiscoveryResult['models'][number]): string {
   if (model.owned_by) parts.push(model.owned_by)
   return parts.join(' · ')
 }
-watch(() => props.discovery, () => { selected.value = []; query.value = '' })
+watch(sourceModels, () => { selected.value = []; query.value = '' })
 </script>
 
 <template>
   <section class="discovered-models" aria-label="选择要添加的模型">
-    <header class="discovered-heading"><strong>可用模型 <span>{{ discovery.models.length }}</span></strong><span>勾选后添加到对话</span></header>
+    <header class="discovered-heading"><strong>可用模型 <span>{{ sourceModels.length }}</span></strong><span>{{ purpose === 'image' ? '勾选后添加到生图' : '勾选后添加到对话' }}</span></header>
     <input v-model="query" class="discovered-search" type="search" placeholder="搜索模型" aria-label="搜索获取到的模型" />
     <div class="discovered-toolbar"><label><input type="checkbox" :checked="allSelected" :disabled="!available.length || saving" @change="toggleAll" />全选当前结果</label><span>{{ selectedIds.length }} 项已选</span></div>
     <div class="discovered-list">
@@ -41,9 +42,9 @@ watch(() => props.discovery, () => { selected.value = []; query.value = '' })
         <span class="discovered-name"><strong>{{ model.name || model.id }}</strong><small v-if="model.name !== model.id">{{ model.id }}</small><small v-if="metadataLabel(model)">{{ metadataLabel(model) }}</small></span>
         <small v-if="addedModelIds.includes(model.id)">已添加</small>
       </label>
-      <p v-if="!visible.length" class="discovered-empty">{{ discovery.models.length ? '没有匹配的模型' : '接口没有返回可用模型' }}</p>
+      <p v-if="!visible.length" class="discovered-empty">{{ sourceModels.length ? '没有匹配的模型' : '请先获取此服务商的模型列表，也可以手动添加' }}</p>
     </div>
-    <footer class="discovered-footer"><span>会同步保存接口返回的元数据（上下文、输出上限和推理能力）</span><button type="button" :disabled="!selectedModels.length || saving" @click="emit('add', selectedModels)">{{ saving ? '正在添加…' : `添加所选模型${selectedModels.length ? `（${selectedModels.length}）` : ''}` }}</button></footer>
+    <footer class="discovered-footer"><span>{{ purpose === 'image' ? '同步尺寸和质量元数据；GPT Image 使用官方参数' : '同步上下文、输出上限和推理能力元数据' }}</span><button type="button" :disabled="!selectedModels.length || saving" @click="emit('add', selectedModels)">{{ saving ? '正在添加…' : `添加所选模型${selectedModels.length ? `（${selectedModels.length}）` : ''}` }}</button></footer>
   </section>
 </template>
 

@@ -7,6 +7,7 @@ import { createProjectMemory, createContextExtension, contextSettings, redactCon
 import { createRetryEvents } from "./retry-events.mjs";
 import { FILE_OUTPUT_GUIDANCE, attachmentPromptText } from "./file-output.mjs";
 import { createDiagnosticLogger, registerDiagnosticSecrets, observeProcess } from "../shared/diagnostics.mjs";
+import { configureHttpDispatcher } from "#pi-http-dispatcher";
 
 const diagnosticLog = createDiagnosticLogger("agent-host");
 observeProcess(diagnosticLog);
@@ -26,10 +27,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const HOST_PROVIDER_ID = "plc-pilot";
+// 直接使用 Pi 原版 HTTP 分发器，关闭默认的响应头/响应体空闲截止，同时保留代理和停止信号。
+configureHttpDispatcher(0);
 hideProcessWindows();
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 4096;
-const TOOL_TIMEOUT_MS = 120000;
 const MAX_MODEL_RETRIES = 5;
 const MODEL_RETRY_BASE_DELAY_MS = 1000;
 const MAX_MODEL_RETRY_DELAY_MS = 60000;
@@ -425,25 +427,8 @@ function makeToolDefinition(tool, sendToolRequest) {
 
 function waitForTool(request, signal) {
   return new Promise((resolve, reject) => {
-    // STone 的构建/测试支持显式长超时；原固定 120 秒会在厂商仍在编译时提前
-    // 丢弃结果。仅对 STone 按其已校验的 timeoutMs 加收尾余量，保留其他工具契约。
-    const requestedTimeout = Number(request.arguments?.timeoutMs);
-    const timeoutMs = String(request.tool_name).startsWith("stone_") && Number.isFinite(requestedTimeout)
-      ? Math.max(TOOL_TIMEOUT_MS, Math.min(3600000, Math.max(1000, requestedTimeout)) + 60000)
-      : request.tool_name === "image_gen" ? 660000 : TOOL_TIMEOUT_MS;
-    const pending = {
-      timer: null,
-      paused: false,
-      resolve,
-      reject,
-    };
-    const expire = () => {
-      pendingToolRequests.delete(request.request_id);
-      reject(new Error(`PLC 工具响应超过 ${Math.round(timeoutMs / 1000)} 秒仍未返回`));
-    };
-    pending.timer = setTimeout(expire, timeoutMs);
+    // 超时由具体工具的显式参数控制，宿主不因长时间没有结果丢弃原调用。
     const abort = () => {
-      if (pending.timer) clearTimeout(pending.timer);
       pendingToolRequests.delete(request.request_id);
       reject(new Error("工具调用已中止"));
     };
@@ -453,18 +438,11 @@ function waitForTool(request, signal) {
     }
     signal?.addEventListener("abort", abort, { once: true });
     pendingToolRequests.set(request.request_id, {
-      pause: () => {
-        if (pending.timer) clearTimeout(pending.timer);
-        pending.timer = null;
-        pending.paused = true;
-      },
       resolve: (value) => {
-        if (pending.timer) clearTimeout(pending.timer);
         signal?.removeEventListener("abort", abort);
         resolve(value);
       },
       reject: (error) => {
-        if (pending.timer) clearTimeout(pending.timer);
         signal?.removeEventListener("abort", abort);
         reject(error);
       },
@@ -836,6 +814,8 @@ async function ensureSession(config) {
   }
   const toolNames = ["read", "grep", "find", "ls", "notes", "history", ...(contextPreferences.project_memory === false ? [] : ["memory"]), ...customTools.map((tool) => tool.name)];
   const settingsManager = SettingsManager.inMemory({
+    // 复用 Pi 官方的 0=禁用空闲截止设置；只由真实网络错误或用户停止结束等待。
+    httpIdleTimeoutMs: 0,
     compaction: contextSettings(model.contextWindow, contextPreferences),
     cacheWarming: "off",
     retry: {
@@ -1050,7 +1030,6 @@ async function handleCommand(command) {
     return;
   }
   if (command.type === "approval_wait") {
-    pendingToolRequests.get(command.request_id)?.pause();
     return;
   }
   if (command.type === "tool_result") {

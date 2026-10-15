@@ -13,13 +13,14 @@ import ThemeToggle from './ThemeToggle.vue'
 import WorkbenchModePicker from './WorkbenchModePicker.vue'
 import type { WorkbenchMode } from '../../api/plcBridge'
 import type { ThemePreference } from '../../types/theme'
+import { IconPhoto } from '@tabler/icons-vue'
 
 export type SidebarThread = { id: string; name: string; cwd: string; busy: boolean; status: string; persisted: boolean }
 const props = defineProps<{ projects: WorkspaceProject[]; threads: SidebarThread[]; activeId: string; theme: ThemePreference; workbenchMode: WorkbenchMode }>()
 const emit = defineEmits<{
   'new-thread': [project?: WorkspaceProject]; 'select-thread': [id: string];
   'add-project': []; 'remove-project': [project: WorkspaceProject]; 'rename-thread': [id: string]; 'delete-thread': [id: string];
-  'open-settings': []; 'open-skills': []; 'open-overview': [];
+  'open-settings': []; 'open-skills': []; 'open-overview': []; 'open-images': [];
   'update:theme': [theme: ThemePreference];
   'update:workbench-mode': [mode: WorkbenchMode];
 }>()
@@ -48,6 +49,7 @@ function toggle(id: string): void { const next = new Set(collapsed.value); if (n
     <button class="sidebar-nav" @click="emit('new-thread')"><IconTablerFilePencil /><span>新对话</span></button>
     <button class="sidebar-nav" @click="emit('open-overview')"><IconTablerFolder /><span>工程概览</span></button>
     <button class="sidebar-nav" @click="emit('open-skills')"><IconTablerBolt /><span>Skills 与工具</span></button>
+    <button class="sidebar-nav" @click="emit('open-images')"><IconPhoto /><span>生图</span></button>
     <div class="sidebar-scroll">
       <div class="group-heading"><span>项目</span><button title="添加项目" aria-label="添加项目" @click="emit('add-project')"><IconTablerFolder /></button></div>
       <section v-for="group in groups" :key="group.project.id" class="project-group">

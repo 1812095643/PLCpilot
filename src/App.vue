@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, shallowRef, watch, type ComponentPublicInstance } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, shallowRef, watch, type ComponentPublicInstance } from 'vue'
 import DesktopLayout from './components/layout/DesktopLayout.vue'
 import AppSplashScreen from './components/layout/AppSplashScreen.vue'
 import WindowTitleBar from './components/layout/WindowTitleBar.vue'
@@ -17,6 +17,8 @@ import { useDocumentWorkspace } from './composables/useDocumentWorkspace'
 import type { DocumentSelection } from './api/documents'
 import { listen } from '@tauri-apps/api/event'
 import type { ImageGenerationProgress } from './api/imageGeneration'
+import { useImageStudio } from './composables/useImageStudio'
+const ImageStudioPage = defineAsyncComponent(() => import('./components/images/ImageStudio.vue'))
 import ComposerQueue from './components/content/ComposerQueue.vue'
 import ModelSettingsPanel from './components/settings/ModelSettingsPanel.vue'
 import SettingsPage from './components/settings/SettingsPage.vue'
@@ -98,7 +100,7 @@ import type {
 } from './types/codex'
 import type { Diagnostic } from './api/plcBridge'
 
-type View = 'chat' | 'overview' | 'skills'
+type View = 'chat' | 'overview' | 'skills' | 'images'
 
 type SubmitRunContext = {
   /** 重新生成时沿用同一用户轮次，并把旧正式回复保留为可切换版本。 */
@@ -112,7 +114,8 @@ const showAppSplash = shallowRef(true)
 const modelSettings = useModelSettings(snapshot)
 const isSavingModel = shallowRef(false)
 const workspace = useWorkspaceThreads()
-const tasksRunning = computed(() => workspace.threads.value.some((thread) => thread.isBusy || thread.isDrainingSubmitQueue || (!thread.queuePaused && thread.queuedSubmits.length > 0)))
+const imageStudio = useImageStudio(showNotice)
+const tasksRunning = computed(() => imageStudio.busy.value || workspace.threads.value.some((thread) => thread.isBusy || thread.isDrainingSubmitQueue || (!thread.queuePaused && thread.queuedSubmits.length > 0)))
 const updater = useAppUpdates(async () => {
   await nextTick()
   await useComposerDraftStorage().flushAll()
@@ -134,6 +137,7 @@ const { active: isWindowDropActive, onDragOver: onWindowDragOver, onDragLeave: o
   openProject: async (path) => { await activateProject(path); showSettings.value = false },
   attachPaths: attachDroppedFiles,
   attachFiles: async (files) => {
+    if (activeView.value === 'images') { imageStudio.attachFiles(files); return }
     showSettings.value = false
     activeView.value = 'chat'
     await nextTick()
@@ -277,7 +281,7 @@ const selectedReasoningEfforts = computed(() => {
 const currentProject = computed(() => workspace.active.value.project)
 const recentProjects = computed(() => snapshot.value.projects.filter((project) => !isSamePath(project.path, currentProject.value.path)))
 const currentCwd = computed(() => currentProject.value.working_directory || currentProject.value.project_directory || currentProject.value.path || '')
-const currentTitle = computed(() => workspace.active.value.session.name || currentProject.value.name || 'PLC Pilot')
+const currentTitle = computed(() => activeView.value === 'images' ? '生图 · PLC Pilot' : workspace.active.value.session.name || currentProject.value.name || 'PLC Pilot')
 const skills = computed(() => snapshot.value.skills.map((skill) => ({
   name: skill.name,
   displayName: skill.name,
@@ -2060,6 +2064,7 @@ async function startNewThread(project?: WorkspaceProject): Promise<void> {
 
 async function attachDroppedFiles(paths: string[]): Promise<void> {
   if (paths.length === 0) return
+  if (activeView.value === 'images') { await imageStudio.attachPaths(paths); return }
   const threadId = activeThreadId.value
   showSettings.value = false
   activeView.value = 'chat'
@@ -2091,6 +2096,7 @@ function onKeyDown(event: KeyboardEvent): void {
 let syncTimer: number | undefined
 let stopImageEvents: (() => void) | undefined
 function onImageProgress(progress: ImageGenerationProgress) {
+  imageStudio.onProgress(progress)
   const thread = workspace.threads.value.find(item => item.id === progress.scope)
   if (!thread) return
   const id = `image-${progress.id}`
@@ -2101,6 +2107,24 @@ function onImageProgress(progress: ImageGenerationProgress) {
   thread.messages = next.messages; thread.streamingAssistantId = next.assistantId
   if (next.split) thread.textStream.reset(thread.streamingRequestId)
 }
+
+function openImageStudio() {
+  activeView.value = 'images'
+  showSettings.value = false
+  void imageStudio.reload()
+}
+function configureImageModels() {
+  settingsCategory.value = 'models'
+  settingsSection.value = ''
+  showSettings.value = true
+}
+function closeSettings() {
+  showSettings.value = false
+  if (activeView.value !== 'images') activeView.value = 'chat'
+}
+watch(showSettings, (visible, previous) => {
+  if (!visible && previous && activeView.value === 'images') void imageStudio.reload()
+})
 
 onMounted(async () => {
   try { stopImageEvents = await listen<ImageGenerationProgress>('image-generation', ({ payload }) => onImageProgress(payload)) } catch { /* 浏览器预览没有桌面事件通道。 */ }
@@ -2151,7 +2175,7 @@ onUnmounted(() => {
     :is-initializing="showAppSplash"
     :is-sidebar-collapsed="isSidebarCollapsed"
     :is-settings-mode="showSettings"
-    :preview-visible="documentWorkspace.visible.value && activeView === 'chat'"
+    :preview-visible="documentWorkspace.visible.value && (activeView === 'chat' || activeView === 'images')"
     @close-sidebar="isSidebarCollapsed = true"
     @dragover="onWindowDragOver"
     @dragleave="onWindowDragLeave"
@@ -2167,7 +2191,7 @@ onUnmounted(() => {
       <WorkspaceSidebar :projects="sidebarProjects" :threads="sidebarThreads" :active-id="activeThreadId" :theme="theme" :workbench-mode="workbenchMode" @update:theme="theme = $event" @update:workbench-mode="onWorkbenchModeChange"
         @new-thread="startNewThread" @select-thread="selectSidebarThread"
         @add-project="onPickProjectFolder" @remove-project="onRemoveProject" @rename-thread="renameSidebarThread" @delete-thread="deleteSidebarThread"
-        @open-settings="showSettings = true" @open-skills="activeView = 'skills'; showSettings = false" @open-overview="activeView = 'overview'; showSettings = false" />
+        @open-settings="showSettings = true" @open-skills="activeView = 'skills'; showSettings = false" @open-overview="activeView = 'overview'; showSettings = false" @open-images="openImageStudio" />
     </template>
 
     <template #topbar>
@@ -2201,7 +2225,7 @@ onUnmounted(() => {
     </template>
 
     <template #content>
-      <SettingsPage v-if="showSettings" v-model:category="settingsCategory" v-model:section="settingsSection" :snapshot="snapshot" :theme="theme" :access-mode="accessMode" :access-mode-disabled="!accessModeReady || accessModeSaving || tasksRunning" @update:access-mode="onAccessModeChange" @close="showSettings = false; activeView = 'chat'" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
+      <SettingsPage v-if="showSettings" v-model:category="settingsCategory" v-model:section="settingsSection" :snapshot="snapshot" :theme="theme" :access-mode="accessMode" :access-mode-disabled="!accessModeReady || accessModeSaving || tasksRunning" @update:access-mode="onAccessModeChange" @close="closeSettings" @refresh="refresh" @update:theme="theme = $event" @notice="showNotice">
         <template #sessions><GlobalSessionCenter :sessions="snapshot.sessions" :projects="snapshot.projects" :active-id="activeSessionId" @open="onResumeSession" @rename="onRenameSession" @delete="onDeleteSession" @archive="onArchiveSession" @unarchive="onUnarchiveSession" @notice="showNotice" /></template>
         <template #knowledge><ProjectContextCenter :project-path="currentProject.path || currentCwd" :project-name="currentProject.name || '当前项目'" :projects="snapshot.projects" @notice="showNotice" /></template>
         <template #updates><UpdatesSettingsPanel :state="updater.state" :busy="updater.active.value" :tasks-running="tasksRunning" @check="updater.check" @install="updater.install" @auto-check="updater.setAutoCheck" @notice="showNotice" /></template>
@@ -2216,6 +2240,7 @@ onUnmounted(() => {
             @save="onSaveModel" @refresh="onProvidersChanged" @set-active="onSetActiveModel" @toggle-enabled="onToggleModel" @duplicate="onDuplicateModel" @remove="onDeleteModel" />
         </template>
       </SettingsPage>
+      <ImageStudioPage v-else-if="activeView === 'images'" :studio="imageStudio" @configure="configureImageModels" @preview="documentWorkspace.open({ path: $event })" @notice="showNotice" />
       <section v-else class="content-root plc-content">
         <div v-if="activeView === 'chat'" class="plc-chat-layout">
           <ThreadConversation

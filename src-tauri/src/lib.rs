@@ -35,7 +35,6 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MCP_DISCOVERY_TIMEOUT_SECONDS: u64 = 3;
 const MCP_DISCOVERY_GRACE_MILLISECONDS: u64 = 1_200;
 const MAX_AGENT_TURNS: usize = 8;
-const PI_HOST_TIMEOUT_SECONDS: u64 = 240;
 const MAX_SESSION_PREVIEW_MESSAGES: usize = 80;
 const MAX_SESSION_PREVIEW_CHARS: usize = 6000;
 /// 每次模型请求最多额外重试五次；初始请求不计入该数字。
@@ -45,13 +44,14 @@ const MAX_MODEL_RETRY_DELAY_MS: u64 = 60_000;
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 const RPC_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const RPC_PROTOCOL_VERSION: u32 = 1;
-const RPC_REQUEST_TIMEOUT_SECONDS: u64 = 300;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 mod attachments;
 mod document_core;
 mod image_generation;
+mod image_parameters;
+mod image_studio;
 mod officecli;
 mod agent_runtime;
 mod agent_control;
@@ -394,6 +394,8 @@ pub struct DiscoveredModel {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub reasoning_levels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_parameters: Option<image_parameters::ImageCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1733,16 +1735,7 @@ async fn handle_local_rpc(
             .or_else(|| value.get("params"))
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let result = timeout(
-            Duration::from_secs(RPC_REQUEST_TIMEOUT_SECONDS),
-            dispatch_local_rpc(&app, state.clone(), &command, args),
-        )
-        .await
-        .map_err(|_| {
-            AppError::Internal(format!(
-                "本机桥接请求超过 {RPC_REQUEST_TIMEOUT_SECONDS} 秒仍未返回"
-            ))
-        })?;
+        let result = dispatch_local_rpc(&app, state.clone(), &command, args).await;
         match result {
             Ok(result) => {
                 write_rpc_response(&mut writer, request_id, true, Some(result), None).await?
@@ -2516,6 +2509,10 @@ pub fn run() {
             document_core::document_cache_attachment,
             image_generation::get_image_settings,
             image_generation::save_image_settings,
+            image_studio::get_image_studio_history,
+            image_studio::start_image_studio_generation,
+            image_studio::cancel_image_studio_generation,
+            image_studio::save_image_studio_result,
             officecli::get_officecli_status,
             officecli::set_office_engine_mode,
             officecli::install_officecli,
@@ -2666,7 +2663,7 @@ async fn get_model_settings(state: State<'_, AppState>) -> Result<Value, AppErro
 
 /// 按接口范围合并所选模型；同名的其他供应商配置不能被覆盖，密钥不返回前端。
 fn merge_discovered_models(state: &mut RuntimeState, config: ModelConfig, model_ids: Vec<String>) -> Result<Vec<ModelSummary>, AppError> {
-    let discovered = model_ids.into_iter().map(|id| DiscoveredModel { id: id.clone(), name: id, owned_by: None, context_window: None, max_tokens: None, reasoning_levels: Vec::new() }).collect();
+    let discovered = model_ids.into_iter().map(|id| DiscoveredModel { image_parameters: image_parameters::official(&id), id: id.clone(), name: id, owned_by: None, context_window: None, max_tokens: None, reasoning_levels: Vec::new() }).collect();
     merge_discovered_models_with_metadata(state, config, discovered)
 }
 
@@ -6135,7 +6132,7 @@ async fn run_pi_host(
                             .and_then(Value::as_str)
                             .ok_or_else(|| AppError::Internal("审批等待缺少动作标识。".into()))?
                             .to_string();
-                        // 先通知 Node 暂停该工具调用的超时计时，再等待用户操作。
+                        // 通知 Node 当前工具正在等待用户操作，保留原调用直到审批完成。
                         // 这条消息不是 tool_result，Pi 不会结束当前 turn。
                         write_host_json(
                             &mut *stdin.lock().await,
@@ -6581,30 +6578,23 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     let mut line = String::new();
-    let result = timeout(Duration::from_secs(PI_HOST_TIMEOUT_SECONDS), async {
-        loop {
-            line.clear();
-            let count = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|error| AppError::Internal(format!("Pi 宿主读取未完成：{error}")))?;
-            if count == 0 {
-                return Err(AppError::Internal(
-                    "PI_HOST_UNAVAILABLE:Pi 宿主提前结束".to_string(),
-                ));
-            }
-            if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
-                return Ok(value);
-            }
+    // 模型思考、审批与生图期间可以长时间没有新事件；静默不能等同于连接失败。
+    // EOF/读取错误正常上报，用户停止仍由 read_host_json_or_abort 立即唤醒。
+    loop {
+        line.clear();
+        let count = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| AppError::Internal(format!("Pi 宿主读取未完成：{error}")))?;
+        if count == 0 {
+            return Err(AppError::Internal(
+                "PI_HOST_UNAVAILABLE:Pi 宿主提前结束".to_string(),
+            ));
         }
-    })
-    .await
-    .map_err(|_| {
-        AppError::Internal(format!(
-            "Pi 宿主响应超过 {PI_HOST_TIMEOUT_SECONDS} 秒仍未返回"
-        ))
-    })?;
-    result
+        if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
+            return Ok(value);
+        }
+    }
 }
 
 async fn read_host_json_or_abort<R>(
@@ -7999,7 +7989,6 @@ async fn call_model(
     tools: &[McpTool],
 ) -> Result<ModelResponse, AppError> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| AppError::Network(error.to_string()))?;
     match config.provider {
@@ -8812,7 +8801,8 @@ fn discovered_model_from_value(value: &Value) -> Option<DiscoveredModel> {
         _ => Vec::new(),
     };
     let reasoning_levels = reasoning_levels.into_iter().filter(|value| matches!(value.as_str(), "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")).collect();
-    Some(DiscoveredModel { id, name, owned_by, context_window, max_tokens, reasoning_levels })
+    let image_parameters = image_parameters::discovered(&id, value);
+    Some(DiscoveredModel { id, name, owned_by, context_window, max_tokens, reasoning_levels, image_parameters })
 }
 
 async fn send_json(
@@ -11092,7 +11082,6 @@ impl McpClient {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| AppError::Mcp("HTTP MCP 缺少 URL".to_string()))?;
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| AppError::Mcp(error.to_string()))?;
         let initialize = json!({
@@ -11311,7 +11300,7 @@ async fn read_json_response<R>(reader: &mut R) -> Result<Value, AppError>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    timeout(Duration::from_secs(120), async {
+    {
         let mut line = String::new();
         loop {
             line.clear();
@@ -11367,13 +11356,40 @@ where
             // 允许服务把诊断文本误写到 stdout；找到下一条 JSON-RPC 消息后继续。
             diagnostics::warn("mcp.non_protocol_stdout", json!({"text": first}));
         }
-    })
-    .await
-    .map_err(|_| AppError::Mcp("MCP 响应超过 120 秒仍未返回".to_string()))?
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn quiet_host_survives_an_hour_and_still_accepts_its_result() {
+        use super::*;
+        let (input, mut output) = tokio::io::duplex(1024);
+        let state = AppState::new(RuntimeState::default());
+        let task = tokio::spawn(async move { read_host_json_or_abort(&mut BufReader::new(input), &state).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(!task.is_finished(), "没有新事件不应触发 240 秒超时");
+        output.write_all(b"{\"type\":\"result\",\"text\":\"done\"}\n").await.unwrap();
+        assert_eq!(task.await.unwrap().unwrap()["text"], "done");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_host_can_be_stopped_and_closed_pipe_still_reports_an_error() {
+        use super::*;
+        let (input, output) = tokio::io::duplex(1024);
+        let state = AppState::new(RuntimeState::default());
+        let job = state.clone();
+        let task = tokio::spawn(async move { read_host_json_or_abort(&mut BufReader::new(input), &job).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        state.abort_requested.store(true, Ordering::SeqCst);
+        state.abort_notify.notify_one();
+        assert!(task.await.unwrap().unwrap_err().to_string().contains("中止"));
+        drop(output);
+        let mut empty = BufReader::new(&b""[..]);
+        assert!(read_host_json(&mut empty).await.unwrap_err().to_string().contains("提前结束"));
+    }
     use super::*;
 
     #[test]
@@ -11653,6 +11669,7 @@ mod tests {
                     context_window: Some(256000),
                     max_tokens: Some(8192),
                     reasoning_levels: vec!["none".into(), "high".into(), "max".into()],
+                    image_parameters: None,
                 },
                 DiscoveredModel {
                     id: "llama3:8b".to_string(),
@@ -11661,6 +11678,7 @@ mod tests {
                     context_window: None,
                     max_tokens: None,
                     reasoning_levels: Vec::new(),
+                    image_parameters: None,
                 }
             ]
         );
@@ -12169,6 +12187,7 @@ mod tests {
             context_window: Some(256000),
             max_tokens: Some(8192),
             reasoning_levels: vec!["none".into(), "high".into(), "max".into()],
+            image_parameters: None,
         }];
         merge_discovered_models_with_metadata(&mut state, source, discovered).expect("导入带元数据模型");
         assert_eq!(state.models[0].name, "带元数据模型");

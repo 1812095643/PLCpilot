@@ -2,6 +2,7 @@ import { createReadStream } from 'node:fs'
 import { readFile, writeFile, stat } from 'node:fs/promises'
 import { createHash, createPublicKey, verify } from 'node:crypto'
 import { basename, join, resolve } from 'node:path'
+import { currentReleaseNotes } from './release-notes.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const directory = resolve(process.argv[2] || join(root, 'release-stage'))
@@ -12,7 +13,7 @@ const rawKey = Buffer.from(keyText[1], 'base64')
 if (rawKey.length !== 42 || rawKey.subarray(0, 2).toString() !== 'Ed') throw new Error('Invalid updater public key')
 const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), rawKey.subarray(10)]), format: 'der', type: 'spki' })
 const expected = ['windows-x86_64', 'darwin-x86_64', 'darwin-aarch64', 'linux-x86_64']
-const manifest = { version, notes: (await readFile(join(root, 'release-notes.md'), 'utf8')).trim(), pub_date: new Date().toISOString(), platforms: {} }
+const manifest = { version, notes: await currentReleaseNotes(root), pub_date: new Date().toISOString(), platforms: {} }
 const checksums = new Map()
 for (const platform of expected) {
   const part = JSON.parse(await readFile(join(directory, `${platform}.json`), 'utf8'))

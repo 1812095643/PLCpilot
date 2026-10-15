@@ -91,6 +91,7 @@ export type DiscoveredModel = {
   context_window?: number | null
   max_tokens?: number | null
   reasoning_levels?: string[]
+  image_parameters?: import('./imageGeneration').ImageCapabilities | null
 }
 
 export type ModelDiscoveryResult = {

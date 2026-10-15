@@ -63,7 +63,7 @@ jobs:
         run: |
           set -euo pipefail
           npm run build
-          node --test shared/diagnostics.test.mjs stone-mcp/test/stone.test.mjs agent-host/*.test.mjs src/utils/conversationTurns.test.mjs
+          node --test shared/*.test.mjs scripts/release-notes.test.mjs stone-mcp/test/stone.test.mjs agent-host/*.test.mjs src/utils/conversationTurns.test.mjs
           cargo test --manifest-path src-tauri/Cargo.toml --lib
       - name: 构建签名安装包
         env:
@@ -105,7 +105,9 @@ jobs:
           path: release-stage
           merge-multiple: true
       - name: 核验各平台安装包、签名与更新清单
-        run: node scripts/merge-release.mjs release-stage
+        run: |
+          node scripts/merge-release.mjs release-stage
+          node scripts/release-notes.mjs --output release-stage/release-notes.md
       - name: 上传完整附件后公开发布
         env:
           GH_TOKEN: ${{ github.token }}
@@ -115,7 +117,7 @@ jobs:
           if gh release view "$tag" --json isDraft > "$RUNNER_TEMP/plc-release.json" 2>/dev/null; then
             node -e 'if(!require(process.env.RUNNER_TEMP+"/plc-release.json").isDraft)throw Error("Release is already public; increment the version")'
           else
-            gh release create "$tag" --target "$GITHUB_SHA" --draft --title "PLC Pilot $tag" --notes-file release-notes.md
+            gh release create "$tag" --target "$GITHUB_SHA" --draft --title "PLC Pilot $tag" --notes-file release-stage/release-notes.md
           fi
           gh release upload "$tag" release-stage/*.exe release-stage/*.msi release-stage/*.zip release-stage/*.sig release-stage/*.dmg release-stage/*.tar.gz release-stage/*.AppImage release-stage/*.deb release-stage/latest.json release-stage/SHA256SUMS.txt --clobber
-          gh release edit "$tag" --draft=false --latest
+          gh release edit "$tag" --notes-file release-stage/release-notes.md --draft=false --latest

@@ -30,6 +30,7 @@
     "createUpdaterArtifacts": true,
     "targets": "all",
     "resources": {
+      "../vendor/toonflow/LICENSE": "licenses/toonflow-LICENSE",
       "../agent-host/pi-agent-host.bundle.mjs": "pi-agent-host.bundle.mjs",
       "../runtime-stage/node": "runtime/node",
       "../runtime-stage/python": "runtime/python",
