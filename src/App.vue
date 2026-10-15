@@ -16,7 +16,7 @@ import DocumentWorkspace from './components/documents/DocumentWorkspace.vue'
 import { useDocumentWorkspace } from './composables/useDocumentWorkspace'
 import type { DocumentSelection } from './api/documents'
 import { listen } from '@tauri-apps/api/event'
-import type { ImageGenerationProgress } from './api/imageGeneration'
+import type { ImageGenerationProgress, ModelTransferResult } from './api/imageGeneration'
 import { useImageStudio } from './composables/useImageStudio'
 const ImageStudioPage = defineAsyncComponent(() => import('./components/images/ImageStudio.vue'))
 import ComposerQueue from './components/content/ComposerQueue.vue'
@@ -1959,6 +1959,19 @@ async function onProvidersChanged(): Promise<void> {
   }
 }
 
+async function onModelsTransferred(result: ModelTransferResult): Promise<void> {
+  await modelSettings.reload()
+  snapshot.value = { ...snapshot.value, models: result.models, model: result.model, active_model_id: result.active_model_id }
+  const fallback = result.models.find(model => model.id === result.active_model_id && model.enabled) ?? result.models.find(model => model.enabled)
+  for (const thread of workspace.threads.value) {
+    if (!result.models.some(model => model.id === thread.selectedModelProfileId && model.enabled)) {
+      thread.selectedModelProfileId = fallback?.id ?? ''
+      thread.selectedModel = fallback?.model ?? ''
+      if (fallback) thread.reasoningEffort = normalizeReasoningEffort(thread.reasoningEffort, fallback)
+    }
+  }
+}
+
 async function onSetActiveModel(id: string): Promise<void> {
   try {
     const summary = await setActiveModel(id)
@@ -2237,7 +2250,7 @@ onUnmounted(() => {
           <ModelSettingsPanel v-if="modelSettings.loaded.value" :models="snapshot.models" :active-model-id="snapshot.active_model_id" :selected-model-id="selectedModelProfileId" :is-saving="isSavingModel"
             :discovery-request="providerDiscoveryRequest" @discovery-handled="providerDiscoveryRequest = 0"
             :current-context-tokens="workspace.active.value.session.context_tokens" :remaining-context-percent="tokenUsage?.remainingContextPercent ?? null" :auto-compaction-enabled="workspace.active.value.session.auto_compaction_enabled"
-            @save="onSaveModel" @refresh="onProvidersChanged" @set-active="onSetActiveModel" @toggle-enabled="onToggleModel" @duplicate="onDuplicateModel" @remove="onDeleteModel" />
+            @save="onSaveModel" @refresh="onProvidersChanged" @models-transferred="onModelsTransferred" @set-active="onSetActiveModel" @toggle-enabled="onToggleModel" @duplicate="onDuplicateModel" @remove="onDeleteModel" />
         </template>
       </SettingsPage>
       <ImageStudioPage v-else-if="activeView === 'images'" :studio="imageStudio" @configure="configureImageModels" @preview="documentWorkspace.open({ path: $event })" @notice="showNotice" />

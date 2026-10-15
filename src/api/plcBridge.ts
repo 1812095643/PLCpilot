@@ -55,6 +55,7 @@ export type WorkspaceProject = {
 }
 
 export type ModelSummary = {
+  image_parameters?: import('./imageGeneration').ImageCapabilities | null
   provider_id?: string
   provider_name?: string
   selected?: boolean

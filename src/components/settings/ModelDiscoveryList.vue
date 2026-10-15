@@ -2,7 +2,7 @@
 import { computed, shallowRef, watch } from 'vue'
 import type { ModelDiscoveryResult, DiscoveredModel } from '../../api/plcBridge'
 
-const props = defineProps<{ discovery?: ModelDiscoveryResult; models?: DiscoveredModel[]; purpose?: 'chat' | 'image'; addedModelIds: string[]; saving: boolean }>()
+const props = defineProps<{ discovery?: ModelDiscoveryResult; models?: DiscoveredModel[]; purpose?: 'chat' | 'image'; addedModelIds: string[]; imageModelIds?: string[]; saving: boolean }>()
 const emit = defineEmits<{ add: [models: ModelDiscoveryResult['models']] }>()
 const query = shallowRef('')
 const selected = shallowRef<string[]>([])
@@ -40,7 +40,7 @@ watch(sourceModels, () => { selected.value = []; query.value = '' })
       <label v-for="model in visible" :key="model.id" class="discovered-row" :class="{ added: addedModelIds.includes(model.id) }">
         <input type="checkbox" :checked="addedModelIds.includes(model.id) || selected.includes(model.id)" :disabled="addedModelIds.includes(model.id) || saving" @change="toggle(model.id)" />
         <span class="discovered-name"><strong>{{ model.name || model.id }}</strong><small v-if="model.name !== model.id">{{ model.id }}</small><small v-if="metadataLabel(model)">{{ metadataLabel(model) }}</small></span>
-        <small v-if="addedModelIds.includes(model.id)">已添加</small>
+        <small v-if="addedModelIds.includes(model.id)">{{ imageModelIds?.includes(model.id) ? '已设为生图' : '已添加' }}</small>
       </label>
       <p v-if="!visible.length" class="discovered-empty">{{ sourceModels.length ? '没有匹配的模型' : '请先获取此服务商的模型列表，也可以手动添加' }}</p>
     </div>

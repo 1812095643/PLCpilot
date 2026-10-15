@@ -1,31 +1,34 @@
 <script setup lang="ts">
-import { computed, onMounted, shallowRef, watch } from 'vue'
-import type { ModelForm, ModelSummary, ModelProviderSummary, DiscoveredModel } from '../../api/plcBridge'
+import { computed, onMounted, shallowRef, useTemplateRef, watch } from 'vue'
+import type { ModelForm, ModelSummary, ModelProviderSummary } from '../../api/plcBridge'
+import type { ImageSettings, ModelTransferResult } from '../../api/imageGeneration'
 import { useModelProviders } from '../../composables/useModelProviders'
 import ProviderConnectionForm from './ProviderConnectionForm.vue'
 import ModelProfileEditor from './ModelProfileEditor.vue'
 import ModelDiscoveryList from './ModelDiscoveryList.vue'
 import ImageModelSettings from './ImageModelSettings.vue'
+import type { ImageModelSettingsExposed } from './ImageModelSettings.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
 
 const props = defineProps<{ models: ModelSummary[]; activeModelId: string; selectedModelId: string; isSaving: boolean;
   currentContextTokens: number; remainingContextPercent: number | null; autoCompactionEnabled: boolean; discoveryRequest: number }>()
-const emit = defineEmits<{ save: [form: ModelForm]; refresh: []; 'discovery-handled': []; duplicate: [id: string]; 'set-active': [id: string]; 'toggle-enabled': [id: string, enabled: boolean]; remove: [id: string] }>()
+const emit = defineEmits<{ save: [form: ModelForm]; refresh: []; 'models-transferred': [result: ModelTransferResult]; 'discovery-handled': []; duplicate: [id: string]; 'set-active': [id: string]; 'toggle-enabled': [id: string, enabled: boolean]; remove: [id: string] }>()
 const manager = useModelProviders(() => emit('refresh'))
 const { providers, form, discovery, busy, loading, error, notice } = manager
 const editingModelId = shallowRef<string | null>(null)
 const confirmingDelete = shallowRef(false)
+const imagePanel = useTemplateRef<ImageModelSettingsExposed>('imagePanel')
+const imageBusy = shallowRef(false)
+const imageSettings = shallowRef<ImageSettings>({ models: [], default_id: '' })
 const selectedProvider = computed(() => providers.value.find(provider => provider.id === form.value.id) ?? null)
 const providerModels = computed(() => props.models.filter(model => model.provider_id === form.value.id))
-const imageModelCandidates = computed(() => {
-  const candidates = new Map<string, DiscoveredModel>(providerModels.value.map(model => [model.model, { id: model.model, name: model.name || model.model, owned_by: null }]))
-  for (const model of discovery.value?.models ?? []) candidates.set(model.id, model)
-  return [...candidates.values()]
-})
+const providerImages = computed(() => imageSettings.value.models.filter(model => model.provider_id === form.value.id))
+const addedModelIds = computed(() => [...new Set([...providerModels.value.map(model => model.model), ...providerImages.value.map(model => model.model)])])
 const editingModel = computed(() => providerModels.value.find(model => model.id === editingModelId.value) ?? null)
-const counts = computed(() => new Map(providers.value.map(provider => [provider.id, props.models.filter(model => model.provider_id === provider.id).length])))
-const blocked = computed(() => busy.value || props.isSaving)
+const counts = computed(() => new Map(providers.value.map(provider => [provider.id, props.models.filter(model => model.provider_id === provider.id).length + imageSettings.value.models.filter(model => model.provider_id === provider.id).length])))
+const blocked = computed(() => busy.value || props.isSaving || imageBusy.value)
+function transferred(result: ModelTransferResult) { imageSettings.value = result.images; editingModelId.value = null; emit('models-transferred', result) }
 function select(provider?: ModelProviderSummary) { manager.select(provider); editingModelId.value = null; confirmingDelete.value = false }
 watch(() => props.selectedModelId, id => { if (providerModels.value.some(model => model.id === id) && editingModelId.value !== null) editingModelId.value = id })
 watch(() => props.models, () => { void manager.reload() })
@@ -51,23 +54,24 @@ onMounted(async () => { await manager.reload(props.models.find(model => model.id
       </nav>
       <div class="provider-detail">
         <header class="provider-detail-heading"><h3>{{ selectedProvider ? selectedProvider.name : '添加服务商' }}</h3><button v-if="selectedProvider" class="provider-icon" :disabled="blocked" aria-label="删除服务商" title="删除服务商" @click="confirmingDelete = !confirmingDelete"><IconTablerTrash /></button></header>
-        <div v-if="confirmingDelete" class="provider-confirm" role="alert"><p>删除“{{ selectedProvider?.name }}”及其 {{ providerModels.length }} 个模型配置？聊天记录会保留。</p><button class="settings-command" :disabled="blocked" @click="manager.remove(); confirmingDelete = false">确认删除</button><button class="settings-command" @click="confirmingDelete = false">取消</button></div>
+        <div v-if="confirmingDelete" class="provider-confirm" role="alert"><p>删除“{{ selectedProvider?.name }}”及其 {{ providerModels.length + providerImages.length }} 个模型配置？聊天记录会保留。</p><button class="settings-command" :disabled="blocked" @click="manager.remove(); confirmingDelete = false">确认删除</button><button class="settings-command" @click="confirmingDelete = false">取消</button></div>
         <ProviderConnectionForm v-model="form" :busy="blocked" :has-key="selectedProvider?.api_key_configured ?? false" @save="manager.save" @discover="manager.discover" />
         <p v-if="error" class="provider-error" role="alert">{{ error }}</p><p v-if="notice" class="provider-hint" role="status">{{ notice }}</p>
-        <ModelDiscoveryList v-if="discovery" :discovery="discovery" :added-model-ids="providerModels.map(model => model.model)" :saving="blocked" @add="manager.add" />
+        <ModelDiscoveryList v-if="discovery" :discovery="discovery" :added-model-ids="addedModelIds" :image-model-ids="providerImages.map(model => model.model)" :saving="blocked" @add="manager.add" />
         <section v-if="selectedProvider" class="provider-models" aria-label="此服务商的模型">
-          <header class="provider-detail-heading"><h3>已添加模型 <small>{{ providerModels.length }}</small></h3><button class="settings-command" :disabled="blocked" @click="editingModelId = ''">添加模型</button></header>
+          <header class="provider-detail-heading"><h3>对话模型 <small>{{ providerModels.length }}</small></h3><button class="settings-command" :disabled="blocked" @click="editingModelId = ''">添加模型</button></header>
           <p v-if="!providerModels.length" class="provider-hint">获取模型后勾选添加，也可以手动填写模型 ID。</p>
           <div v-for="model in providerModels" :key="model.id" class="provider-model">
             <input type="checkbox" :checked="model.selected ?? model.enabled" :disabled="blocked" :aria-label="`启用模型 ${model.model}`" @change="emit('toggle-enabled', model.id, ($event.target as HTMLInputElement).checked)" />
             <button class="model-edit" :disabled="blocked" @click="editingModelId = model.id"><strong>{{ model.name || model.model }}</strong><small>{{ model.model }} · {{ Math.round(model.context_window / 1000) }}K 上下文</small></button>
+            <button class="provider-text-button" :disabled="blocked" @click="imagePanel?.moveToImage(model.id)">设为生图模型</button>
             <button v-if="model.enabled && model.id !== activeModelId" class="provider-text-button" :disabled="blocked" @click="emit('set-active', model.id)">设为默认</button><small v-else-if="model.is_default" class="provider-hint">默认</small>
             <button class="provider-icon" :disabled="blocked" :aria-label="`删除模型 ${model.model}`" @click="emit('remove', model.id)"><IconTablerTrash /></button>
             <button class="provider-icon" :disabled="blocked" :aria-label="`复制模型 ${model.model}`" @click="emit('duplicate', model.id)"><IconTablerCopy /></button>
           </div>
           <ModelProfileEditor v-if="editingModelId !== null" :key="`${form.id}:${editingModelId}`" :model="editingModel" :provider="selectedProvider" :busy="blocked" @save="emit('save', $event)" @close="editingModelId = null" />
         </section>
-        <ImageModelSettings v-if="selectedProvider" :key="selectedProvider.id" :provider-id="selectedProvider.id" :available-models="imageModelCandidates" />
+        <ImageModelSettings v-if="selectedProvider" ref="imagePanel" :key="selectedProvider.id" :provider-id="selectedProvider.id" :chat-models="providerModels" :disabled="busy || isSaving" @busy="imageBusy = $event" @loaded="imageSettings = $event" @models-transferred="transferred" />
       </div>
     </div>
     <p class="provider-context">当前会话 {{ currentContextTokens.toLocaleString() }} tokens<span v-if="remainingContextPercent !== null"> · 剩余 {{ Math.round(remainingContextPercent) }}%</span> · 自动压缩{{ autoCompactionEnabled ? '已开启' : '已关闭' }}</p>

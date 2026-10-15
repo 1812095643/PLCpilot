@@ -51,6 +51,7 @@ mod attachments;
 mod document_core;
 mod image_generation;
 mod image_parameters;
+mod model_transfer;
 mod image_studio;
 mod officecli;
 mod agent_runtime;
@@ -116,6 +117,8 @@ pub struct ModelConfig {
     pub context_window: u64,
     #[serde(default = "default_reasoning_levels")]
     pub reasoning_levels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_parameters: Option<image_parameters::ImageCapabilities>,
     #[serde(default = "default_model_enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -158,6 +161,7 @@ impl Default for ModelConfig {
             max_tokens: 4096,
             context_window: DEFAULT_CONTEXT_WINDOW,
             reasoning_levels: default_reasoning_levels(),
+            image_parameters: None,
             enabled: true,
             is_default: true,
             last_error: None,
@@ -353,6 +357,8 @@ pub struct ModelSummary {
     pub context_window: u64,
     pub max_tokens: u32,
     pub reasoning_levels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_parameters: Option<image_parameters::ImageCapabilities>,
     pub enabled: bool,
     pub is_default: bool,
     pub last_error: Option<String>,
@@ -2509,6 +2515,8 @@ pub fn run() {
             document_core::document_cache_attachment,
             image_generation::get_image_settings,
             image_generation::save_image_settings,
+            model_transfer::move_model_to_image,
+            model_transfer::move_model_to_chat,
             image_studio::get_image_studio_history,
             image_studio::start_image_studio_generation,
             image_studio::cancel_image_studio_generation,
@@ -2692,11 +2700,13 @@ fn merge_discovered_models_with_metadata(state: &mut RuntimeState, config: Model
             context_window: metadata.and_then(|item| item.context_window).unwrap_or(source.context_window),
             max_tokens: metadata.and_then(|item| item.max_tokens).unwrap_or(source.max_tokens).min(metadata.and_then(|item| item.context_window).unwrap_or(source.context_window) as u32),
             reasoning_levels: metadata.map(|item| item.reasoning_levels.clone()).filter(|levels| !levels.is_empty()).unwrap_or_else(|| source.reasoning_levels.clone()),
+            image_parameters: metadata.and_then(|item| item.image_parameters.clone()),
             enabled: true, is_default: false, ..source.clone()
         })?;
         if let Some(existing) = state.models.iter_mut().find(|existing| existing.model == id && same_model_scope(existing, &model)) {
             // 再次添加只启用原配置、更新明确提供的连接凭据，保留其专属上下文设置。
             existing.enabled = true;
+            if model.image_parameters.is_some() { existing.image_parameters = model.image_parameters.clone(); }
             if model.api_key.is_some() { existing.api_key = model.api_key; }
             selected.push(existing.id.clone());
         } else {
@@ -2787,6 +2797,7 @@ async fn configure_model_inner(
     model_providers::bind_model(&guard, &mut config)?;
     let previous_scope = guard.models.iter().find(|model| model.id == requested_id).cloned();
     if let Some(existing) = guard.models.iter().find(|model| model.id == requested_id) {
+        if config.image_parameters.is_none() && config.model == existing.model && same_model_scope(&config, existing) { config.image_parameters = existing.image_parameters.clone(); }
         if config.api_key.is_none() && same_model_scope(&config, existing) {
             config.api_key = existing.api_key.clone();
         }
@@ -9166,6 +9177,7 @@ fn model_summary(config: &ModelConfig) -> ModelSummary {
         context_window: config.context_window,
         max_tokens: config.max_tokens,
         reasoning_levels: config.reasoning_levels.clone(),
+        image_parameters: config.image_parameters.clone(),
         enabled: config.enabled && config.provider_enabled,
         is_default: config.is_default,
         last_error: config.last_error.clone(),

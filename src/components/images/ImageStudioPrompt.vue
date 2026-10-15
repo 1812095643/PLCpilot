@@ -30,7 +30,7 @@ function shortcut(event: KeyboardEvent) {
     <div class="reference-toolbar"><button type="button" class="reference-add" @click="picker?.click()"><IconPhotoPlus />参考图片<span>{{ attachments.attachments.value.length }}/8</span></button><input ref="picker" type="file" multiple accept="image/png,image/jpeg,image/webp" hidden @change="pick" /></div>
     <ComposerAttachmentStrip :attachments="attachments.attachments.value" @remove="attachments.removeAttachment" @preview="$event.sourcePath && emit('preview', $event.sourcePath)" />
     <div class="studio-form-options">
-      <label class="studio-model-field"><span>模型</span><select v-model="modelId" :disabled="busy || !models.length" aria-label="生图模型"><option v-if="!models.length" value="">尚未配置生图模型</option><optgroup v-for="group in groups" :key="group.provider.id" :label="group.provider.name"><option v-for="model in group.models" :key="model.id" :value="model.id">{{ model.model }}{{ model.protocol === 'responses' ? ' · Responses' : '' }}</option></optgroup></select></label>
+      <label class="studio-model-field"><span>模型</span><select v-model="modelId" :disabled="busy || !models.length" aria-label="生图模型"><option v-if="!models.length" value="">尚未配置生图模型</option><optgroup v-for="group in groups" :key="group.provider.id" :label="group.provider.name"><option v-for="model in group.models" :key="model.id" :value="model.id">{{ model.name || model.model }}{{ model.protocol === 'responses' ? ' · Responses' : '' }}</option></optgroup></select></label>
       <button v-if="!models.length" type="button" class="setup-link" @click="emit('configure')">去设置中选择模型</button>
       <ImageOutputOptions v-else v-model:size="size" v-model:quality="quality" :parameters="parameters" :disabled="busy" />
     </div>

@@ -7,6 +7,7 @@ use crate::image_parameters::ImageCapabilities;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ImageModel {
     pub id: String, pub provider_id: String, pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub name: Option<String>,
     #[serde(default = "image_protocol")] pub protocol: String,
     #[serde(default)] pub request_model: Option<String>,
     #[serde(default = "image_auto")] pub size: String,
@@ -14,6 +15,8 @@ pub struct ImageModel {
     #[serde(default)] pub streaming: bool,
     #[serde(default = "default_model_enabled")] pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub parameters: Option<ImageCapabilities>,
+    /// 移出对话列表时保留原 profile；凭据始终从服务商读取，不写入此备份。
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub chat_profile: Option<ModelConfig>,
 }
 fn image_protocol() -> String { "images".into() }
 fn image_auto() -> String { "auto".into() }
@@ -24,6 +27,11 @@ pub struct ImageSettings {
     #[serde(default)] pub default_id: String,
 }
 fn config_path() -> PathBuf { app_data_root().join("image-models.json") }
+pub(crate) fn write_settings(settings: &ImageSettings) -> Result<(), AppError> { write_json_atomic(&config_path(), settings, "生图模型") }
+pub(crate) fn public_settings(mut settings: ImageSettings) -> ImageSettings {
+    for model in &mut settings.models { model.chat_profile = None; }
+    settings
+}
 
 pub(crate) fn read_settings() -> Result<ImageSettings, AppError> {
     if !config_path().exists() { return Ok(ImageSettings::default()); }
@@ -40,15 +48,22 @@ pub(crate) fn read_settings() -> Result<ImageSettings, AppError> {
 }
 
 #[tauri::command]
-pub fn get_image_settings() -> Result<ImageSettings, AppError> { read_settings() }
+pub fn get_image_settings() -> Result<ImageSettings, AppError> { Ok(public_settings(read_settings()?)) }
 
 #[tauri::command]
 pub async fn save_image_settings(mut settings: ImageSettings, state: State<'_, AppState>) -> Result<ImageSettings, AppError> {
     if settings.models.len() > 64 { return Err(AppError::Configuration("生图模型最多配置 64 个。".into())); }
     let runtime = state.inner.lock().await;
+    let previous = read_settings()?;
     let mut ids = HashSet::new();
     let mut models = HashSet::new();
     for model in &mut settings.models {
+        if let Some(saved) = previous.models.iter().find(|saved| saved.id == model.id && saved.chat_profile.is_some()) {
+            if saved.provider_id != model.provider_id || saved.model != model.model {
+                return Err(AppError::Configuration("请先转为对话模型，再修改模型 ID 或服务商。".into()));
+            }
+            model.chat_profile = saved.chat_profile.clone();
+        } else { model.chat_profile = None; }
         model.model = model.model.trim().to_string();
         if model.id.is_empty() { model.id = Uuid::new_v4().to_string(); }
         if !ids.insert(model.id.clone()) || model.model.is_empty() || model.model.len() > 200 { return Err(AppError::Configuration("请填写唯一配置和有效生图模型 ID。".into())); }
@@ -61,8 +76,8 @@ pub async fn save_image_settings(mut settings: ImageSettings, state: State<'_, A
         model.parameters = Some(caps);
     }
     if !settings.models.iter().any(|model| model.id == settings.default_id && model.enabled) { settings.default_id = settings.models.iter().find(|model| model.enabled).map(|model| model.id.clone()).unwrap_or_default(); }
-    write_json_atomic(&config_path(), &settings, "生图模型")?;
-    Ok(settings)
+    write_settings(&settings)?;
+    Ok(public_settings(settings))
 }
 
 pub fn tool() -> McpTool {

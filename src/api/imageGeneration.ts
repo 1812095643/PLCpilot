@@ -1,8 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
 import type { ImageCapabilities } from '../../shared/image-model-parameters.mjs'
 export type { ImageCapabilities } from '../../shared/image-model-parameters.mjs'
-export type ImageModel = { id: string; provider_id: string; model: string; protocol: 'images' | 'responses'; request_model?: string; size: string; quality: string; streaming: boolean; enabled: boolean; parameters?: ImageCapabilities | null }
+export type ImageModel = { id: string; provider_id: string; model: string; name?: string | null; protocol: 'images' | 'responses'; request_model?: string; size: string; quality: string; streaming: boolean; enabled: boolean; parameters?: ImageCapabilities | null }
 export type ImageSettings = { models: ImageModel[]; default_id: string }
+export type ModelTransferResult = { images: ImageSettings; models: import('./plcBridge').ModelSummary[]; model: import('./plcBridge').ModelSummary; active_model_id: string }
+export const moveModelToImage = (id: string) => invoke<ModelTransferResult>('move_model_to_image', { id })
+export const moveModelToChat = (id: string) => invoke<ModelTransferResult>('move_model_to_chat', { id })
 export type ImageGenerationProgress = {
   id: string; scope: string; status: 'generating' | 'partial' | 'completed' | 'cancelled' | 'error'; model: string
   model_id?: string; provider_id?: string; prompt?: string; size?: string; quality?: string; started_at?: string

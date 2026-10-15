@@ -106,7 +106,16 @@ pub async fn delete_model_provider(id: String, state: State<'_, AppState>) -> Re
     next.models.retain(|model| model.provider_id != id);
     next.model_providers.retain(|provider| provider.id != id);
     sync_active_model(&mut next);
+    let mut images = image_generation::read_settings()?;
+    images.models.retain(|model| model.provider_id != id);
+    if !images.models.iter().any(|model| model.id == images.default_id && model.enabled) {
+        images.default_id = images.models.iter().find(|model| model.enabled).map(|model| model.id.clone()).unwrap_or_default();
+    }
     persist_runtime_state(&next)?;
+    if let Err(error) = image_generation::write_settings(&images) {
+        let _ = persist_runtime_state(&guard);
+        return Err(error);
+    }
     *guard = next;
     Ok(())
 }
